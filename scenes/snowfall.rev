@@ -1,0 +1,26 @@
+/* Reverie Engine — "Snowfall"
+   Soft-focus winter evening with drifting snow. */
+
+scene "Snowfall" {
+    fps = 60
+
+    layer bg {
+        type = image
+        src = "assets/lake.png"
+        fit = fill
+        blur = 4
+    }
+
+    layer frost {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.45)
+        radius = 1.15
+        stops = [#00000000, (#0a142880 0.75), (#0a1428d9 1.0)]
+    }
+
+    layer snow {
+        type = particles
+        preset = snow
+    }
+}

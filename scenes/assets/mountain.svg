@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0a0a2a"/>
+      <stop offset="0.45" stop-color="#432b6b"/>
+      <stop offset="0.72" stop-color="#b4486d"/>
+      <stop offset="0.9" stop-color="#ff9e64"/>
+      <stop offset="1" stop-color="#2b1a3d"/>
+    </linearGradient>
+    <radialGradient id="moonglow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff2d5" stop-opacity="0.9"/>
+      <stop offset="0.35" stop-color="#ffd9a0" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#ffd9a0" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ridgefar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#57517f"/>
+      <stop offset="1" stop-color="#3a3563"/>
+    </linearGradient>
+    <linearGradient id="ridgemid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#37315c"/>
+      <stop offset="1" stop-color="#241f45"/>
+    </linearGradient>
+    <linearGradient id="ridgenear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e1a3a"/>
+      <stop offset="1" stop-color="#100d24"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d2c5e" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#201a3e"/>
+      <stop offset="1" stop-color="#0c0a20"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1920" height="1080" fill="url(#sky)"/>
+
+  <!-- stars -->
+  <g fill="#ffffff">
+    <circle cx="180" cy="120" r="1.6" opacity="0.8"/>
+    <circle cx="420" cy="80" r="1.2" opacity="0.6"/>
+    <circle cx="660" cy="180" r="1.8" opacity="0.9"/>
+    <circle cx="880" cy="60" r="1.3" opacity="0.7"/>
+    <circle cx="1120" cy="150" r="1.5" opacity="0.8"/>
+    <circle cx="1340" cy="90" r="1.2" opacity="0.6"/>
+    <circle cx="1620" cy="200" r="1.7" opacity="0.85"/>
+    <circle cx="500" cy="260" r="1.1" opacity="0.5"/>
+    <circle cx="760" cy="240" r="1.4" opacity="0.65"/>
+    <circle cx="1240" cy="280" r="1.2" opacity="0.55"/>
+    <circle cx="1500" cy="170" r="1.3" opacity="0.7"/>
+    <circle cx="250" cy="330" r="1.2" opacity="0.45"/>
+    <circle cx="1010" cy="220" r="1.1" opacity="0.5"/>
+    <circle cx="1740" cy="330" r="1.4" opacity="0.6"/>
+  </g>
+
+  <!-- moon -->
+  <circle cx="1520" cy="250" r="150" fill="url(#moonglow)"/>
+  <circle cx="1520" cy="250" r="62" fill="#f7ecd2"/>
+
+  <!-- far ridge -->
+  <path fill="url(#ridgefar)" opacity="0.85"
+        d="M0 660 L110 600 L235 650 L360 545 L505 625 L640 560 L790 640
+           L930 530 L1080 615 L1215 555 L1360 635 L1495 570 L1640 645
+           L1780 585 L1920 655 L1920 1080 L0 1080 Z"/>
+
+  <!-- mid ridge -->
+  <path fill="url(#ridgemid)"
+        d="M0 790 L140 700 L280 760 L430 640 L590 730 L740 660 L905 755
+           L1060 630 L1225 725 L1380 665 L1545 760 L1700 680 L1920 775
+           L1920 1080 L0 1080 Z"/>
+
+  <!-- near ridge with trees -->
+  <path fill="url(#ridgenear)"
+        d="M0 920 L90 870 L200 915 L330 830 L470 905 L610 845 L755 910
+           L900 820 L1050 900 L1195 850 L1345 915 L1490 840 L1640 905
+           L1790 855 L1920 910 L1920 1080 L0 1080 Z"/>
+
+  <!-- pines on near ridge -->
+  <g fill="#0c0a1e">
+    <path d="M240 900 l22 -70 l22 70 z"/>
+    <path d="M284 905 l18 -58 l18 58 z"/>
+    <path d="M880 885 l24 -76 l24 76 z"/>
+    <path d="M925 895 l17 -52 l17 52 z"/>
+    <path d="M1500 890 l23 -72 l23 72 z"/>
+    <path d="M1545 900 l16 -50 l16 50 z"/>
+    <path d="M620 915 l19 -60 l19 60 z"/>
+    <path d="M1210 920 l20 -62 l20 62 z"/>
+  </g>
+
+  <!-- water -->
+  <rect x="0" y="1002" width="1920" height="78" fill="url(#water)"/>
+  <rect x="0" y="1000" width="1920" height="3" fill="#8a6ba8" opacity="0.5"/>
+
+  <!-- moon reflection -->
+  <g fill="#f7ecd2" opacity="0.28">
+    <rect x="1490" y="1005" width="60" height="4"/>
+    <rect x="1478" y="1013" width="84" height="3"/>
+    <rect x="1500" y="1021" width="40" height="3"/>
+    <rect x="1470" y="1030" width="100" height="2.5"/>
+    <rect x="1495" y="1039" width="50" height="2"/>
+    <rect x="1482" y="1048" width="76" height="2"/>
+  </g>
+</svg>

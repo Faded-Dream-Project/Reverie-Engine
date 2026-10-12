@@ -1,0 +1,45 @@
+/* Reverie Engine — "Mountain Dusk"
+   Hand-drawn SVG ridgeline with stars, a parallax mountain layer, and a
+   soft interactive mist fluid drifting through the valley. */
+
+scene "Mountain Dusk" {
+    fps = 60
+
+    layer sky {
+        type = gradient
+        shape = linear
+        angle = 180
+        stops = [#0a0a2a, (#432b6b 0.45), (#b4486d 0.72), (#ff9e64 0.9), (#2b1a3d 1.0)]
+    }
+
+    layer stars {
+        type = image
+        src = "assets/stars.png"
+        fit = fill
+        opacity = 0.8
+        blend = screen
+        parallax = 0.05
+    }
+
+    layer mountains {
+        type = image
+        src = "assets/mountain.svg"
+        fit = fill
+        parallax = 0.14
+    }
+
+    layer mist {
+        type = fluid
+        res = 0.35
+        dye = #7fd4ff
+        dye2 = #ffb8d9
+        force = 10
+        radius = 0.022
+        dissipation = 0.28
+        ambient = 0.4
+        blend = screen
+        opacity = 0.45
+        blur = 5
+        anim opacity { from = 0.3; to = 0.6; dur = 14s; ease = sine; mode = pingpong }
+    }
+}
