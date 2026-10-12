@@ -20,10 +20,10 @@ into a single self-contained `.revpack` binary for distribution.
 
 ```
  ~ $ reverie scenes/mountain-dusk.rev
- [info] reverie 0.1.0 — backend=auto renderer=auto
+ [info] reverie 0.1.1 — backend=auto renderer=auto
  [info] backend: x11
- [info] renderer: opengl (tier 2)
- [info] renderer: opengl (tier 2, GPU compositing)
+ [info] renderer: vulkan (tier 3, CPU compositing)
+ [info] vulkan: GPU present capable (queue family 0); presenting via platform SHM path
         ... and your desktop is alive.
 ```
 
@@ -37,11 +37,15 @@ Reverie probes, in order, and takes the first that works:
  vulkan ──► opengl ──► opengl-on-llvmpipe ──► reverie's own CPU engine
 ```
 
-* **vulkan** — swapchain presentation: the frame is uploaded once to a
-  host-visible staging buffer and copied into the swapchain image with image
-  barriers. Driven by `dlopen("libvulkan.so.1")` plus a hand-vendored set of
-  declarations verified against the official Khronos headers. No Vulkan SDK
-  is needed to build or run.
+* **vulkan** — the engine composites on CPU and presents via the GPU: the
+  frame is uploaded once to a host-visible staging buffer and copied into
+  the swapchain image with image barriers. Driven by `dlopen("libvulkan.so.1")`
+  plus a hand-vendored set of declarations verified against the official
+  Khronos headers. No Vulkan SDK is needed to build or run.
+  Since 0.1.1 the swapchain present is opt-in (`REV_VK_PRESENT=wsi`): the
+  default presents through the platform's proven path (MIT-SHM / wl_shm)
+  after field reports of driver-specific XWayland black screens with no
+  error output. Both paths are E2E-tested and pixel-exact.
 * **opengl** — full GPU compositing: layers are uploaded as textures,
   blurred with a downsample + separable gaussian pipeline, and blended with
   W3C blend-mode shaders that mirror the CPU implementation exactly.
@@ -99,7 +103,10 @@ verified end-to-end under Xvfb:
 * the raw Wayland client is exercised against a hand-written fake
   compositor over a socketpair — registry binds verified byte-exact, shm
   pools mmap'd by the "server", premultiplied pixels checked, pointer
-  events and the closed flow included.
+  events and the closed flow included — **and** against a real weston +
+  libwayland-server instance (headless): the handshake must complete cleanly
+  and the client's first wire bytes are compared byte-for-byte against what
+  a real libwayland client sends (`scripts/e2e-wayland.sh`).
 
 ## Build
 
@@ -132,15 +139,30 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.0 (pre-release)
+## Status — 0.1.1 (pre-release)
+
+0.1.1 fixes the two field-reported 0.1.0 regressions:
+
+* **Wayland backend failed on every real compositor** ("protocol parse
+  error", then "registry roundtrip timed out"): the wire client encoded the
+  message header correctly but *decoded* compositor events with the size and
+  opcode bitfields swapped, so the very first server message failed framing.
+  Fixed, and the fix is pinned by a byte-exact golden test against real
+  libwayland traffic plus a live weston E2E (details in
+  [docs/BACKENDS.md](docs/BACKENDS.md)).
+* **Black screen when falling back to X11 on Wayland sessions**: the vulkan
+  tier presented through its WSI swapchain, which some real-driver XWayland
+  stacks silently drop (no error anywhere). 0.1.1 defaults the tier to the
+  platform's proven presenter (MIT-SHM / wl_shm); `REV_VK_PRESENT=wsi`
+  restores the swapchain path. Both are pixel-exact vs the CPU renderer.
 
 The 0.x series exists to prove the architecture on real hardware before any
 1.0 API freeze. Core module test coverage: DEFLATE/PNG codec, SVG stack,
 scene language, pack container, Wayland wire client — all green; X11 E2E
-pixel-exact; renderer chain E2E on llvmpipe + lavapipe. The 0.2 roadmap:
-Vulkan compute compositing (blurring and blending with shaders instead of
-present-only), the Wayland WSI shim graduating from experimental, more SVG
-filters.
+pixel-exact; renderer chain E2E on llvmpipe + lavapipe; Wayland E2E against
+real weston. The 0.2 roadmap: Vulkan compute compositing (blurring and
+blending with shaders instead of present-only), the Wayland WSI shim
+graduating from experimental, more SVG filters.
 
 ## Repository layout
 
@@ -148,7 +170,8 @@ filters.
 src/          engine sources (see docs/ARCHITECTURE.md)
 scenes/       example .rev scenes + hand-drawn assets
 tests/        unit + integration suites (incl. the Wayland fake compositor)
-scripts/e2e.sh   three-tier Xvfb end-to-end
+scripts/e2e.sh         Xvfb end-to-end, all renderer tiers present on the machine
+scripts/e2e-wayland.sh real-weston Wayland wire-protocol E2E (needs the test stack)
 docs/         FORMAT (scene language + .revpack), ARCHITECTURE, BACKENDS
 ```
 

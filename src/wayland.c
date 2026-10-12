@@ -97,6 +97,8 @@ struct WLDisplay {
 
         bool fatal;
         bool close_requested;
+        char wl_error[160];    /* text of the last wl_display.error, if any */
+        u32 comp_version;      /* wl_compositor version we bound */
 
         WLObject objs[160];
         int nobjs;
@@ -182,6 +184,8 @@ static bool wl_flush(WLDisplay *w)
 static bool wl_begin_req(WLDisplay *w, u32 obj, u32 opcode, size_t payload)
 {
         size_t total = 8 + payload;
+        if (getenv("REV_WL_TRACE"))
+                fprintf(stderr, "[wl-trace] REQ obj=%u op=%u size=%zu\n", obj, opcode, total);
         if (total > WL_WBUF_CAP) {
                 if (!wl_flush(w))
                         return false;
@@ -193,7 +197,10 @@ static bool wl_begin_req(WLDisplay *w, u32 obj, u32 opcode, size_t payload)
         u8 *p = w->wbuf + w->wlen;
         u32 sz = (u32)total;
         memcpy(p, &obj, 4);
-        u32 op = (opcode << 16) | (sz & 0xffff);
+        /* wire: second word = (size << 16) | opcode  — size in the HIGH 16
+         * bits, opcode in the LOW 16. Verified byte-exact against a live
+         * weston/libwayland roundtrip (see tests + docs/BACKENDS.md). */
+        u32 op = ((u32)sz << 16) | (opcode & 0xffffu);
         memcpy(p + 4, &op, 4);
         w->wlen += 8;
         return true;
@@ -233,7 +240,7 @@ static bool wl_create_pool(WLDisplay *w, u32 new_id, int fd, i32 size)
         u8 msg[16];
         u32 obj = w->shm;
         u32 sz = 16;
-        u32 op = (0 << 16) | sz;    /* opcode 0 */
+        u32 op = ((u32)sz << 16) | 0u;    /* opcode 0, size 16 */
         memcpy(msg, &obj, 4);
         memcpy(msg + 4, &op, 4);
         memcpy(msg + 8, &new_id, 4);
@@ -261,7 +268,7 @@ static bool wl_create_pool(WLDisplay *w, u32 new_id, int fd, i32 size)
 
 static bool req_get_registry(WLDisplay *w)
 {
-        if (!wl_begin_req(w, 1, 1, 4))
+        if (!wl_begin_req(w, 1, 1, 4))    /* wl_display.get_registry = request 1 */
                 return false;
         wl_put_u32(w, 2);    /* registry id = 2 */
         wl_obj_new(w, WK_REGISTRY, -1, -1);
@@ -272,7 +279,7 @@ static bool req_get_registry(WLDisplay *w)
 static bool req_sync(WLDisplay *w, u32 *cb_id_out)
 {
         u32 id = wl_obj_new(w, WK_CALLBACK, -1, -1);
-        if (!wl_begin_req(w, 1, 2, 4))
+        if (!wl_begin_req(w, 1, 0, 4))    /* wl_display.sync = request 0 */
                 return false;
         wl_put_u32(w, id);
         if (cb_id_out)
@@ -340,23 +347,75 @@ static f64 gfix(const u8 *p)
 }
 
 /* parses one event message at rbuf+rpos; returns bytes consumed or 0 if
- * incomplete, -1 on protocol violation */
+ * incomplete, -1 on protocol violation.
+ *
+ * Wire format (verified byte-exact against live weston + libwayland 1.23,
+ * see scripts/e2e-wayland.sh and tests/test_wayland.c):
+ *   word 0: object id
+ *   word 1: (size << 16) | opcode   — size INCLUDING the 8-byte header
+ * The same layout is used for client requests (wl_begin_req) and for
+ * compositor events, in both directions of the stream. */
 static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
 {
         if (avail < 8)
                 return 0;
         u32 obj = get32(p);
         u32 opword = get32(p + 4);
-        u32 opcode = opword >> 16;
-        u32 size = opword & 0xffff;
-        if (size < 8 || (size & 3) || size > WL_RBUF_CAP)
+        u32 size = opword >> 16;
+        u32 opcode = opword & 0xffff;
+        if (size < 8 || (size & 3) || size > WL_RBUF_CAP) {
+                if (getenv("REV_WL_TRACE"))
+                        fprintf(stderr, "[wl-trace] BAD MSG obj=%u op=%u size=%u avail=%zu bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                                obj, opcode, size, avail,
+                                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
                 return -1;
+        }
         if (avail < size)
                 return 0;
         const u8 *a = p + 8;
 
+        /* wl_display itself is object 1 — events land there without a
+         * client-side object entry. */
+        if (obj == 1) {
+                if (opcode == 0 && size >= 28) {
+                        /* wl_display.error(object_id, code, message) */
+                        u32 bad_obj = get32(a);
+                        u32 code = get32(a + 4);
+                        u32 slen = get32(a + 8);
+                        char msg[96] = { 0 };
+                        if (slen >= 1 && slen < 96)
+                                memcpy(msg, a + 12, slen - 1);
+                        snprintf(w->wl_error, sizeof w->wl_error,
+                                 "compositor error on object %u code %u: %s",
+                                 bad_obj, code, msg);
+                        LOGW("wayland: %s", w->wl_error);
+                        w->fatal = true;
+                }
+                /* opcode 1 = delete_id: our ids are never reused, so the
+                 * server-side retirement is a no-op for us. */
+                return (i64)size;
+        }
+
         WLObject *o = wl_obj_find(w, obj);
 
+        if (getenv("REV_WL_TRACE")) {
+                char desc[96] = "";
+                if (o) {
+                        if (o->kind == WK_REGISTRY && opcode == 0) {
+                                u32 slen = get32(a + 4);
+                                char ifn[64] = { 0 };
+                                if (slen >= 1 && slen <= 63)
+                                        memcpy(ifn, a + 8, slen - 1);
+                                snprintf(desc, sizeof desc, "global name=%u iface=%s v%u",
+                                         get32(a), ifn, get32(a + 8 + ((slen + 3) & ~3u)));
+                        } else {
+                                snprintf(desc, sizeof desc, "kind=%d", o->kind);
+                        }
+                } else {
+                        snprintf(desc, sizeof desc, "UNKNOWN-OBJ");
+                }
+                fprintf(stderr, "[wl-trace] EV obj=%u op=%u size=%u %s\n", obj, opcode, size, desc);
+        }
         switch (o ? o->kind : 0) {
         case WK_CALLBACK:
                 if (opcode == 0)
@@ -636,7 +695,11 @@ WLDisplay *wl_connect(char *err, size_t errcap)
                         }
                 }
                 if (!done) {
-                        snprintf(err, errcap, "wayland: registry roundtrip timed out");
+                        if (w->wl_error[0])
+                                snprintf(err, errcap, "wayland: registry roundtrip failed (%s)",
+                                         w->wl_error);
+                        else
+                                snprintf(err, errcap, "wayland: registry roundtrip timed out");
                         wl_disconnect(w);
                         return NULL;
                 }
@@ -656,7 +719,10 @@ WLDisplay *wl_connect(char *err, size_t errcap)
                 return NULL;
         }
 
-        if (!req_bind_typed(w, g_comp->name, "wl_compositor", g_comp->version < 4 ? g_comp->version : 4,
+        /* wl_compositor version: damage_buffer (surface op 9) needs v4 */
+        w->comp_version = g_comp->version < 6 ? g_comp->version : 6;
+        u32 bind_comp_v = w->comp_version;
+        if (!req_bind_typed(w, g_comp->name, "wl_compositor", bind_comp_v,
                             WK_COMPOSITOR, -1, -1, &w->compositor) ||
             !req_bind_typed(w, g_shm->name, "wl_shm", g_shm->version < 1 ? 1 : g_shm->version,
                             WK_SHM, -1, -1, &w->shm) ||
@@ -895,13 +961,16 @@ int wl_add_window(WLDisplay *w, int mon)
                 wl_put_u32(w, win->buf[0]);
                 wl_put_i32(w, 0);
                 wl_put_i32(w, 0);
-                if (!wl_begin_req(w, win->surface, 9, 16))    /* damage_buffer */
+                /* damage_buffer (op 9) exists since wl_surface v4; for older
+                 * compositors use logical damage (op 2) */
+                if (!wl_begin_req(w, win->surface, w->comp_version >= 4 ? 9 : 2,
+                                  w->comp_version >= 4 ? 16 : 20))
                         return -1;
                 wl_put_i32(w, 0);
                 wl_put_i32(w, 0);
                 wl_put_u32(w, win->pw);
                 wl_put_u32(w, win->ph);
-                if (win->scale > 1) {
+                if (win->scale > 1 && w->comp_version >= 3) {
                         if (!wl_begin_req(w, win->surface, 8, 4))    /* set_buffer_scale */
                                 return -1;
                         wl_put_i32(w, win->scale);
@@ -968,8 +1037,9 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
         wl_put_u32(w, win->buf[b]);
         wl_put_i32(w, 0);
         wl_put_i32(w, 0);
-        if (!wl_begin_req(w, win->surface, 9, 16))    /* damage_buffer */
-                return false;
+        if (!wl_begin_req(w, win->surface, w->comp_version >= 4 ? 9 : 2,
+                          w->comp_version >= 4 ? 16 : 20))
+                return false;    /* damage(_buffer) */
         wl_put_i32(w, 0);
         wl_put_i32(w, 0);
         wl_put_u32(w, width);

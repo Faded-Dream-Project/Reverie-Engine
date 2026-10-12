@@ -48,6 +48,7 @@ struct X11 {
         int rloss, gloss, bloss;
         u16 ext_shm, ext_xinerama;      /* major opcodes, 0 = absent */
         u16 ext_shm_ev;                 /* first event of MIT-SHM    */
+        bool is_xwayland;               /* "XWAYLAND" extension present */
         XWin wins[X11_MAX_WINS];
         int nwins;
         /* event queue (events drained while waiting for replies) */
@@ -459,10 +460,10 @@ X11 *x11_connect(char *err, size_t errcap)
         x->rid_next = 1;
 
         /* extensions */
-        const char *exts[] = { "MIT-SHM", "XINERAMA" };
-        u16 *bases[] = { &x->ext_shm, &x->ext_xinerama };
-        u16 *firsts[] = { &x->ext_shm_ev, NULL };
-        for (int e = 0; e < 2; e++) {
+        const char *exts[] = { "MIT-SHM", "XINERAMA", "XWAYLAND" };
+        u16 *bases[] = { &x->ext_shm, &x->ext_xinerama, NULL };
+        u16 *firsts[] = { &x->ext_shm_ev, NULL, NULL };
+        for (int e = 0; e < 3; e++) {
                 u8 q[32];
                 memset(q, 0, sizeof q);
                 u16 nlen = (u16)strlen(exts[e]);
@@ -474,10 +475,21 @@ X11 *x11_connect(char *err, size_t errcap)
                         goto conn_fail;
                 u8 *rep = read_reply(x, false);
                 if (rep && rep[8]) {
-                        *bases[e] = rep[9];
+                        if (bases[e])
+                                *bases[e] = rep[9];
                         if (firsts[e])
                                 *firsts[e] = rep[10];
-                        LOGI("x11: extension %s = opcode %u", exts[e], rep[9]);
+                        if (e == 2) {
+                                /* XWayland registers a fake "XWAYLAND"
+                                 * extension — its presence means we are on a
+                                 * Wayland session's X compatibility server.
+                                 * Diagnostic only: the desktop-window
+                                 * strategy already works there. */
+                                x->is_xwayland = true;
+                                LOGI("x11: XWayland detected (Wayland session's X server)");
+                        } else {
+                                LOGI("x11: extension %s = opcode %u", exts[e], rep[9]);
+                        }
                 }
         }
 

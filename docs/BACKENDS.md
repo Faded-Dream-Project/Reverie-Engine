@@ -56,11 +56,15 @@ and logged as such.)
   runtime-dlopen'd `libxcb.so.1`. The window XID comes from our own raw X11
   client — server-side objects are global, so this is legal without Xlib.
   Wayland WSI: the shim's `wl_display*`/`wl_surface*` (experimental).
-* Per frame: engine composites on the CPU → memcpy into a host-visible
-  staging buffer → `vkCmdCopyBufferToImage` with layout barriers → FIFO
-  present. SRGB surface formats are accepted: the copy path moves raw bytes
-  (no sampling), so they are visually identical to UNORM here.
-* Verified E2E on lavapipe: **pixel-exact vs the CPU renderer.**
+* **Present path (0.1.1):** the engine composites on the CPU and then either
+  - *platform present (default)* — hands the frame to the backend's proven
+    presenter (MIT-SHM on X11, wl_shm on Wayland), or
+  - *WSI present (`REV_VK_PRESENT=wsi`)* — memcpy into a host-visible
+    staging buffer → `vkCmdCopyBufferToImage` with layout barriers → FIFO
+    present.
+  The default flipped in 0.1.1 after a field report of a **black screen on
+  XWayland with a real GPU driver** (see Troubleshooting); both paths are
+  E2E-tested and pixel-exact vs the CPU renderer on lavapipe.
 
 ### tier 2 — opengl (GPU compositing)
 
@@ -92,12 +96,37 @@ and logged as such.)
 |---------------------|-----------------------------------------------------|
 | `REV_RENDERER`      | same as `--renderer`                                |
 | `REV_BACKEND`       | same as `--backend`                                 |
+| `REV_VK_PRESENT`    | `wsi` = vulkan tier presents via its swapchain (default: platform SHM path) |
 | `REV_WAYLAND_GPU`   | `1` = activate the experimental Wayland WSI shim    |
+| `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 
 ## Troubleshooting
 
-* **"compositor lacks ... zwlr_layer_shell_v1"** — GNOME Wayland. See the
-  caveat above; use X11 (XWayland counts as X11) or a wlroots compositor.
+* **"compositor lacks ... zwlr_layer_shell_v1"** — GNOME Wayland, or a
+  compositor without layer-shell (stock weston is another). See the caveat
+  above; use X11 (XWayland counts as X11) or a wlroots/KDE compositor.
+* **Black screen on a Wayland session (0.1.0 postmortem)** — the classic
+  0.1.0 failure chain on such sessions: the Wayland client failed its
+  handshake (bug below), the engine auto-fell back to X11 — which under a
+  Wayland session means **XWayland** (detected and logged as such since
+  0.1.1) — and the vulkan tier presented through its WSI swapchain, which
+  some real-driver XWayland stacks silently drop: every call succeeds, the
+  window never updates. 0.1.1 fixes both links: the Wayland handshake now
+  works natively (so the fallback usually never happens), and the vulkan
+  tier defaults to the platform presenter that the pre-0.1.0 engine shipped
+  (MIT-SHM into the same desktop window — the mechanism field-proven to
+  show). `REV_VK_PRESENT=wsi` restores the swapchain path if you want to
+  benchmark it.
+* **"protocol parse error" / "registry roundtrip timed out" (0.1.0
+  postmortem)** — the wire client *encoded* requests with the correct header
+  layout (`word1 = (size << 16) | opcode`) but *decoded* events with the two
+  16-bit fields swapped, so the first real compositor message failed
+  framing; the sync callback then never fired and the roundtrip timed out.
+  The fake-compositor test had missed it because both sides of that test
+  shared the same swapped decoder. Fixed in 0.1.1; the regression net is now
+  triple: the fake compositor uses the real format, a golden-byte test pins
+  our first 24 wire bytes to a capture from real libwayland, and
+  `scripts/e2e-wayland.sh` runs the client against a genuine weston.
 * **"vulkan unavailable (...)"** — read the reason in the log: no loader,
   no ICD, no presentable queue family, or the surface does not allow
   TRANSFER_DST usage (the engine falls through to GL).

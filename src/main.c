@@ -55,7 +55,10 @@ static void usage(void)
 "environment:\n"
 "  REV_RENDERER    same as --renderer\n"
 "  REV_BACKEND     same as --backend\n"
+"  REV_VK_PRESENT  wsi = vulkan tier presents via its swapchain\n"
+"                  (default: the platform's proven SHM present path)\n"
 "  REV_WAYLAND_GPU 1 = opt into the experimental Wayland GPU WSI shim\n"
+"  REV_WL_TRACE    1 = dump raw Wayland wire traffic to stderr\n"
 "\n"
 "renderer chain (auto): vulkan -> opengl -> opengl-on-llvmpipe -> cpu.\n");
 }
@@ -324,7 +327,9 @@ int main(int argc, char **argv)
                 return 1;
         }
         LOGI("renderer: %s (tier %d, %s)", rend->name, rend->tier,
-             rend->wants_layers ? "GPU compositing" : "CPU compositing + GPU present");
+             rend->wants_layers ? "GPU compositing" : "CPU compositing");
+        if (!rend->wants_layers && strcmp(rend->name, "vulkan") == 0)
+                LOGI("vulkan tier: present path follows REV_VK_PRESENT (default: platform SHM)");
 
         const bool gpu_layers = rend->wants_layers && rtscene_gpu_capable(sf.sc);
         if (rend->wants_layers && !gpu_layers)

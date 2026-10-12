@@ -398,6 +398,18 @@ typedef struct {
         bool ready;
 } VkWin_;
 
+/* Present-path selection (0.1.1):
+ *   PLATFORM: frames flow through the platform's proven presenter — MIT-SHM
+ *     on X11, wl_shm on Wayland. This is the DEFAULT: it is bit-identical to
+ *     the mechanism that worked everywhere in field reports, while the 0.1.0
+ *     swapchain present proved fragile on some real-driver XWayland stacks
+ *     (black screen with no error). See docs/BACKENDS.md.
+ *   WSI: the 0.1.0 behavior — staging upload + image copy + FIFO present via
+ *     the Vulkan WSI. Opt in with REV_VK_PRESENT=wsi (used by scripts/e2e.sh
+ *     so the path stays regression-tested). */
+#define VK_PRESENT_PLATFORM 0
+#define VK_PRESENT_WSI 1
+
 typedef struct {
         void *lib;
         void *libxcb;            /* X11 WSI transport */
@@ -407,6 +419,7 @@ typedef struct {
         VkDevice_ dev;
         VkQueue_ queue;
         u32 queue_family;
+        int present_mode;        /* VK_PRESENT_PLATFORM | VK_PRESENT_WSI */
         VkWin_ win[REV_PLATFORM_MAX_OUTPUTS];
         int cur_win;
 
@@ -977,6 +990,28 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
 
         v->vkGetDeviceQueue(v->dev, v->queue_family, 0, &v->queue);
 
+        /* 0.1.1 present-path selection: platform (default) or WSI */
+        {
+                const char *pm = getenv("REV_VK_PRESENT");
+                v->present_mode = (pm && strcmp(pm, "wsi") == 0) ? VK_PRESENT_WSI
+                                                                 : VK_PRESENT_PLATFORM;
+        }
+        if (v->present_mode == VK_PRESENT_PLATFORM) {
+                if (!p->present_cpu) {
+                        snprintf(err, errcap, "platform has no CPU present path");
+                        return false;
+                }
+                /* the probe surface has served its purpose (device selection);
+                 * the platform presenter owns the windows now */
+                if (probe) {
+                        v->vkDestroySurfaceKHR(v->inst, probe, NULL);
+                }
+                LOGI("vulkan: GPU present capable (queue family %u); presenting via "
+                     "platform SHM path — set REV_VK_PRESENT=wsi for swapchain present",
+                     v->queue_family);
+                return true;
+        }
+
         /* the probe surface becomes window 0's surface */
         v->win[0].surface = probe;
         {
@@ -1018,7 +1053,14 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
 static bool vk_begin(RRenderer *rr, int win, u32 w, u32 h)
 {
         RenderVK *v = (RenderVK *)rr->ctx;
-        if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS || !v->win[win].ready)
+        if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
+                return false;
+        v->cur_win = win;
+        if (v->present_mode == VK_PRESENT_PLATFORM) {
+                /* the platform presenter takes explicit sizes per frame */
+                return true;
+        }
+        if (!v->win[win].ready)
                 return false;
         if (v->win[win].width != w || v->win[win].height != h) {
                 v->win[win].width = w;
@@ -1044,8 +1086,19 @@ static bool vk_layer(RRenderer *rr, const RLayerCmd *cmd)
 static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
 {
         RenderVK *v = (RenderVK *)rr->ctx;
+        if (!cpu_frame || !cpu_frame->px)
+                return false;
+
+        /* platform-present mode: hand the composited frame to the backend's
+         * proven presenter (MIT-SHM / wl_shm). Same pixels, same window, the
+         * mechanism the 1.0-era engine shipped and every field report
+         * confirms — see the 0.1.0 XWayland black-screen postmortem. */
+        if (v->present_mode == VK_PRESENT_PLATFORM)
+                return v->plat->present_cpu(v->plat, v->cur_win,
+                                            cpu_frame->px, cpu_frame->w, cpu_frame->h);
+
         VkWin_ *w = &v->win[v->cur_win];
-        if (!w->ready || !cpu_frame || !cpu_frame->px)
+        if (!w->ready)
                 return false;
         if (cpu_frame->w != w->width || cpu_frame->h != w->height)
                 return false;
@@ -1164,6 +1217,8 @@ static void vk_resize(RRenderer *rr, int win, u32 w, u32 h)
         RenderVK *v = (RenderVK *)rr->ctx;
         if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
                 return;
+        if (v->present_mode == VK_PRESENT_PLATFORM)
+                return;    /* the platform presenter sizes per frame */
         VkWin_ *win_ = &v->win[win];
         if (!win_->ready)
                 return;
@@ -1219,7 +1274,7 @@ RRenderer *render_vk_create(void)
         }
         rr->name = "vulkan";
         rr->tier = 3;
-        rr->wants_layers = false;    /* present-only tier in 0.1.0 */
+        rr->wants_layers = false;    /* present-only tier in 0.1.x; see VK_PRESENT notes above */
         rr->ctx = v;
         rr->init = vk_init;
         rr->fini = vk_fini;
