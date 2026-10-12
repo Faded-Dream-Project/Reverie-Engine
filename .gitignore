@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.out
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Runtime junk
+*.log
+core

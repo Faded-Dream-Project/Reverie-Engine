@@ -1,0 +1,56 @@
+REVERIE ENGINE
+PROPRIETARY SOURCE LICENSE
+Copyright (c) 2026 FemBoyGamerTechGuy. All Rights Reserved.
+
+---------------------------------------------------------------------------
+
+This license governs the source code, documentation, scene files, assets
+and all other materials contained in this repository (collectively, the
+"Software"). By obtaining, viewing or otherwise accessing the Software you
+agree to the terms of this license.
+
+1. OWNERSHIP
+   The Software is and remains the exclusive property of the copyright
+   holder stated above. No title or ownership is transferred to you.
+   All rights not expressly granted (and none are granted below) are
+   reserved by the copyright holder.
+
+2. NO COPYING, MODIFICATION OR REDISTRIBUTION
+   You may NOT copy, reproduce, republish, upload, post, transmit, share,
+   mirror, sell, resell, sublicense or distribute the Software or any part
+   of it, in source or binary form, standalone or bundled with other
+   software. You may NOT modify, adapt, translate or create derivative
+   works of the Software.
+
+3. NO COMMERCIAL USE
+   The Software may not be used, in whole or in part, for any commercial
+   purpose without prior written permission from the copyright holder.
+
+4. LIMITED VIEWING RIGHT
+   You are granted a revocable, non-transferable, non-exclusive right to
+   view the source code of the Software for personal, non-commercial
+   evaluation and study only.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES
+   OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+6. TERMINATION
+   Any breach of this license terminates your limited viewing right
+   immediately, and you must destroy all copies of the Software in your
+   possession.
+
+7. TRADEMARKS
+   "Reverie Engine", the Reverie name and any associated marks are
+   trademarks of the copyright holder. Nothing in this license grants any
+   right to use them.
+
+For licensing inquiries, contact the copyright holder via the repository
+owner's GitHub profile: https://github.com/FemBoyGamerTechGuy
+
+---------------------------------------------------------------------------
+"Reverie Engine" — an interactive wallpaper engine written in pure C.
