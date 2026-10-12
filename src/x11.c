@@ -634,11 +634,10 @@ int x11_monitors(X11 *x, RRect *out, int max)
  * windows
  * ------------------------------------------------------------------------ */
 
-int x11_add_window(X11 *x, RRect geom)
+/* Creates a window (server resources + SHM) into slot `w`. Shared by
+ * x11_add_window and x11_resize_window. */
+static bool xwin_create(X11 *x, XWin *w, RRect geom)
 {
-        if (x->nwins >= X11_MAX_WINS)
-                return -1;
-        XWin *w = &x->wins[x->nwins];
         memset(w, 0, sizeof *w);
         w->w = (u32)geom.w;
         w->h = (u32)geom.h;
@@ -671,7 +670,7 @@ int x11_add_window(X11 *x, RRect geom)
                       | (1u << 17)/* StructureNotifyMask */
                       | (1u << 22)/* PropertyChangeMask */);
         if (!send_req(x, q, 40))
-                return -1;
+                return false;
 
         /* CreateGC */
         memset(q, 0, sizeof q);
@@ -681,7 +680,7 @@ int x11_add_window(X11 *x, RRect geom)
         put32(q + 8, wid);
         put32(q + 12, 0);         /* no values */
         if (!send_req(x, q, 16))
-                return -1;
+                return false;
 
         /* EWMH: desktop window */
         u32 a_type = intern_atom(x, "_NET_WM_WINDOW_TYPE");
@@ -711,7 +710,7 @@ int x11_add_window(X11 *x, RRect geom)
         put16(q + 2, 2);
         put32(q + 4, wid);
         if (!send_req(x, q, 8))
-                return -1;
+                return false;
 
         /* MIT-SHM setup: two shared segments */
         w->use_shm = false;
@@ -755,14 +754,59 @@ int x11_add_window(X11 *x, RRect geom)
                 }
                 w->fallback = (u8 *)malloc((size_t)w->w * w->h * 4);
                 if (!w->fallback)
-                        return -1;
+                        return false;
                 LOGI("x11: MIT-SHM unavailable, using core PutImage");
         }
 
         w->wid = wid;
         w->gc = gc;
         x11_sync(x);
+        return true;
+}
+
+int x11_add_window(X11 *x, RRect geom)
+{
+        if (x->nwins >= X11_MAX_WINS)
+                return -1;
+        XWin *w = &x->wins[x->nwins];
+        if (!xwin_create(x, w, geom))
+                return -1;
         return x->nwins++;
+}
+
+/* Destroy + re-create the window in slot `win` (new XID, same index). */
+bool x11_resize_window(X11 *x, int win, RRect geom)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return false;
+        XWin *w = &x->wins[win];
+
+        /* destroy the old server window */
+        if (w->wid) {
+                u8 q[8];
+                memset(q, 0, sizeof q);
+                q[0] = 4;            /* DestroyWindow */
+                put16(q + 2, 2);
+                put32(q + 4, w->wid);
+                send_req(x, q, 8);
+        }
+        /* detach shm segments */
+        for (int s = 0; s < 2; s++) {
+                if (w->shm[s].shmseg) {
+                        u8 a[12];
+                        memset(a, 0, sizeof a);
+                        a[0] = (u8)x->ext_shm;
+                        a[1] = 2;    /* ShmDetach */
+                        put16(a + 2, 3);
+                        put32(a + 4, w->shm[s].shmseg);
+                        send_req(x, a, 12);
+                }
+                if (w->shm[s].shmid > 0)
+                        shmdt(w->shm[s].mem);
+        }
+        free(w->fallback);
+        w->fallback = NULL;
+        return xwin_create(x, w, geom);
 }
 
 /* --------------------------------------------------------------------------
@@ -995,4 +1039,34 @@ u32 *x11_screenshot(X11 *x, int win, u32 *w, u32 *h)
         *w = wd->w;
         *h = wd->h;
         return out;
+}
+
+/* --------------------------------------------------------------------------
+ * GPU support accessors
+ * ------------------------------------------------------------------------ */
+
+u32 x11_window_xid(X11 *x, int win)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return 0;
+        return x->wins[win].wid;
+}
+
+/* GetWindowAttributes (opcode 3) — returns the window's visual.
+ * Reply: visual u32 @8. Returns 0 on failure. */
+u32 x11_win_visual(X11 *x, int win)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return 0;
+        u8 q[8];
+        memset(q, 0, sizeof q);
+        q[0] = 3;                /* GetWindowAttributes */
+        put16(q + 2, 2);
+        put32(q + 4, x->wins[win].wid);
+        if (!send_req(x, q, 8))
+                return 0;
+        u8 *rep = read_reply(x, false);
+        if (!rep || rep[0] != 1)
+                return 0;
+        return get32(rep + 8);
 }

@@ -12,6 +12,7 @@
 #include "arena.h"
 #include "png.h"
 #include "rev.h"
+#include "pack.h"
 #include "scene.h"
 #include "util.h"
 
@@ -31,7 +32,45 @@ static void usage(void)
 "      --drag X,Y       simulate a continuous drag toward X,Y\n"
 "  revtool mkpng <out.png> <W> <H> <pattern>\n"
 "      patterns: soft-bands | stars | checker | gradient | vignette\n"
-"  revtool pnginfo <file.png>\n");
+"  revtool pnginfo <file.png>\n"
+"  revtool pack <scene.rev> [-o out.revpack]\n"
+"      bundles the scene + every referenced asset into one .revpack\n"
+"  revtool unpack <file.revpack> [-d outdir]\n"
+"      extracts scene.rev + assets back into a directory\n");
+}
+
+static int cmd_pack(int argc, char **argv)
+{
+	const char *scene = argv[2];
+	const char *out = "scene.revpack";
+	for (int i = 3; i + 1 < argc; i++) {
+		if (!strcmp(argv[i], "-o") || !strcmp(argv[i], "--out"))
+			out = argv[i + 1];
+	}
+	char err[512];
+	if (!rev_pack_write(out, scene, err, sizeof err)) {
+		printf("FAIL: %s\n", err);
+		return 1;
+	}
+	printf("packed %s -> %s\n", scene, out);
+	return 0;
+}
+
+static int cmd_unpack(int argc, char **argv)
+{
+	const char *pack = argv[2];
+	const char *dir = "unpacked";
+	for (int i = 3; i + 1 < argc; i++) {
+		if (!strcmp(argv[i], "-d") || !strcmp(argv[i], "--dir"))
+			dir = argv[i + 1];
+	}
+	char err[512];
+	if (!rev_pack_unpack(pack, dir, err, sizeof err)) {
+		printf("FAIL: %s\n", err);
+		return 1;
+	}
+	printf("unpacked %s -> %s/\n", pack, dir);
+	return 0;
 }
 
 static int cmd_validate(const char *path)
@@ -370,6 +409,10 @@ int main(int argc, char **argv)
 		return cmd_render(argc, argv, 2);
 	if (strcmp(cmd, "mkpng") == 0 && argc >= 6)
 		return cmd_mkpng(argc, argv, 2);
+	if (strcmp(cmd, "pack") == 0 && argc >= 3)
+		return cmd_pack(argc, argv);
+	if (strcmp(cmd, "unpack") == 0 && argc >= 3)
+		return cmd_unpack(argc, argv);
 	if (strcmp(cmd, "pnginfo") == 0 && argc >= 3)
 		return cmd_pnginfo(argv[2]);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {

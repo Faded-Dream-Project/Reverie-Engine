@@ -191,3 +191,50 @@ Errors carry line numbers and say what they expected:
 $ revtool validate scenes/myscene.rev
 FAIL: layer 'sky' (line 14): gradient needs stops = [color, ...] (min 2)
 ```
+
+
+---
+
+## The .revpack container
+
+A `.revpack` bundles a scene's text with every referenced asset (PNG/SVG)
+into one checksummed binary, so a wallpaper ships as a single file. The
+daemon accepts `.rev` and `.revpack` interchangeably (it sniffs the magic).
+
+All integers are little-endian.
+
+```
+offset  size  field
+0       6     magic "REVPAK"
+6       2     u16 format version (currently 1)
+8       4     u32 scene_off        offset of the scene text
+12      4     u32 scene_len        scene text length (excluding NUL)
+16      4     u32 asset_count
+20      4     u32 name_blob_off    name/strings region offset
+24      4     u32 name_blob_len
+28      4     u32 data_off         asset data region offset
+32      4     u32 header_crc32     CRC-32 of bytes 0..31
+36      3     u8[3] writer engine version (e.g. 0.1.0 → 0,1,0)
+39      1     u8 flags (0)
+40      28×N  asset entries:
+              u32 name_off, u32 name_len        (into the name blob)
+              u64 data_off, u64 data_len
+              u32 data_crc32                    (over the asset bytes)
+...           name blob (NUL-terminated names, concatenated)
+...           scene text (NUL-terminated)
+...           asset data blobs
+```
+
+Loader rules: magic and version must match; every offset/length is bounds
+checked against the file; the header CRC and every asset CRC are verified;
+assets are addressed by the exact path string used in the scene's `src` /
+`image` properties. Missing assets in a pack fall back to disk with a
+warning (packs are built best-effort).
+
+Tooling:
+
+```
+revtool pack   scenes/mountain-dusk.rev -o dusk.revpack
+revtool unpack dusk.revpack -d dusk_dir/     # scene.rev + flat assets
+reverie dusk.revpack                          # runs directly from the pack
+```

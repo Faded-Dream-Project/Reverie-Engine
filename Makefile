@@ -23,7 +23,7 @@ DEFS     = -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 OPTS     = -fno-math-errno -funroll-loops
 ALL_CFLAGS  = -std=c11 $(WARN) $(DEFS) $(CFLAGS) $(OPTS) -Isrc
 LDFLAGS     =
-LIBS        = -lm
+LIBS        = -lm -ldl
 
 BUILD   = build
 
@@ -35,6 +35,7 @@ CORE_SRC = \
 	src/simd.c \
 	src/inflate.c \
 	src/png.c \
+	src/pack.c \
 	src/geom.c \
 	src/raster.c \
 	src/svg.c \
@@ -43,7 +44,17 @@ CORE_SRC = \
 	src/composite.c \
 	src/fluid.c \
 	src/ripple.c \
-	src/particles.c
+	src/particles.c \
+	src/platform.c \
+	src/x11.c \
+	src/plat_x11.c \
+	src/plat_wayland.c \
+	src/wayland.c \
+	src/wlshim.c \
+	src/render.c \
+	src/render_cpu.c \
+	src/render_gl.c \
+	src/render_vk.c
 
 CORE_OBJ = $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))
 LIBREV   = $(BUILD)/libreverie.a
@@ -68,8 +79,8 @@ $(BUILD)/%.o: src/%.c | $(BUILD)
 $(LIBREV): $(CORE_OBJ)
 	$(AR) rcs $@ $(CORE_OBJ)
 
-$(BUILD)/reverie: $(BUILD)/main.o $(BUILD)/x11.o $(LIBREV)
-	$(CC) $(ALL_CFLAGS) -o $@ $(BUILD)/main.o $(BUILD)/x11.o $(LIBREV) $(LDFLAGS) $(LIBS)
+$(BUILD)/reverie: $(BUILD)/main.o $(LIBREV)
+	$(CC) $(ALL_CFLAGS) -o $@ $(BUILD)/main.o $(LIBREV) $(LDFLAGS) $(LIBS)
 
 $(BUILD)/revtool: $(BUILD)/revtool.o $(LIBREV)
 	$(CC) $(ALL_CFLAGS) -o $@ $(BUILD)/revtool.o $(LIBREV) $(LDFLAGS) $(LIBS)
@@ -78,7 +89,7 @@ $(BUILD)/%.o: tests/%.c | $(BUILD)
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 $(BUILD)/test_%: $(BUILD)/test_%.o $(LIBREV)
-	$(CC) $(ALL_CFLAGS) -o $@ $< $(LIBREV) $(LDFLAGS) $(LIBS)
+	$(CC) $(ALL_CFLAGS) -o $@ $< $(LIBREV) $(LDFLAGS) $(LIBS) -lpthread
 
 test: $(TEST_BIN)
 	@fail=0; \

@@ -15,3 +15,4 @@ build/
 # Runtime junk
 *.log
 core
+docs/img/

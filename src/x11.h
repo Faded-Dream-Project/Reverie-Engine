@@ -50,3 +50,11 @@ void x11_root_size(X11 *x, u32 *w, u32 *h);
 u32 *x11_screenshot(X11 *x, int win, u32 *w, u32 *h);
 
 #endif /* REV_X11_H */
+
+/* GPU surface support: window XID (for EGL/Vulkan surface creation on the
+ * same server from another library's connection) and the window's visual. */
+u32 x11_window_xid(X11 *x, int win);
+u32 x11_win_visual(X11 *x, int win);
+
+/* Destroy + re-create a window in the same slot (new XID, same index). */
+bool x11_resize_window(X11 *x, int win, RRect geom);

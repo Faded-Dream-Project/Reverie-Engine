@@ -3,23 +3,30 @@
 One process, one thread, zero locks. Data flows in one direction:
 
 ```
- .rev file ──rev.c──▶ IR ──scene.c──▶ RTScene ──┐
-                                               │ per frame
- pointer ──x11.c──▶ per-monitor pointer state ─┤
-                                               ▼
-                    ┌──────────── scene.c: rtscene_render ────────────┐
-                    │ for each layer (bottom → top):                   │
-                    │   anims → effective props                        │
-                    │   content raster (cached / simulated)            │
-                    │   blur (cached for static layers)                │
-                    │   blend into accumulator (composite.c)           │
-                    └───────────────────────┬──────────────────────────┘
-                                            ▼ RGBA8 straight-alpha
-                    ┌──────── x11.c: x11_present ─────────────────────┐
-                    │ convert to visual layout → SHM segment →        │
-                    │ ShmPutImage (double-buffered) → X server window │
-                    └─────────────────────────────────────────────────┘
-```
+ .rev/.revpack ──rev.c/pack.c──▶ IR ──scene.c──▶ RTScene ──┐
+                                                            │ per frame
+            platform.h: pump()/pointer() ──▶ pointer state ─┤
+                                                            ▼
+              ┌──── scene.c: render_core ────────────────────────────┐
+              │ per layer (bottom → top):                           │
+              │   anims → effective props                            │
+              │   content raster (cached / simulated)                │
+              │   CPU mode: blur (cached) + blend into the accumulator│
+              │   GPU mode: emit RTLayerCmd (raster+blend+blur+pos)  │
+              └──────────────────────┬───────────────────────────────┘
+                                       ▼
+              ┌──── render.h: RRenderer chain ───────────────────────┐
+              │ vulkan: CPU frame → staging buffer → CopyBufferToImage│
+              │         → barriers → swapchain present               │
+              │ opengl: layer cmds → textures → premultiply →         │
+              │         downsample+separable blur → W3C blend shader  │
+              │         → ping-pong accum → eglSwapBuffers            │
+              │ cpu:    layer cmds → composite.c blur+blend →         │
+              │         platform present (SHM / wl_shm)               │
+              └──────────────────────┬───────────────────────────────┘
+                                       ▼
+              platform.h: X11 raw wire / Wayland raw wire
+``````
 
 ## Modules
 
@@ -40,9 +47,19 @@ One process, one thread, zero locks. Data flows in one direction:
 | `fluid.c`       | Stam "stable fluids": pressure projection (Gauss–Seidel), semi-Lagrangian advection, vorticity confinement, dye at 2× velocity resolution, ambient forcing |
 | `ripple.c`      | wave-equation height field; refraction of the below-composite + specular highlights |
 | `particles.c`   | deterministic PRNG particle system with ambient presets and pointer bursts |
+| `pack.c`        | **the .revpack container** — scene + assets in one CRC-checked binary |
+| `platform.c/.h` | display-backend abstraction: monitors, windows, pointer, present |
+| `plat_x11.c`    | RPlatform over x11.c |
+| `plat_wayland.c`| RPlatform over wayland.c (delegates to wlshim when active) |
 | `x11.c`         | **the raw X11 wire client** (see below) |
-| `main.c`        | the daemon: arg parsing, monitor setup, frame loop, pointer polling, hot-reload |
-| `revtool.c`     | CLI: validate / info / offline render (with simulated pointer+drag) / mkpng / pnginfo |
+| `wayland.c`     | **the raw Wayland wire client**: registry, layer-shell, wl_shm, pointer |
+| `render.c/.h`   | renderer interface + the auto chain (vulkan → opengl → cpu) |
+| `render_cpu.c`  | tier 1: composite.c-based compositor + platform present |
+| `render_gl.c`   | tier 2: dlopen'd EGL/ES3, GLSL premultiply/blur/blend/present pipeline |
+| `render_vk.c`   | tier 3: dlopen'd libvulkan, staging-buffer copy present path |
+| `wlshim.c`      | EXPERIMENTAL opt-in Wayland GPU WSI shim (real libwayland-client via dlopen) |
+| `main.c`        | the daemon: backend+renderer selection, frame loop, pointer, hot-reload, --shot E2E hook |
+| `revtool.c`     | CLI: validate / info / offline render / pack / unpack / mkpng / pnginfo |
 
 ## Pixel convention
 

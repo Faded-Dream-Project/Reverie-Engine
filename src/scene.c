@@ -83,6 +83,7 @@ typedef struct RTLayer {
 struct RTLayerInst {
         u32 w, h;
         RFb raster;           /* static content at (w,h)            */
+        RFb sim_fb;           /* persistent sim render target        */
         bool raster_ok;
         RFb blurred;
         f64 blur_amt;
@@ -112,6 +113,8 @@ struct RTScene {
         } ptr[RT_MAX_MONITORS];
         char *base_dir;
         RArena *ir_arena;     /* borrowed: IR must outlive the scene */
+        void *asset_ctx;
+        RTAssetFn asset_fn;
 };
 
 /* --------------------------------------------------------------------------
@@ -450,6 +453,8 @@ void rtscene_free(RTScene *sc)
                         if (!in)
                                 continue;
                         free(in->raster.px);
+                                        free(in->sim_fb.px);
+                                        in->sim_fb.px = NULL;
                         free(in->blurred.px);
                         fluid_free(in->fluid);
                         ripple_free(in->ripple);
@@ -465,6 +470,23 @@ void rtscene_free(RTScene *sc)
         free(sc->title);
         free(sc->base_dir);
         free(sc);
+}
+
+void rtscene_set_asset_provider(RTScene *sc, void *ctx, RTAssetFn fn)
+{
+        if (!sc)
+                return;
+        sc->asset_ctx = ctx;
+        sc->asset_fn = fn;
+        /* force reload of any cached sources */
+        for (int i = 0; i < sc->n; i++)
+                for (int m = 0; m < RT_MAX_MONITORS; m++) {
+                        RTLayerInst *in = sc->layers[i].inst[m];
+                        if (in) {
+                                in->img_loaded = false;
+                                in->raster_ok = false;
+                        }
+                }
 }
 
 const char *rtscene_title(const RTScene *sc) { return sc ? (sc->title ? sc->title : "") : ""; }
@@ -612,7 +634,7 @@ static void build_solid_raster(RFb *fb, RColor c)
                 fb->px[i] = v;
 }
 
-static bool load_source(RTLayer *L, RTLayerInst *in, char *err, size_t errcap)
+static bool load_source(RTScene *sc, RTLayer *L, RTLayerInst *in, char *err, size_t errcap)
 {
         if (in->img_loaded)
                 return in->img_is_svg ? in->svg != NULL : in->img.px != NULL;
@@ -620,6 +642,30 @@ static bool load_source(RTLayer *L, RTLayerInst *in, char *err, size_t errcap)
         in->img_loaded = true;
         bool is_svg = rev_str_ends_with_ci(L->src, ".svg");
         in->img_is_svg = is_svg;
+
+        /* packed asset? decode from memory first */
+        if (sc->asset_fn) {
+                size_t mlen = 0;
+                const u8 *mdata = sc->asset_fn(sc->asset_ctx, L->src, &mlen);
+                if (mdata && mlen) {
+                        if (is_svg) {
+                                in->svg = rev_svg_parse((const char *)mdata, mlen, err, errcap);
+                                if (!in->svg)
+                                        return false;
+                                f64 w = 0, h = 0;
+                                rev_svg_intrinsic_size(in->svg, &w, &h);
+                                in->src_w = w > 0 ? w : 16;
+                                in->src_h = h > 0 ? h : 9;
+                        } else {
+                                if (!rev_png_decode(mdata, mlen, &in->img, err, errcap))
+                                        return false;
+                                in->src_w = in->img.w;
+                                in->src_h = in->img.h;
+                        }
+                        return true;
+                }
+                /* fall through to disk */
+        }
 
         if (is_svg) {
                 char e2[256];
@@ -715,16 +761,47 @@ static RTLayerInst *get_inst(RTLayer *L, int mon)
         return L->inst[mon];
 }
 
-void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
+/* --------------------------------------------------------------------------
+ * render core: composites into `fb` (CPU mode, fl == NULL) or emits layer
+ * commands into `fl` (GPU offload mode, fb == NULL). Emission mode skips
+ * CPU blur (the renderer blurs on the GPU) and requires ripple-free scenes.
+ * ------------------------------------------------------------------------ */
+
+static bool ensure_sim_fb(RTLayerInst *in, u32 w, u32 h)
 {
-        if (!sc || !fb || !fb->px || fb->w == 0 || fb->h == 0)
+        if (in->sim_fb.px && in->sim_fb.w == w && in->sim_fb.h == h)
+                return true;
+        free(in->sim_fb.px);
+        in->sim_fb.px = (u32 *)malloc((size_t)w * h * 4);
+        in->sim_fb.w = w;
+        in->sim_fb.h = h;
+        return in->sim_fb.px != NULL;
+}
+
+bool rtscene_gpu_capable(const RTScene *sc)
+{
+        if (!sc)
+                return false;
+        for (int i = 0; i < sc->n; i++)
+                if (sc->layers[i].type == LT_RIPPLE)
+                        return false;
+        return true;
+}
+
+static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f64 dt)
+{
+        if (!sc || (!fb && !fl))
+                return;
+        if (fl && fb)
+                return;    /* mutually exclusive modes */
+        if (fb && (!fb->px || fb->w == 0 || fb->h == 0))
                 return;
         if (mon < 0 || mon >= RT_MAX_MONITORS)
                 mon = 0;
         if (dt <= 0) dt = 1.0 / sc->fps;
         if (dt > 0.1) dt = 0.1;
 
-        f64 W = fb->w, H = fb->h;
+        f64 W = fb ? fb->w : fl->w, H = fb ? fb->h : fl->h;
         /* normalized pointer for this monitor (default center) */
         f64 px = 0.5, py = 0.5, pdx = 0, pdy = 0;
         bool pressed = false;
@@ -756,8 +833,18 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                 u32 rw = (u32)(W * pf + 0.5), rh = (u32)(H * pf + 0.5);
 
                 const RFb *srcfb = NULL;
+                f64 emit_blur = e.blur;    /* GPU mode: sigma passed through  */
 
                 if (L->type == LT_RIPPLE) {
+                        if (fl) {
+                                /* ripple needs the below-composite: CPU-only */
+                                static bool warned_ripple;
+                                if (!warned_ripple) {
+                                        warned_ripple = true;
+                                        LOGW("layer '%s': ripple requires CPU compositing", L->name);
+                                }
+                                continue;
+                        }
                         if (!in->ripple) {
                                 in->ripple = ripple_new(fb->w, fb->h);
                                 if (in->ripple)
@@ -783,7 +870,7 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                         }
                 } else if (L->type == LT_FLUID) {
                         if (!in->fluid) {
-                                in->fluid = fluid_new(fb->w, fb->h, L->f_res);
+                                in->fluid = fluid_new((u32)W, (u32)H, L->f_res);
                                 if (in->fluid)
                                         fluid_configure(in->fluid, L->f_dye, L->f_dye2, L->f_force,
                                                         L->f_radius, L->f_dissip, L->f_ambient);
@@ -793,18 +880,28 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                                                 e.radius, L->f_dissip, L->f_ambient);
                                 fluid_pointer(in->fluid, px, py, pdx, pdy, pressed);
                                 fluid_step(in->fluid, dt);
-                                if (!scratch.px || scratch.w != fb->w || scratch.h != fb->h) {
-                                        free(scratch.px);
-                                        scratch.px = (u32 *)malloc((size_t)fb->w * fb->h * 4);
-                                        scratch.w = fb->w;
-                                        scratch.h = fb->h;
+                                RFb *target;
+                                if (fl) {
+                                        if (!ensure_sim_fb(in, (u32)W, (u32)H))
+                                                continue;
+                                        target = &in->sim_fb;
+                                } else {
+                                        if (!scratch.px || scratch.w != (u32)W || scratch.h != (u32)H) {
+                                                free(scratch.px);
+                                                scratch.px = (u32 *)malloc((size_t)W * H * 4);
+                                                scratch.w = (u32)W;
+                                                scratch.h = (u32)H;
+                                        }
+                                        target = &scratch;
                                 }
-                                fluid_render(in->fluid, scratch.px, fb->w, fb->h);
-                                srcfb = &scratch;
+                                if (target->px) {
+                                        fluid_render(in->fluid, target->px, (u32)W, (u32)H);
+                                        srcfb = target;
+                                }
                         }
                 } else if (L->type == LT_PARTICLES) {
                         if (!in->parts) {
-                                in->parts = particles_new(fb->w, fb->h);
+                                in->parts = particles_new((u32)W, (u32)H);
                                 if (in->parts)
                                         particles_configure(in->parts, L->p_preset, 0, L->p_rate, L->p_size,
                                                             L->p_grav, L->p_drift, L->p_spawn, L->p_c0, L->p_c1);
@@ -812,20 +909,32 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                         if (in->parts) {
                                 particles_pointer(in->parts, px, py, pressed);
                                 particles_step(in->parts, dt);
-                                if (!scratch.px || scratch.w != fb->w || scratch.h != fb->h) {
-                                        free(scratch.px);
-                                        scratch.px = (u32 *)malloc((size_t)fb->w * fb->h * 4);
-                                        scratch.w = fb->w;
-                                        scratch.h = fb->h;
+                                RFb *target;
+                                if (fl) {
+                                        if (!ensure_sim_fb(in, (u32)W, (u32)H))
+                                                continue;
+                                        target = &in->sim_fb;
+                                } else {
+                                        if (!scratch.px || scratch.w != (u32)W || scratch.h != (u32)H) {
+                                                free(scratch.px);
+                                                scratch.px = (u32 *)malloc((size_t)W * H * 4);
+                                                scratch.w = (u32)W;
+                                                scratch.h = (u32)H;
+                                        }
+                                        target = &scratch;
                                 }
-                                memset(scratch.px, 0, (size_t)scratch.w * scratch.h * 4);
-                                particles_render(in->parts, scratch.px, fb->w, fb->h);
-                                srcfb = &scratch;
+                                if (target->px) {
+                                        memset(target->px, 0, (size_t)W * H * 4);
+                                        particles_render(in->parts, target->px, (u32)W, (u32)H);
+                                        srcfb = target;
+                                }
                         }
                 } else {
                         /* static content with parallax oversize */
                         if (!in->raster_ok || in->raster.w != rw || in->raster.h != rh) {
                                 free(in->raster.px);
+                                        free(in->sim_fb.px);
+                                        in->sim_fb.px = NULL;
                                 in->raster.px = (u32 *)malloc((size_t)rw * rh * 4);
                                 in->raster.w = rw;
                                 in->raster.h = rh;
@@ -837,7 +946,7 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                                         build_solid_raster(&in->raster, L->color);
                                 } else {
                                         char err[256] = { 0 };
-                                        if (!load_source(L, in, err, sizeof err)) {
+                                        if (!load_source(sc, L, in, err, sizeof err)) {
                                                 LOGW("layer '%s': %s", L->name, err);
                                                 continue;
                                         }
@@ -853,7 +962,7 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                                 build_gradient_raster(&in->raster, L, &e);
                         }
 
-                        if (e.blur >= 0.5) {
+                        if (e.blur >= 0.5 && !fl) {
                                 if (!in->blurred_ok || in->blur_amt != e.blur ||
                                     in->blurred.w != rw || in->blurred.h != rh) {
                                         free(in->blurred.px);
@@ -877,8 +986,28 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
                 if (!srcfb || !srcfb->px)
                         continue;
 
-                /* placement */
-                if ((u32)srcfb->w == fb->w && (u32)srcfb->h == fb->h) {
+                /* placement + composite/emit */
+                if (fl) {
+                        if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                break;
+                        RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                        cmd->px = srcfb->px;
+                        cmd->w = srcfb->w;
+                        cmd->h = srcfb->h;
+                        cmd->blend = L->blend;
+                        cmd->opacity = e.opacity;
+                        cmd->blur = (L->type == LT_IMAGE || L->type == LT_GRADIENT ||
+                                     L->type == LT_SOLID) ? emit_blur : 0.0;
+                        if ((u32)srcfb->w == (u32)W && (u32)srcfb->h == (u32)H) {
+                                cmd->dx = 0;
+                                cmd->dy = 0;
+                        } else {
+                                f64 ox = (W - srcfb->w) / 2.0 + (px - 0.5) * e.parallax * W * 0.04;
+                                f64 oy = (H - srcfb->h) / 2.0 + (py - 0.5) * e.parallax * H * 0.04;
+                                cmd->dx = (i32)ox;
+                                cmd->dy = (i32)oy;
+                        }
+                } else if ((u32)srcfb->w == fb->w && (u32)srcfb->h == fb->h) {
                         rev_comp_blend(fb, srcfb, L->blend, e.opacity);
                 } else {
                         f64 ox = (W - srcfb->w) / 2.0 + (px - 0.5) * e.parallax * W * 0.04;
@@ -891,4 +1020,17 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
         free(below_snap);
         sc->ptr[mon].dx = 0;
         sc->ptr[mon].dy = 0;
+}
+
+void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
+{
+        render_core(sc, fb, NULL, mon, t, dt);
+}
+
+void rtscene_render_layers(RTScene *sc, RTFrameList *fl, int mon, f64 t, f64 dt)
+{
+        if (!sc || !fl)
+                return;
+        fl->n = 0;
+        render_core(sc, NULL, fl, mon, t, dt);
 }
