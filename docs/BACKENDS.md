@@ -105,6 +105,21 @@ and logged as such.)
 * **"compositor lacks ... zwlr_layer_shell_v1"** — GNOME Wayland, or a
   compositor without layer-shell (stock weston is another). See the caveat
   above; use X11 (XWayland counts as X11) or a wlroots/KDE compositor.
+  Since 0.1.2 the message also reports how many globals were parsed, so a
+  false positive of this kind is immediately visible (see the postmortem
+  below).
+* **"compositor lacks ... zwlr_layer_shell_v1" on a compositor that HAS
+  layer-shell (0.1.2 postmortem)** — field report: a stacking compositor
+  advertised 57 globals (layer shell at #52, `wl_output` at #57), yet the
+  engine claimed layer shell was missing and fell back to XWayland. Root
+  cause: the registry's global table had a fixed capacity of **48** and
+  silently dropped everything past it — the parse was correct (the trace
+  printed every global), the *storage* was lossy. The test suite never saw
+  it because weston and the fake compositor advertise ~19 globals. Fixed by
+  growing the table on demand (same fix in the libwayland WSI shim, which
+  had its own 48-entry copy); the message now includes the parsed count;
+  a flood regression test replays the exact field layout (57 globals,
+  shell at #52, output at #57) and fails on the old code.
 * **Black screen on a Wayland session (0.1.0 postmortem)** — the classic
   0.1.0 failure chain on such sessions: the Wayland client failed its
   handshake (bug below), the engine auto-fell back to X11 — which under a
@@ -116,7 +131,12 @@ and logged as such.)
   tier defaults to the platform presenter that the pre-0.1.0 engine shipped
   (MIT-SHM into the same desktop window — the mechanism field-proven to
   show). `REV_VK_PRESENT=wsi` restores the swapchain path if you want to
-  benchmark it.
+  benchmark it. If the fallback still shows black on your stack, bisect it:
+  run `reverie <scene> --renderer cpu` (if the CPU tier shows, present and
+  compositing are fine and the delta is the GPU init), and use
+  `--shot out.png --shot-after 3` to read the window content back — a
+  correct PNG under a black screen means the window is being obscured or
+  restacked by the WM, not mis-rendered.
 * **"protocol parse error" / "registry roundtrip timed out" (0.1.0
   postmortem)** — the wire client *encoded* requests with the correct header
   layout (`word1 = (size << 16) | opcode`) but *decoded* events with the two

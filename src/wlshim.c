@@ -121,8 +121,8 @@ static struct {
         const struct wl_interface_ *wl_surface_iface;
         const struct wl_interface_ *wl_output_iface;
 
-        ShimGlobal globals[48];
-        int nglobals;
+        ShimGlobal *globals;   /* grown on demand — compositors advertise 50+ */
+        int nglobals, globcap;
         ShimOutput outputs[8];
         int noutputs;
         ShimWin wins[8];
@@ -160,10 +160,17 @@ static void on_global(void *data, wl_registry_ *reg, u32 name, const char *iface
 {
         (void)data;
         (void)reg;
-        if (S.nglobals >= (int)(sizeof S.globals / sizeof S.globals[0]))
-                return;
+        if (S.nglobals == S.globcap) {
+                int ncap = S.globcap ? S.globcap * 2 : 64;
+                ShimGlobal *ng = (ShimGlobal *)realloc(S.globals,
+                                                       (size_t)ncap * sizeof *ng);
+                if (!ng)
+                        return;    /* drop on OOM; required globals bind below */
+                S.globals = ng;
+                S.globcap = ncap;
+        }
         S.globals[S.nglobals].name = name;
-        snprintf(S.globals[S.nglobals].iface, sizeof S.globals[0].iface, "%s", iface ? iface : "?");
+        snprintf(S.globals[S.nglobals].iface, sizeof S.globals->iface, "%s", iface ? iface : "?");
         S.globals[S.nglobals].version = version;
         S.nglobals++;
 }
@@ -455,6 +462,9 @@ void wlshim_platform_fini(RPlatform *p)
                 S.disconnect(S.display);
                 S.display = NULL;
         }
+        free(S.globals);
+        S.globals = NULL;
+        S.globcap = 0;
         memset(&S, 0, sizeof S);
         S.tried = true;
 }

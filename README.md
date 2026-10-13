@@ -20,7 +20,7 @@ into a single self-contained `.revpack` binary for distribution.
 
 ```
  ~ $ reverie scenes/mountain-dusk.rev
- [info] reverie 0.1.1 — backend=auto renderer=auto
+ [info] reverie 0.1.2 — backend=auto renderer=auto
  [info] backend: x11
  [info] renderer: vulkan (tier 3, CPU compositing)
  [info] vulkan: GPU present capable (queue family 0); presenting via platform SHM path
@@ -139,9 +139,20 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.1 (pre-release)
+## Status — 0.1.2 (pre-release)
 
-0.1.1 fixes the two field-reported 0.1.0 regressions:
+0.1.2 fixes a field-reported 0.1.1 regression:
+
+* **Layer-shell compositors were mis-detected as lacking `zwlr_layer_shell_v1`**
+  ("compositor lacks required globals … falling back to X11") even though the
+  global was plainly advertised: the registry's global table had a fixed
+  capacity of 48, and the reporting stacking compositor advertises 57 — layer
+  shell at #52 and `wl_output` at #57 were silently dropped. The table now
+  grows on demand, the failure message reports how many globals were parsed,
+  and a flood regression test replays the exact field layout. (The same
+  48-entry cap existed in the libwayland WSI shim.)
+
+0.1.1 fixed the two field-reported 0.1.0 regressions:
 
 * **Wayland backend failed on every real compositor** ("protocol parse
   error", then "registry roundtrip timed out"): the wire client encoded the

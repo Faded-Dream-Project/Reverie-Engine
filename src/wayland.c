@@ -594,25 +594,50 @@ static void wl_dispatch_pending(WLDisplay *w)
  * globals bookkeeping (the registry events arrive before we have bound)
  * ------------------------------------------------------------------------ */
 
-#define WL_MAX_GLOBALS 48
+/* 0.1.2 field bug: a KWin/labwc-class stacking compositor advertises ~57
+ * globals; the fixed 48-entry table silently dropped zwlr_layer_shell_v1
+ * (global #52) and wl_output (#57) — layer shell was then mis-reported as
+ * missing and the engine bogusly fell back to XWayland. Real compositors
+ * vary wildly in global count, so the table now grows on demand. */
 typedef struct {
         u32 name;
         char iface[64];
         u32 version;
 } WLGlobal;
 
-static WLGlobal g_globals[WL_MAX_GLOBALS];
-static int g_nglobals;
+static WLGlobal *g_globals;
+static int g_nglobals, g_globcap;
 
 void wl_note_global(WLDisplay *w, u32 name, const char *iface, u32 version)
 {
         (void)w;
-        if (g_nglobals >= WL_MAX_GLOBALS)
-                return;
+        if (g_nglobals == g_globcap) {
+                int ncap = g_globcap ? g_globcap * 2 : 64;
+                WLGlobal *ng = (WLGlobal *)realloc(g_globals, (size_t)ncap * sizeof *ng);
+                if (!ng) {
+                        static bool warned;
+                        if (!warned) {
+                                warned = true;
+                                LOGW("wayland: global table OOM at %d entries, dropping %s",
+                                     g_nglobals, iface);
+                        }
+                        return;
+                }
+                g_globals = ng;
+                g_globcap = ncap;
+        }
         g_globals[g_nglobals].name = name;
-        snprintf(g_globals[g_nglobals].iface, sizeof g_globals[0].iface, "%s", iface);
+        snprintf(g_globals[g_nglobals].iface, sizeof g_globals->iface, "%s", iface);
         g_globals[g_nglobals].version = version;
         g_nglobals++;
+}
+
+static void wl_free_globals(void)
+{
+        free(g_globals);
+        g_globals = NULL;
+        g_globcap = 0;
+        g_nglobals = 0;
 }
 
 static const WLGlobal *find_global(const char *iface)
@@ -667,7 +692,7 @@ WLDisplay *wl_connect(char *err, size_t errcap)
         WLDisplay *w = (WLDisplay *)calloc(1, sizeof *w);
         w->fd = fd;
         w->next_id = 2;    /* registry gets id 2, matches the hardcoded wire value */
-        g_nglobals = 0;
+        wl_free_globals();
 
         if (!req_get_registry(w)) {
                 snprintf(err, errcap, "wayland: get_registry failed");
@@ -711,10 +736,11 @@ WLDisplay *wl_connect(char *err, size_t errcap)
         const WLGlobal *g_shell = find_global("zwlr_layer_shell_v1");
         if (!g_comp || !g_shm || !g_shell) {
                 snprintf(err, errcap,
-                         "wayland: compositor lacks required globals (%s%s%s)",
+                         "wayland: compositor lacks required globals (%s%s%s) — %d globals parsed",
                          !g_comp ? "wl_compositor " : "",
                          !g_shm ? "wl_shm " : "",
-                         !g_shell ? "zwlr_layer_shell_v1 (needed for wallpaper layer; GNOME does not support it)" : "");
+                         !g_shell ? "zwlr_layer_shell_v1 (needed for wallpaper layer; GNOME/Mutter does not support it)" : "",
+                         g_nglobals);
                 wl_disconnect(w);
                 return NULL;
         }
@@ -1127,4 +1153,5 @@ void wl_disconnect(WLDisplay *w)
         if (w->fd >= 0)
                 close(w->fd);
         free(w);
+        wl_free_globals();
 }

@@ -220,6 +220,8 @@ static void *phase_a(void *arg)
                 for (int i = 0; i < 5; i++) {
                         n = s_read_msg(msg, sizeof msg, NULL);
                         CHECK(n >= 24, "received bind");
+                        if (n < 24)
+                                continue;    /* client gone: skip stale-buffer parsing */
                         u32 name = s_get32(msg + 8);
                         u32 slen = s_get32(msg + 12);
                         char iface[64] = { 0 };
@@ -280,6 +282,135 @@ static void *phase_a(void *arg)
                 return NULL;
 }
 
+/* ---- flood regression (v0.1.2 field bug) -------------------------------------
+ * A stacking compositor (KWin/labwc class) advertised 57 globals; the fixed
+ * 48-entry global table silently dropped zwlr_layer_shell_v1 (global #52)
+ * and wl_output (#57) — layer shell was mis-reported as missing and the
+ * engine bogusly fell back to XWayland. Flood the registry past the old cap
+ * with the required globals at their FIELD positions and require a clean
+ * connect with layer shell bound. */
+static u32 flood_shell_name, flood_output_name;
+
+static void *phase_flood(void *arg)
+{
+        (void)arg;
+        cli_fd = accept(srv_fd, NULL, NULL);
+        if (cli_fd < 0)
+                return NULL;
+
+        /* client opens with get_registry + sync (golden bytes checked below
+         * in the canonical scenario; here we only need the framing) */
+        n = s_read_msg(msg, sizeof msg, NULL);
+        n = s_read_msg(msg, sizeof msg, NULL);
+        u32 sync_cb = s_get32(msg + 8);
+
+        /* 57 globals, required ones at their field positions: wl_shm #2,
+         * wl_compositor #11, wl_seat #17, zwlr_layer_shell_v1 #52,
+         * wl_output #57 — both shell and output sit past the old 48 cap. */
+        static const struct { u32 name; const char *iface; u32 v; } req[] = {
+                { 2,  "wl_shm", 2 },
+                { 11, "wl_compositor", 6 },
+                { 17, "wl_seat", 9 },
+                { 52, "zwlr_layer_shell_v1", 4 },
+                { 57, "wl_output", 4 },
+        };
+        char filler[64];
+        for (u32 name = 1; name <= 57; name++) {
+                const char *iface = NULL;
+                u32 v = 1;
+                for (size_t i = 0; i < sizeof req / sizeof req[0]; i++) {
+                        if (req[i].name == name) {
+                                iface = req[i].iface;
+                                v = req[i].v;
+                        }
+                }
+                if (!iface) {
+                        if (name == 33) {
+                                /* longest name from the field trace (47 chars) */
+                                iface = "ext_foreign_toplevel_image_capture_source_manager_v1";
+                        } else {
+                                snprintf(filler, sizeof filler, "wp_filler_global_%u_v1", name);
+                                iface = filler;
+                        }
+                }
+                s_send_str_event(OBJ_REGISTRY, 0, name, iface, v);
+        }
+        s_send(sync_cb, 0, NULL, 0);
+        {
+                u8 d[4];
+                s_put32(d, sync_cb);
+                s_send(OBJ_DISPLAY, 1, d, 4);   /* delete_id */
+        }
+
+        /* five binds: compositor, shm, layer_shell, seat, output */
+        for (int i = 0; i < 5; i++) {
+                n = s_read_msg(msg, sizeof msg, NULL);
+                CHECK(n >= 24, "flood: received bind");
+                if (n < 24)
+                        continue;    /* client gone: skip stale-buffer parsing */
+                u32 name = s_get32(msg + 8);
+                u32 slen = s_get32(msg + 12);
+                char iface[64] = { 0 };
+                memcpy(iface, msg + 16, slen > 63 ? 63 : slen - 1);
+                u32 padded = ((slen + 3) & ~3u);
+                u32 new_id = s_get32(msg + 20 + padded);
+                if (strcmp(iface, "wl_compositor") == 0) {
+                        S.compositor = new_id;
+                } else if (strcmp(iface, "wl_shm") == 0) {
+                        S.shm = new_id;
+                } else if (strcmp(iface, "zwlr_layer_shell_v1") == 0) {
+                        S.layer_shell = new_id;
+                        flood_shell_name = name;
+                } else if (strcmp(iface, "wl_seat") == 0) {
+                        S.seat = new_id;
+                } else if (strcmp(iface, "wl_output") == 0) {
+                        S.output = new_id;
+                        flood_output_name = name;
+                }
+        }
+        CHECK(S.layer_shell != 0 && flood_shell_name == 52,
+              "flood: layer_shell (global #52, past the old 48 cap) found + bound");
+        CHECK(S.output != 0 && flood_output_name == 57,
+              "flood: wl_output (global #57, past the old 48 cap) found + bound");
+
+        /* seat capabilities: pointer present */
+        {
+                u8 p[8];
+                s_put32(p, 1);
+                s_send(S.seat, 0, p, 4);
+        }
+        /* output geometry/mode/scale/done */
+        {
+                u8 p[32];
+                memset(p, 0, sizeof p);
+                s_put32(p, 0);
+                s_put32(p + 4, 0);
+                s_put32(p + 8, 640);
+                s_put32(p + 12, 400);
+                s_send(S.output, 0, p, 24);
+                u8 m[20];
+                memset(m, 0, sizeof m);
+                s_put32(m, 1);
+                s_put32(m + 4, 800);
+                s_put32(m + 8, 600);
+                s_put32(m + 12, 60000);
+                s_send(S.output, 1, m, 16);
+                u8 sc[8];
+                s_put32(sc, 2);
+                s_send(S.output, 3, sc, 4);
+                s_send(S.output, 2, NULL, 0);
+        }
+
+        /* get_pointer THEN the final sync (client order) */
+        n = s_read_msg(msg, sizeof msg, NULL);
+        n = s_read_msg(msg, sizeof msg, NULL);
+        if (n < 12)
+                return NULL;    /* client gone before the final roundtrip */
+        u32 sync2 = s_get32(msg + 8);
+        s_send(sync2, 0, NULL, 0);
+        return NULL;
+}
+
 static void *phase_b(void *arg)
 {
         (void)arg;
@@ -327,6 +458,8 @@ static void *phase_b(void *arg)
 
 int main(void)
 {
+        setvbuf(stdout, NULL, _IOLBF, 0);   /* failures stay visible if we die */
+
         /* runtime dir + socket */
         snprintf(runtime_dir, sizeof runtime_dir, "/tmp/revwltest.%d", (int)getpid());
         mkdir(runtime_dir, 0700);
@@ -355,6 +488,44 @@ int main(void)
 
         setenv("XDG_RUNTIME_DIR", runtime_dir, 1);
         setenv("WAYLAND_DISPLAY", sock_name, 1);
+
+        /* ---- flood regression run (fresh socket, fresh client state) ----- */
+        {
+                struct sockaddr_un fa;
+                memset(&fa, 0, sizeof fa);
+                fa.sun_family = AF_UNIX;
+                if (strlen(runtime_dir) + strlen("testwl-flood") + 1 >= sizeof fa.sun_path) {
+                        printf("flood runtime path too long\n");
+                        return 1;
+                }
+                snprintf(fa.sun_path, sizeof fa.sun_path, "%s/testwl-flood", runtime_dir);
+                unlink(fa.sun_path);
+                int save_srv = srv_fd;
+                srv_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (bind(srv_fd, (struct sockaddr *)&fa, sizeof fa) < 0) {
+                        printf("flood bind failed: %s\n", strerror(errno));
+                        return 1;
+                }
+                listen(srv_fd, 1);
+                setenv("WAYLAND_DISPLAY", "testwl-flood", 1);
+
+                char ferr[256] = { 0 };
+                pthread_t thf;
+                pthread_create(&thf, NULL, phase_flood, NULL);
+                WLDisplay *fw = wl_connect(ferr, sizeof ferr);
+                CHECK(fw != NULL, ferr[0] ? ferr : "flood: wl_connect with 57 globals");
+                pthread_join(thf, NULL);
+                wl_disconnect(fw);
+                close(cli_fd);
+                close(srv_fd);
+                srv_fd = save_srv;
+                unlink(fa.sun_path);
+
+                /* restore env + server state for the canonical scenario */
+                setenv("WAYLAND_DISPLAY", sock_name, 1);
+                memset(&S, 0, sizeof S);
+                flood_shell_name = flood_output_name = 0;
+        }
 
         /* client connects in a forked child? No — the client is in-process:
          * connect BEFORE accept by forking accept into the parent flow. Simplest:
