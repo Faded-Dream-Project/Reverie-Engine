@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "util.h"
 
 /* ---- libwayland ABI types ------------------------------------------------ */
 typedef struct wl_proxy wl_proxy_;
@@ -148,6 +149,12 @@ typedef struct {
         u32 pw, ph;         /* buffer (device-pixel) size */
         bool buf_free[2];
         int cur;
+        /* v0.2.0 frame pacing */
+        wl_proxy_ *frame_cb;   /* pending wl_surface.frame callback       */
+        bool frame_ready;      /* callback fired since last wait          */
+        bool gl_surface;       /* EGL owns this surface: the wl_shm
+                                * presenter must NOT touch it (the GL
+                                * renderer presents via eglSwapBuffers)    */
 } ShimWin;
 
 typedef struct {
@@ -159,6 +166,7 @@ typedef struct {
 typedef struct {
         wl_proxy_ *output;
         i32 lx, ly, pw, ph, scale;
+        i32 refresh_mhz;   /* mode refresh (mHz; 0 = unreported) */
         bool have_mode;
         int win;
 } ShimOutput;
@@ -179,7 +187,7 @@ static struct {
         const struct wl_interface_ *wl_output_iface;
         const struct wl_interface_ *wl_shm_pool_iface;
         const struct wl_interface_ *wl_buffer_iface;
-        u64 presents;        /* frames delivered through wl_shm (log milestone) */
+        const struct wl_interface_ *wl_callback_iface;
 
         ShimGlobal *globals;   /* grown on demand — compositors advertise 50+ */
         int nglobals, globcap;
@@ -190,9 +198,14 @@ static struct {
 
         f64 px, py, pdx, pdy;
         bool pvalid, ppressed, plasted;
+        bool press_edge, release_edge, click, click_pending;
+        f64 click_x, click_y;
+        u32 clicks;
         int ptr_win;
         u32 seat_caps;
         bool close_requested;
+        u64 presents;        /* frames delivered through wl_shm (log milestone) */
+        u64 drops;           /* presents dropped (both slots held)             */
 
         /* libwayland symbols (EXPORTED functions only — the generated inline
          * wrappers like wl_display_get_registry / wl_registry_bind /
@@ -314,6 +327,13 @@ static void on_ptr_enter(void *data, wl_proxy_ *ptr, u32 serial, wl_proxy_ *surf
                         S.px = out->lx + (f64)sx / 256.0;
                         S.py = out->ly + (f64)sy / 256.0;
                         S.pvalid = true;
+                        if (!S.plasted) {
+                                S.pdx = 0;
+                                S.pdy = 0;
+                        }
+                        /* enter position is a valid delta baseline (the jump
+                         * TO it is not a drag and never counts) */
+                        S.plasted = true;
                         S.ptr_win = i;
                         return;
                 }
@@ -330,8 +350,10 @@ static void on_ptr_motion(void *data, wl_proxy_ *ptr, u32 time, wl_fixed_t_ sx, 
         f64 nx = out->lx + (f64)sx / 256.0;
         f64 ny = out->ly + (f64)sy / 256.0;
         if (S.plasted) {
-                S.pdx = nx - S.px;
-                S.pdy = ny - S.py;
+                /* accumulate the whole drag between reads (was: last-event
+                 * delta only — multi-event drags lost most of their motion) */
+                S.pdx += nx - S.px;
+                S.pdy += ny - S.py;
         }
         S.px = nx;
         S.py = ny;
@@ -341,7 +363,21 @@ static void on_ptr_motion(void *data, wl_proxy_ *ptr, u32 time, wl_fixed_t_ sx, 
 static void on_ptr_button(void *data, wl_proxy_ *ptr, u32 serial, u32 time, u32 button, u32 state)
 {
         (void)data; (void)ptr; (void)serial; (void)time; (void)button;
-        S.ppressed = state == 1;
+        if (state == 1) {
+                S.ppressed = true;
+                S.press_edge = true;
+                S.click_x = S.px;   /* position at press */
+                S.click_y = S.py;
+                S.click_pending = true;
+        } else {
+                S.ppressed = false;
+                S.release_edge = true;
+                if (S.click_pending) {
+                        S.click = true;
+                        S.clicks++;
+                }
+                S.click_pending = false;
+        }
 }
 
 static void on_output_geometry(void *data, wl_proxy_ *out, i32 x, i32 y, i32 pw, i32 ph,
@@ -360,13 +396,14 @@ static void on_output_geometry(void *data, wl_proxy_ *out, i32 x, i32 y, i32 pw,
 
 static void on_output_mode(void *data, wl_proxy_ *out, u32 flags, i32 w, i32 h, i32 refresh)
 {
-        (void)data; (void)refresh;
+        (void)data;
         if (!(flags & 1))
                 return;
         for (int i = 0; i < S.noutputs; i++)
                 if (S.outputs[i].output == out) {
                         S.outputs[i].pw = w;
                         S.outputs[i].ph = h;
+                        S.outputs[i].refresh_mhz = refresh;
                         S.outputs[i].have_mode = true;
                         return;
                 }
@@ -452,6 +489,16 @@ static void on_layer_closed(void *data, wl_proxy_ *ls)
                 }
 }
 
+/* wl_callback.done — the compositor latched the frame this callback was
+ * requested for. data = the ShimWin that presented. */
+static void on_frame_done(void *data, wl_proxy_ *cb, u32 time)
+{
+        (void)cb; (void)time;
+        ShimWin *win = (ShimWin *)data;
+        if (win)
+                win->frame_ready = true;
+}
+
 /* ---- activation ------------------------------------------------------------- */
 
 static void shim_pool_destroy(ShimWin *win);    /* fwd: fini tears pools down */
@@ -523,6 +570,7 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
         *(void **)&S.wl_registry_iface = dlsym(S.lib, "wl_registry_interface");
         *(void **)&S.wl_shm_pool_iface = dlsym(S.lib, "wl_shm_pool_interface");
         *(void **)&S.wl_buffer_iface = dlsym(S.lib, "wl_buffer_interface");
+        *(void **)&S.wl_callback_iface = dlsym(S.lib, "wl_callback_interface");
         if (!S.wl_surface_iface || !S.wl_output_iface || !S.wl_pointer_iface ||
             !S.wl_registry_iface) {
                 snprintf(err, errcap, "wlshim: interface data symbols missing");
@@ -677,6 +725,10 @@ void wlshim_platform_fini(RPlatform *p)
                 if (S.proxy_destroy) {
                         for (int i = 0; i < S.nwins; i++) {
                                 shim_pool_destroy(&S.wins[i]);
+                                if (S.wins[i].frame_cb) {
+                                        S.proxy_destroy(S.wins[i].frame_cb);
+                                        S.wins[i].frame_cb = NULL;
+                                }
                                 if (S.wins[i].layer_surface)
                                         S.proxy_destroy(S.wins[i].layer_surface);
                                 if (S.wins[i].surface)
@@ -935,6 +987,17 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
         ShimWin *winp = &S.wins[win];
         if (winp->closed || !rgba)
                 return false;
+        if (winp->gl_surface) {
+                /* EGL owns this surface now (the GL renderer presents via
+                 * eglSwapBuffers); attaching wl_shm buffers would fight the
+                 * EGL swapchain for the same wl_surface. */
+                static bool warned;
+                if (!warned) {
+                        warned = true;
+                        LOGW("wlshim: window %d presented by EGL — wl_shm path idle", win);
+                }
+                return true;
+        }
 
         /* (re)create the pool when this frame's size changes (output scale
          * changes recreate the window buffers) */
@@ -961,8 +1024,10 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
                         b = i;
                         break;
                 }
-        if (b < 0)
+        if (b < 0) {
+                S.drops++;
                 return true;    /* compositor still holds both slots — drop frame */
+        }
 
         /* premultiply into the pool slot (ARGB8888 is premultiplied alpha) */
         u32 *dst = (u32 *)((u8 *)winp->pool_mem + (size_t)w * h * 4 * b);
@@ -991,6 +1056,21 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
         S.proxy_marshal(winp->surface, S.comp_version >= 4 ? 9 : 2,
                         0, 0, w, h);                                 /* damage(_buffer) */
         S.proxy_marshal(winp->surface, WL_SURFACE_COMMIT);
+
+        /* wl_surface.frame (opcode 3) — the pacing loop sleeps on this
+         * callback; the compositor fires it when the frame is latched. */
+        if (!winp->frame_cb && S.wl_callback_iface) {
+                winp->frame_cb = S.proxy_marshal_constructor(winp->surface, 3,
+                                                             S.wl_callback_iface, NULL);
+                if (winp->frame_cb) {
+                        static void (*const cb_listener[])(void) = {
+                                (void (*)(void))on_frame_done,
+                        };
+                        S.proxy_add_listener(winp->frame_cb,
+                                             (void (**)(void))cb_listener, winp);
+                }
+        }
+
         if (S.flush(S.display) < 0)
                 return false;
         winp->buf_free[b] = false;
@@ -1006,6 +1086,7 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
 
 void wlshim_pump(RPointerState *ptr)
 {
+        (void)ptr;    /* pointer state is read (and consumed) via wlshim_pointer */
         if (!S.active)
                 return;
         struct pollfd p = { S.get_fd(S.display), POLLIN, 0 };
@@ -1013,16 +1094,6 @@ void wlshim_pump(RPointerState *ptr)
                 S.dispatch(S.display);
         else
                 S.dispatch_pending(S.display);
-        if (ptr) {
-                ptr->valid = S.pvalid;
-                ptr->pressed = S.ppressed;
-                ptr->x = S.px;
-                ptr->y = S.py;
-                ptr->dx = S.pdx;
-                ptr->dy = S.pdy;
-        }
-        S.pdx = 0;
-        S.pdy = 0;
 }
 
 bool wlshim_pointer(RPointerState *out)
@@ -1038,7 +1109,81 @@ bool wlshim_pointer(RPointerState *out)
         out->dx = S.pdx;
         out->dy = S.pdy;
         out->pressed = S.ppressed;
+        out->press_edge = S.press_edge;
+        out->release_edge = S.release_edge;
+        out->click = S.click;
+        out->click_x = S.click_x;
+        out->click_y = S.click_y;
+        out->clicks = S.clicks;
+        /* consume-on-read — deltas/edges are delivered exactly once */
+        S.pdx = 0;
+        S.pdy = 0;
+        S.press_edge = false;
+        S.release_edge = false;
+        S.click = false;
         return true;
+}
+
+bool wlshim_wait_frame(f64 seconds)
+{
+        if (!S.active || !S.display)
+                return false;
+        if (seconds < 0)
+                seconds = 0;
+        f64 deadline = rev_monotonic() + seconds;
+
+        for (;;) {
+                struct pollfd p = { S.get_fd(S.display), POLLIN, 0 };
+                if (poll(&p, 1, 0) > 0)
+                        S.dispatch(S.display);
+                else
+                        S.dispatch_pending(S.display);
+
+                bool any = false;
+                for (int i = 0; i < S.nwins; i++) {
+                        if (S.wins[i].frame_cb && S.wins[i].frame_ready) {
+                                if (S.proxy_destroy)
+                                        S.proxy_destroy(S.wins[i].frame_cb);
+                                S.wins[i].frame_cb = NULL;
+                                S.wins[i].frame_ready = false;
+                                any = true;
+                        }
+                }
+                if (any)
+                        return true;
+
+                f64 rem = deadline - rev_monotonic();
+                if (rem <= 0)
+                        return false;
+                int ms = (int)(rem * 1000.0);
+                if (ms < 1)
+                        ms = 1;
+                if (ms > 16)
+                        ms = 16;
+                poll(&p, 1, ms);
+        }
+}
+
+u64 wlshim_dropped_frames(void)
+{
+        return S.drops;
+}
+
+int wlshim_monitor_refresh(int mon)
+{
+        if (mon < 0 || mon >= S.noutputs)
+                return 0;
+        i32 mhz = S.outputs[mon].refresh_mhz;
+        if (mhz < 10000 || mhz > 1000000)
+                return 0;
+        return (int)((mhz + 500) / 1000);
+}
+
+void wlshim_set_gl_surface(int win, bool on)
+{
+        if (win < 0 || win >= S.nwins)
+                return;
+        S.wins[win].gl_surface = on;
 }
 
 bool wlshim_win_geometry(int win, RRect *geom)

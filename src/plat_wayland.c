@@ -72,6 +72,14 @@ static f64 pw_monitor_scale(RPlatform *p, int mon)
         return wl_monitor_scale(c->wl, mon);
 }
 
+static int pw_monitor_refresh(RPlatform *p, int mon)
+{
+        PlatWayland *c = (PlatWayland *)p->ctx;
+        if (wlshim_active())
+                return wlshim_monitor_refresh(mon);
+        return wl_monitor_refresh(c->wl, mon);
+}
+
 static int pw_add_window(RPlatform *p, RRect geom)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
@@ -133,18 +141,23 @@ static bool pw_pointer(RPlatform *p, RPointerState *out)
         PlatWayland *c = (PlatWayland *)p->ctx;
         if (wlshim_active())
                 return wlshim_pointer(out);
-        memset(out, 0, sizeof *out);
-        f64 x, y, dx, dy;
-        bool pressed;
-        if (!wl_pointer(c->wl, &x, &y, &dx, &dy, &pressed))
-                return false;
-        out->valid = true;
-        out->x = x;
-        out->y = y;
-        out->dx = dx;
-        out->dy = dy;
-        out->pressed = pressed;
-        return true;
+        return wl_pointer(c->wl, out);
+}
+
+static bool pw_wait_frame(RPlatform *p, f64 seconds)
+{
+        PlatWayland *c = (PlatWayland *)p->ctx;
+        if (wlshim_active())
+                return wlshim_wait_frame(seconds);
+        return wl_wait_frame(c->wl, seconds);
+}
+
+static u64 pw_dropped_frames(RPlatform *p)
+{
+        PlatWayland *c = (PlatWayland *)p->ctx;
+        if (wlshim_active())
+                return wlshim_dropped_frames();
+        return wl_dropped_frames(c->wl);
 }
 
 static bool pw_win_geometry(RPlatform *p, int win, RRect *geom)
@@ -209,6 +222,7 @@ RPlatform *plat_wayland_create(void)
         p->fini = pw_fini;
         p->monitors = pw_monitors;
         p->monitor_scale = pw_monitor_scale;
+        p->monitor_refresh = pw_monitor_refresh;
         p->add_window = pw_add_window;
         p->present_cpu = pw_present_cpu;
         p->has_gpu = false;    /* set dynamically in init() */
@@ -217,6 +231,8 @@ RPlatform *plat_wayland_create(void)
         p->resize_window = pw_resize_window;
         p->pump = pw_pump;
         p->pointer = pw_pointer;
+        p->wait_frame = pw_wait_frame;
+        p->dropped_frames = pw_dropped_frames;
         p->win_geometry = pw_win_geometry;
         p->sync = pw_sync;
         p->should_close = pw_should_close;

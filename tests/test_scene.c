@@ -229,6 +229,33 @@ int main(void)
 			free(fb.px);
 			rtscene_free(sc);
 		}
+
+		/* v0.2.0 click latch, isolated on a FRESH scene so every changed
+		 * pixel is attributable to the click alone: a full press+release
+		 * between two renders (no held pointer at all) must still splash
+		 * via rtscene_click. Consume-once semantics are pinned by the
+		 * platform-layer suites (test_wayland / test_wlshim). */
+		{
+			RTScene *sc2 = compile(txt, err, sizeof err);
+			CHECK(sc2 != NULL, "recompile for click test: %s", err);
+			if (sc2) {
+				RFb fb = { calloc((size_t)W * H, 4), W, H };
+				rtscene_render(sc2, &fb, 0, 0.0, 1.0 / 30.0);   /* flat water */
+				u32 flatpx = fb.px[0];    /* uniform: base color through still water */
+				rtscene_pointer(sc2, 0, W * 0.5, H * 0.5, 0, 0, false);
+				rtscene_click(sc2, 0, W * 0.25, H * 0.25);
+				for (int i = 0; i < 4; i++)
+					rtscene_render(sc2, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+				int disturbed = 0;
+				for (size_t i = 0; i < (size_t)W * H; i++)
+					if (fb.px[i] != flatpx)
+						disturbed++;
+				CHECK(disturbed > 30,
+				      "click splash disturbs pixels (%d)", disturbed);
+				free(fb.px);
+				rtscene_free(sc2);
+			}
+		}
 	}
 
 	/* 7. screen blend brightens */

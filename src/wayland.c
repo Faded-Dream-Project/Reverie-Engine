@@ -28,6 +28,8 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "platform.h"
+#include "util.h"
 
 #define WL_RBUF_CAP 16384
 #define WL_WBUF_CAP 8192
@@ -48,6 +50,7 @@ enum {
         WK_OUTPUT,
         WK_LAYER_SHELL,
         WK_LAYER_SURFACE,
+        WK_FRAME_CB,     /* wl_surface.frame callback (win >= 0)   */
 };
 
 typedef struct {
@@ -62,6 +65,7 @@ typedef struct {
         u32 obj;
         i32 lx, ly;        /* logical position in global space      */
         i32 pw, ph;        /* physical pixel mode size              */
+        i32 refresh_mhz;   /* mode refresh (mHz; 0 = unreported)    */
         i32 scale;
         bool have_mode, have_geom, done;
         int win;           /* window index on this output, -1 none  */
@@ -85,6 +89,8 @@ typedef struct {
         bool closed;
         int cur;
         u32 last_serial;
+        u32 frame_cb;      /* pending wl_surface.frame callback id, 0 none */
+        bool frame_ready;  /* callback fired since last wait            */
 } WLWin;
 
 struct WLDisplay {
@@ -117,10 +123,18 @@ struct WLDisplay {
         WLWin wins[WL_MAX_OUTPUTS];
         int nwins;
 
-        /* pointer state */
+        /* pointer state — deltas ACCUMULATE between wl_pointer() reads (the
+         * old code overwrote them per motion event, collapsing a whole drag
+         * into the last event's delta); button transitions are latched so a
+         * click between two polls still reports a click edge. */
         f64 px, py, pdx, pdy;
         bool pvalid, ppressed, plasted;
+        bool press_edge, release_edge, click, click_pending;
+        f64 click_x, click_y;
+        u32 clicks;
         int ptr_win;
+
+        u64 drops;         /* presents dropped (both slots held)   */
 };
 
 /* --------------------------------------------------------------------------
@@ -418,8 +432,14 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
         }
         switch (o ? o->kind : 0) {
         case WK_CALLBACK:
-                if (opcode == 0)
+        case WK_FRAME_CB:
+                if (opcode == 0) {
+                        /* wl_callback.done — for a frame callback, latch the
+                         * per-window readiness the pacing loop sleeps on */
+                        if (o->kind == WK_FRAME_CB && o->win >= 0 && o->win < w->nwins)
+                                w->wins[o->win].frame_ready = true;
                         wl_obj_del(w, obj);    /* done */
+                }
                 break;
 
         case WK_REGISTRY: {
@@ -457,6 +477,7 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                         u32 flags = get32(a);
                         out->pw = gi32(a + 4);
                         out->ph = gi32(a + 8);
+                        out->refresh_mhz = gi32(a + 12);
                         if (flags & 1)         /* current mode */
                                 out->have_mode = true;
                 } else if (opcode == 2) { /* done */
@@ -484,6 +505,11 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                                         w->pdx = 0;
                                         w->pdy = 0;
                                 }
+                                /* the enter position is a valid delta baseline:
+                                 * motion after enter accumulates from it (the
+                                 * jump TO the enter position is not a drag and
+                                 * never counts) */
+                                w->plasted = true;
                         }
                 } else if (opcode == 1) { /* leave */
                         w->ptr_win = -1;
@@ -493,8 +519,11 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                                 WLOutput *out = &w->outputs[w->wins[w->ptr_win].out];
                                 f64 nx = out->lx + sx, ny = out->ly + sy;
                                 if (w->plasted) {
-                                        w->pdx = nx - w->px;
-                                        w->pdy = ny - w->py;
+                                        /* accumulate: a drag spanning several motion
+                                         * events between two polls must deliver the
+                                         * TOTAL delta, not the last event's */
+                                        w->pdx += nx - w->px;
+                                        w->pdy += ny - w->py;
                                 }
                                 w->px = nx;
                                 w->py = ny;
@@ -503,7 +532,21 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                         }
                 } else if (opcode == 3) { /* button(serial, time, button, state) */
                         u32 state = get32(a + 12);
-                        w->ppressed = state == 1;
+                        if (state == 1) {
+                                w->ppressed = true;
+                                w->press_edge = true;
+                                w->click_x = w->px;   /* position at press */
+                                w->click_y = w->py;
+                                w->click_pending = true;
+                        } else {
+                                w->ppressed = false;
+                                w->release_edge = true;
+                                if (w->click_pending) {
+                                        w->click = true;
+                                        w->clicks++;
+                                }
+                                w->click_pending = false;
+                        }
                 }
                 break;
         }
@@ -858,6 +901,17 @@ f64 wl_monitor_scale(WLDisplay *w, int mon)
         return (f64)(w->outputs[mon].scale < 1 ? 1 : w->outputs[mon].scale);
 }
 
+int wl_monitor_refresh(WLDisplay *w, int mon)
+{
+        if (!w || mon < 0 || mon >= w->noutputs)
+                return 0;
+        i32 mhz = w->outputs[mon].refresh_mhz;
+        /* mHz -> Hz, rounded; sanity gate against junk values */
+        if (mhz < 10000 || mhz > 1000000)
+                return 0;
+        return (int)((mhz + 500) / 1000);
+}
+
 int wl_add_window(WLDisplay *w, int mon)
 {
         if (mon < 0 || mon >= w->noutputs || w->nwins >= WL_MAX_OUTPUTS)
@@ -1079,7 +1133,9 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
                         break;
                 }
         if (b < 0) {
-                /* server still holds both buffers — drop this frame */
+                /* server still holds both buffers — drop this frame (the
+                 * double-buffer cycle is the real frame limiter here) */
+                w->drops++;
                 return true;
         }
 
@@ -1124,6 +1180,23 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
         }
         if (!wl_begin_req(w, win->surface, 6, 0))     /* commit */
                 return false;
+
+        /* wl_surface.frame (opcode 3) — request the callback the pacing loop
+         * sleeps on; the compositor fires it when this frame is latched, so
+         * the next present aligns with the actual repaint cycle.
+         * (Opcode sanity: destroy=0 attach=1 damage=2 frame=3 ... commit=6
+         * damage_buffer=9 — from wayland.xml; the "13" in an earlier draft
+         * of this code was wrong and the strict fake compositor rejects it.) */
+        if (!win->frame_cb) {
+                u32 cb = wl_obj_new(w, WK_FRAME_CB, win_, -1);
+                if (wl_begin_req(w, win->surface, 3, 4)) {
+                        wl_put_u32(w, cb);
+                        win->frame_cb = cb;
+                } else {
+                        wl_obj_del(w, cb);
+                }
+        }
+
         if (!wl_flush(w))
                 return false;
         win->buf_free[b] = false;
@@ -1141,16 +1214,73 @@ void wl_pump(WLDisplay *w)
                 wl_dispatch_pending(w);
 }
 
-bool wl_pointer(WLDisplay *w, f64 *x, f64 *y, f64 *dx, f64 *dy, bool *pressed)
+bool wl_pointer(WLDisplay *w, RPointerState *out)
 {
-        if (!w || !w->pvalid)
+        if (!w || !out)
                 return false;
-        if (x) *x = w->px;
-        if (y) *y = w->py;
-        if (dx) *dx = w->pdx;
-        if (dy) *dy = w->pdy;
-        if (pressed) *pressed = w->ppressed;
+        out->valid = w->pvalid;
+        out->pressed = w->ppressed;
+        out->x = w->px;
+        out->y = w->py;
+        out->dx = w->pdx;
+        out->dy = w->pdy;
+        out->press_edge = w->press_edge;
+        out->release_edge = w->release_edge;
+        out->click = w->click;
+        out->click_x = w->click_x;
+        out->click_y = w->click_y;
+        out->clicks = w->clicks;
+        if (!w->pvalid)
+                return false;
+        /* consume-on-read: each delta batch / button edge is delivered exactly
+         * once — no stale repeats, no swallowed clicks */
+        w->pdx = 0;
+        w->pdy = 0;
+        w->press_edge = false;
+        w->release_edge = false;
+        w->click = false;
         return true;
+}
+
+bool wl_wait_frame(WLDisplay *w, f64 seconds)
+{
+        if (!w || w->fatal)
+                return false;
+        if (seconds < 0)
+                seconds = 0;
+        f64 deadline = rev_monotonic() + seconds;
+
+        for (;;) {
+                /* pending events first (non-blocking) */
+                wl_dispatch_pending(w);
+
+                bool any = false;
+                for (int i = 0; i < w->nwins; i++) {
+                        if (w->wins[i].frame_cb && w->wins[i].frame_ready) {
+                                w->wins[i].frame_cb = 0;    /* consumed */
+                                w->wins[i].frame_ready = false;
+                                any = true;
+                        }
+                }
+                if (any || w->fatal)
+                        return any;
+
+                f64 rem = deadline - rev_monotonic();
+                if (rem <= 0)
+                        return false;
+                int ms = (int)(rem * 1000.0);
+                if (ms < 1)
+                        ms = 1;
+                if (ms > 16)
+                        ms = 16;    /* slice: stay responsive to non-callback data */
+                struct pollfd p = { w->fd, POLLIN, 0 };
+                poll(&p, 1, ms);
+        }
+}
+
+u64 wl_dropped_frames(WLDisplay *w)
+{
+        return w ? w->drops : 0;
 }
 
 bool wl_win_geometry(WLDisplay *w, int win_, RRect *geom)

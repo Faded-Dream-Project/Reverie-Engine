@@ -139,6 +139,58 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
+## Status — 0.2.0 (pre-release)
+
+0.2.0 fixes the field-reported 0.1.6 GL failure on Wayland — `--renderer
+opengl` behind `REV_WAYLAND_GPU=1` died at window creation with
+`eglCreateWindowSurface failed (0x300b)` — and lands the frame-pacing and
+interaction overhaul the fix rode in on:
+
+* **The GL renderer handed the raw `wl_surface*` to EGL as a native
+  window.** A wl_surface is *not* an `EGLNativeWindow`: on Wayland, EGL
+  requires a `wl_egl_window` wrapper (from `libwayland-egl.so.1`, dlopen'd
+  like everything else here) and rejects the bare proxy with
+  `EGL_BAD_NATIVE_WINDOW` (0x300b). The renderer now opens the display
+  through `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR)` when the vendor
+  advertises `EGL_EXT_platform_wayland`, wraps each surface in a
+  `wl_egl_window` sized in buffer pixels, creates the EGL window surface on
+  the wrapper, resizes via `wl_egl_window_resize` (the surface survives
+  output geometry changes), and tears it all down cleanly. While a window
+  is EGL-owned the shim's `wl_shm` presenter stays off that surface
+  (`wlshim_set_gl_surface`), so the two present paths can never fight over
+  attach/commit. `scripts/run-egl-probe.sh` reproduces the failure mode
+  against live weston (path A fails — the exact EGL error code varies by
+  driver, the field report was 0x300b — and path B, the fixed sequence,
+  reaches 5 successful swaps with a real GL renderer string).
+* **Frame pacing no longer sleeps blind.** The daemon used a `nanosleep`
+  of whatever the scene fps left over; a slow frame swallowed input that
+  arrived meanwhile, and presentation never aligned with the compositor's
+  repaint cycle. Both Wayland paths now request `wl_surface.frame`
+  callbacks after each present and pace via the new platform
+  `wait_frame()` — sleeping in ≤16 ms slices while dispatching events,
+  waking exactly when the compositor latches the frame. X11 paces on the
+  X connection fd (events keep flowing, no compositor signal exists).
+  Scene fps is additionally capped to the fastest connected display
+  (`wl_output.mode` refresh, new `monitor_refresh()` API) — frames faster
+  than the panel could only ever become compositor drops — and a periodic
+  `perf:` log line reports actual fps plus dropped-frame count for field
+  triage.
+* **Interaction state is consume-on-read.** Pointer deltas now *accumulate*
+  between polls (a drag spanning several motion events used to deliver only
+  the last event's delta), button transitions are latched as edges, and a
+  click whose press **and** release both land between two polls still
+  registers — position captured at the press. Clicks drive the new
+  `rtscene_click()`: ripple layers get a one-shot splash and particle
+  layers a spark burst at the click point.
+* **A fourth opcode near-miss, caught before release this time.** The frame
+  request was initially drafted as `wl_surface` opcode 13; the canonical
+  protocol puts `frame` at opcode 3 (the same hallucinated-table family as
+  0.1.3 and 0.1.6). The strict fake compositors — rebuilt for exactly this
+  after 0.1.6 — rejected it on first run: the regression net did its job.
+  Both fake servers now pin the frame request's target, opcode, wire size
+  and new-id payload, reply `wl_callback.done`, and assert the
+  single-shot wake semantics of `wait_frame()`.
+
 ## Status — 0.1.6 (pre-release)
 
 0.1.6 fixes the field-reported 0.1.5 startup failure — on strict compositors

@@ -17,12 +17,23 @@
 typedef struct RPlatform RPlatform;
 
 /* Aggregated pointer state (global/compositor coordinates, X11 root-style),
- * updated by pump(). dx/dy are deltas since the previous pump. */
+ * updated by pump(). dx/dy are deltas accumulated since the last pointer()
+ * call (consume-on-read).
+ *
+ * Edge latching (v0.2.0): a click whose press AND release both arrive between
+ * two polls must still register. Button transitions are latched as edge flags
+ * and consumed by pointer() — a click is reported even when it lived entirely
+ * inside a single event batch (or a single slow frame). */
 typedef struct {
         bool valid;      /* pointer position known                    */
-        bool pressed;    /* any button held                           */
-        f64 x, y;        /* global coordinates                        */
-        f64 dx, dy;      /* delta since last pump                     */
+        bool pressed;    /* any button held (current state)           */
+        bool press_edge;     /* a press was seen since last read      */
+        bool release_edge;   /* a release was seen since last read    */
+        bool click;          /* full press+release since last read    */
+        f64 x, y;       /* global coordinates                        */
+        f64 dx, dy;      /* accumulated delta since last read         */
+        f64 click_x, click_y;  /* position where the click started      */
+        u32 clicks;     /* total click count (monotonic, for stats)  */
 } RPointerState;
 
 struct RPlatform {
@@ -37,6 +48,9 @@ struct RPlatform {
         int  (*monitors)(RPlatform *p, RRect *out, int max);
         /* Per-output scale factor (Wayland fractional/hidpi; X11 reports 1). */
         f64  (*monitor_scale)(RPlatform *p, int mon);
+        /* Current output refresh rate in Hz (rounded); 0 = unknown (X11 core
+         * does not report it — pacing then falls back to the scene fps). */
+        int  (*monitor_refresh)(RPlatform *p, int mon);
 
         /* ---- windows ---- */
         int  (*add_window)(RPlatform *p, RRect geom);
@@ -47,7 +61,9 @@ struct RPlatform {
          *            (X11: always true — EGL needs only the XID;
          *             Wayland: only when the WSI shim is active)
          * native:    X11 -> XID; Wayland -> wl_surface* from the shim, else 0
-         * display:   Wayland+shim -> wl_display* (for eglGetDisplay);
+         *            (renderers wrap it: EGL needs a wl_egl_window, Vulkan
+         *            the raw wl_surface — see render_gl.c / render_vk.c)
+         * display:   Wayland+shim -> wl_display* (for EGL's platform display);
          *            X11 -> NULL (EGL default display is used) */
         bool has_gpu;
         u64  (*native_handle)(RPlatform *p, int win);
@@ -64,6 +80,18 @@ struct RPlatform {
         void (*sync)(RPlatform *p);
         /* True when the compositor/server asked to close (Wayland "closed"). */
         bool (*should_close)(RPlatform *p);
+
+        /* ---- frame pacing (v0.2.0) ------------------------------------------
+         * wait_frame(): block up to `seconds` (>= 0) while PROCESSING INPUT
+         * EVENTS, returning early when the display signals readiness (the
+         * Wayland frame callback latched the last presented frame). Replaces
+         * blind nanosleep pacing: a slow frame can no longer swallow input,
+         * and presentation aligns with the compositor's repaint cycle.
+         * Returns true if a frame signal arrived before the timeout. */
+        bool (*wait_frame)(RPlatform *p, f64 seconds);
+        /* Presented-but-dropped frames (both shm slots held by the server).
+         * Used by the perf stats — cheap to query, monotonic. */
+        u64  (*dropped_frames)(RPlatform *p);
 
         /* ---- tests / tools ---- */
         u32 *(*screenshot)(RPlatform *p, int win, u32 *w, u32 *h);

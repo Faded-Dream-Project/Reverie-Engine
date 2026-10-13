@@ -14,8 +14,9 @@ only linked libraries are libc and libm.
 | presentation (CPU tier)| MIT-SHM double buffer (core PutImage fallback) | wl_shm pools (memfd), 2 buffers, premultiplied ARGB8888 |
 | monitors               | Xinerama (fallback: root)   | wl_output geometry/mode/scale            |
 | hidpi                  | not applicable (core X11)   | scale factor honored (pixel-sized buffers + `set_buffer_scale`) |
-| input                  | QueryPointer polling        | wl_seat/wl_pointer events                |
-| GPU present            | EGL (raw XID) or Vulkan (runtime-dlopen'd libxcb) | experimental WSI shim (`REV_WAYLAND_GPU=1`) |
+| input                  | QueryPointer polling + latched button edges | wl_seat/wl_pointer events (consume-on-read, click latching) |
+| frame pacing           | X connection fd polling | wl_surface.frame callbacks via wait_frame() |
+| GPU present            | EGL (raw XID) or Vulkan (runtime-dlopen'd libxcb) | experimental WSI shim (`REV_WAYLAND_GPU=1`) — EGL via wl_egl_window |
 
 ### Selection
 
@@ -72,6 +73,13 @@ and logged as such.)
   `eglGetProcAddress`. On X11, `eglGetDisplay(EGL_DEFAULT_DISPLAY)` makes
   Mesa open its own connection — the engine hands EGL only the raw XID, so
   **no Xlib exists anywhere in the process** (not even dlopen'd).
+* On Wayland (WSI shim active) the display is opened via
+  `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR)` and every window
+  surface lives on a `wl_egl_window` from `libwayland-egl.so.1` (also
+  dlopen'd) — the raw `wl_surface` is not an EGL native window (0x300b,
+  see Troubleshooting). Buffer-pixel dimensions throughout; output
+  geometry changes resize the wrapper in place. While EGL owns a window,
+  the shim's `wl_shm` presenter is locked off its surface.
 * Pipeline: upload straight-alpha raster → premultiply pass → downsample +
   separable 9-tap gaussian + upscale → W3C blend shader onto a ping-pong
   accumulation FBO → present (unpremultiply).
@@ -103,6 +111,33 @@ and logged as such.)
 
 ## Troubleshooting
 
+* **`eglCreateWindowSurface failed (0x300b)` with `--renderer opengl` on
+  Wayland (0.2.0 postmortem)** — field report: with `REV_WAYLAND_GPU=1`
+  active, the GL tier died at "renderer init" with EGL error 0x300b
+  (`EGL_BAD_NATIVE_WINDOW`). Root cause: the renderer passed the shim's
+  raw `wl_surface*` as the EGL native window. On X11 the XID *is* the
+  native window, and the X11 path worked — but on Wayland EGL requires a
+  `wl_egl_window` wrapper (created per window by `libwayland-egl.so.1`,
+  dlopen'd with no build-time linkage) and rejects anything else. The
+  fixed sequence: `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,`
+  `wl_display, NULL)` when the client extensions advertise
+  `EGL_EXT_platform_wayland` (plain `eglGetDisplay` fallback),
+  `wl_egl_window_create(wl_surface, w, h)` with BUFFER-pixel dimensions
+  (the engine's framebuffers are already device-pixel sized),
+  `eglCreatePlatformWindowSurface` on the wrapper, `wl_egl_window_resize`
+  on output geometry changes (the EGL surface itself survives), and
+  `wl_egl_window_destroy` at teardown. While a window is EGL-owned the
+  shim's `wl_shm` presenter is locked off that surface
+  (`wlshim_set_gl_surface`) — two present paths attaching buffers to the
+  same `wl_surface` would corrupt each other's commits.
+  `scripts/egl_wayland_probe.c` (run via `scripts/run-egl-probe.sh`)
+  reproduces both paths against a live weston: path A (raw surface)
+  fails — the exact EGL error code varies by driver/version; the field
+  report was 0x300b — and path B (wrapper) reaches 5 successful
+  `eglSwapBuffers`. If EGL still fails after 0.2.0, check that
+  `libwayland-egl.so.1` is installed alongside the driver's `libEGL.so.1`
+  (Mesa ships both; hybrid NVIDIA setups must point EGL at a vendor that
+  supports the Wayland platform).
 * **`invalid arguments for zwlr_layer_surface_v1#N.set_size` at startup
   (0.1.6 postmortem)** — field report on a strict compositor: BOTH Wayland
   paths (`REV_WAYLAND_GPU=1` and the raw client behind `--renderer

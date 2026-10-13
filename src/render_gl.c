@@ -8,6 +8,15 @@
  *         hand-written X11 client. No Xlib is ever linked or loaded by us.
  * Wayland: requires the WSI shim (wlshim.c) to provide wl_display/wl_surface
  *          handles; without it init fails and the chain falls to CPU.
+ *          v0.2.0: the display is opened through the EGL platform API
+ *          (EGL_EXT_platform_wayland) when available, and every window
+ *          surface is created on a wl_egl_window from libwayland-egl —
+ *          handing the RAW wl_surface to eglCreateWindowSurface is the
+ *          v0.1.6 field failure "eglCreateWindowSurface failed (0x300b)"
+ *          (EGL_BAD_NATIVE_WINDOW). While a wl_egl_window is attached the
+ *          shim's wl_shm presenter stays off that surface (see
+ *          wlshim_set_gl_surface) so the two present paths cannot fight
+ *          over commits.
  *
  * llvmpipe: when Mesa reports a software rasterizer we log it and keep
  *         running — that is precisely the "OpenGL on llvmpipe" tier of the
@@ -31,15 +40,19 @@
 
 #include "log.h"
 #include "platform.h"
+#include "wlshim.h"
 
 /* ---- EGL constants (Khronos registry values) ---------------------------- */
 #define EGL_SUCCESS 0x3000
+#define EGL_BAD_NATIVE_WINDOW 0x300B
 #define EGL_DEFAULT_DISPLAY ((void *)0)
 #define EGL_ALPHA_SIZE 0x3021
 #define EGL_BLUE_SIZE 0x3022
 #define EGL_GREEN_SIZE 0x3023
 #define EGL_RED_SIZE 0x3024
 #define EGL_NATIVE_VISUAL_ID 0x302E
+#define EGL_EXTENSIONS 0x3055
+#define EGL_PLATFORM_WAYLAND_KHR 0x31D8
 #define EGL_SURFACE_TYPE 0x3033
 #define EGL_NONE 0x3038
 #define EGL_RENDERABLE_TYPE 0x3040
@@ -268,9 +281,20 @@ typedef struct {
         EGLContext_ ctx;
         EGLConfig_ cfg;
         int es_version;
+        bool is_wayland;   /* platform-specific window surface creation  */
+
+        /* libwayland-egl.so.1 (Wayland only, dlopen'd): the wl_egl_window
+         * factory EGL window surfaces are created on */
+        void *wegl_lib;
+        void *(*wl_egl_window_create)(void *surface, int w, int h);
+        void  (*wl_egl_window_destroy)(void *win);
+        void  (*wl_egl_window_resize)(void *win, int w, int h, int dx, int dy);
 
         /* egl entry points */
         EGLDisplay_ (*eglGetDisplay)(void *);
+        EGLDisplay_ (*eglGetPlatformDisplay)(unsigned long, void *, const EGLint_ *);
+        const char *(*eglQueryString)(EGLDisplay_, EGLint_);
+        EGLSurface_ (*eglCreatePlatformWindowSurface)(EGLDisplay_, EGLConfig_, void *, const EGLint_ *);
         EGLBoolean_ (*eglInitialize)(EGLDisplay_, EGLint_ *, EGLint_ *);
         EGLBoolean_ (*eglChooseConfig)(EGLDisplay_, const EGLint_ *, EGLConfig_ *, EGLint_, EGLint_ *);
         EGLBoolean_ (*eglBindAPI)(unsigned long);
@@ -288,6 +312,7 @@ typedef struct {
         struct {
                 EGLSurface_ surf;
                 u64 native;
+                void *eglwin;    /* Wayland: wl_egl_window wrapping native  */
                 u32 w, h;
         } win[REV_PLATFORM_MAX_OUTPUTS];
         RTarget accum[REV_PLATFORM_MAX_OUTPUTS][2];
@@ -398,7 +423,45 @@ static bool gl_window_surface(RenderGL *r, int win)
                 r->eglDestroySurface(r->dpy, r->win[win].surf);
                 r->win[win].surf = NULL;
         }
+        if (r->win[win].eglwin) {
+                r->wl_egl_window_destroy(r->win[win].eglwin);
+                r->win[win].eglwin = NULL;
+        }
         r->win[win].native = native;
+
+        if (r->is_wayland) {
+                /* A wl_surface is NOT an EGLNativeWindow: it must be wrapped
+                 * in a wl_egl_window (libwayland-egl), and the surface created
+                 * through the platform API. Passing the raw proxy is exactly
+                 * the v0.1.6 "eglCreateWindowSurface failed (0x300b)" field
+                 * failure. Dimensions are BUFFER pixels — the surface carries
+                 * the output scale via set_buffer_scale, and the engine's
+                 * framebuffers are already device-pixel sized. */
+                if (!r->wl_egl_window_create)
+                        return false;
+                u32 w = 640, h = 480;
+                RRect g;
+                if (r->plat->win_geometry(r->plat, win, &g) && g.w > 0 && g.h > 0) {
+                        w = (u32)g.w;
+                        h = (u32)g.h;
+                }
+                r->win[win].eglwin = r->wl_egl_window_create((void *)(uintptr_t)native,
+                                                             (int)w, (int)h);
+                if (!r->win[win].eglwin)
+                        return false;
+                /* EGL owns this wl_surface from here on — keep the shim's
+                 * wl_shm presenter off it (it would fight the EGL swapchain
+                 * for attach/commit) */
+                wlshim_set_gl_surface(win, true);
+                if (r->eglCreatePlatformWindowSurface)
+                        r->win[win].surf = r->eglCreatePlatformWindowSurface(
+                                r->dpy, r->cfg, r->win[win].eglwin, NULL);
+                else
+                        r->win[win].surf = r->eglCreateWindowSurface(
+                                r->dpy, r->cfg, (uintptr_t)r->win[win].eglwin, NULL);
+                return r->win[win].surf != NULL;
+        }
+
         r->win[win].surf = r->eglCreateWindowSurface(r->dpy, r->cfg, (uintptr_t)native, NULL);
         return r->win[win].surf != NULL;
 }
@@ -440,17 +503,61 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         }
 
         /* display: X11 -> default (Mesa opens its own connection);
-         * wayland -> the shim's wl_display*. */
+         * wayland -> the shim's wl_display*, through the platform API when
+         * the vendor advertises EGL_EXT_platform_wayland. */
+        r->is_wayland = strcmp(p->name, "wayland") == 0;
         void *native_dpy = p->native_display(p);
-        if (!native_dpy && strcmp(p->name, "wayland") == 0) {
-                snprintf(err, errcap,
-                         "wayland GPU requires the WSI shim (libwayland-client + REV_WAYLAND_GPU=1)");
-                return false;
-        }
-        r->dpy = r->eglGetDisplay(native_dpy);
-        if (!r->dpy) {
-                snprintf(err, errcap, "eglGetDisplay failed (0x%x)", (unsigned)(uintptr_t)r->eglGetError());
-                return false;
+        if (r->is_wayland) {
+                if (!native_dpy) {
+                        snprintf(err, errcap,
+                                 "wayland GPU requires the WSI shim (libwayland-client + REV_WAYLAND_GPU=1)");
+                        return false;
+                }
+                *(void **)&r->eglGetPlatformDisplay = dlsym(r->lib, "eglGetPlatformDisplay");
+                *(void **)&r->eglQueryString = dlsym(r->lib, "eglQueryString");
+                *(void **)&r->eglCreatePlatformWindowSurface = dlsym(r->lib, "eglCreatePlatformWindowSurface");
+                bool have_platform = false;
+                if (r->eglGetPlatformDisplay && r->eglQueryString) {
+                        const char *cext = r->eglQueryString(NULL, EGL_EXTENSIONS);
+                        if (cext && (strstr(cext, "EGL_EXT_platform_wayland") ||
+                                     strstr(cext, "EGL_KHR_platform_wayland")))
+                                have_platform = true;
+                }
+                if (have_platform) {
+                        r->dpy = r->eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR,
+                                                          native_dpy, NULL);
+                        LOGD("egl: platform display (EGL_EXT_platform_wayland)");
+                } else {
+                        r->dpy = r->eglGetDisplay(native_dpy);
+                }
+                if (!r->dpy) {
+                        snprintf(err, errcap, "eglGetDisplay failed (0x%x)",
+                                 (unsigned)(uintptr_t)r->eglGetError());
+                        return false;
+                }
+
+                /* wl_egl_window factory — mandatory for GL on Wayland */
+                r->wegl_lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
+                if (!r->wegl_lib) {
+                        snprintf(err, errcap,
+                                 "libwayland-egl.so.1 not loadable: %s", dlerror());
+                        return false;
+                }
+                *(void **)&r->wl_egl_window_create = dlsym(r->wegl_lib, "wl_egl_window_create");
+                *(void **)&r->wl_egl_window_destroy = dlsym(r->wegl_lib, "wl_egl_window_destroy");
+                *(void **)&r->wl_egl_window_resize = dlsym(r->wegl_lib, "wl_egl_window_resize");
+                if (!r->wl_egl_window_create || !r->wl_egl_window_destroy ||
+                    !r->wl_egl_window_resize) {
+                        snprintf(err, errcap, "libwayland-egl.so.1 is missing required symbols");
+                        return false;
+                }
+        } else {
+                r->dpy = r->eglGetDisplay(native_dpy);
+                if (!r->dpy) {
+                        snprintf(err, errcap, "eglGetDisplay failed (0x%x)",
+                             (unsigned)(uintptr_t)r->eglGetError());
+                        return false;
+                }
         }
         EGLint_ maj = 0, min = 0;
         if (!r->eglInitialize(r->dpy, &maj, &min)) {
@@ -499,7 +606,9 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
 
         /* first surface (window 0 must exist — the engine creates windows first) */
         if (!gl_window_surface(r, 0)) {
-                snprintf(err, errcap, "eglCreateWindowSurface failed (0x%x)",
+                snprintf(err, errcap, "%s failed (0x%x)",
+                         r->is_wayland ? "eglCreatePlatformWindowSurface(wl_egl_window)"
+                                       : "eglCreateWindowSurface",
                          (unsigned)(uintptr_t)r->eglGetError());
                 return false;
         }
@@ -865,13 +974,21 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
 
 static void gl_resize(RRenderer *rr, int win, u32 w, u32 h)
 {
-        (void)w;
-        (void)h;
         RenderGL *r = (RenderGL *)rr->ctx;
         if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
                 return;
-        /* surface is re-created lazily on next begin() when the native handle
-         * changes; accum is re-allocated by ensure_target on size change. */
+        if (r->is_wayland && r->win[win].eglwin && r->wl_egl_window_resize) {
+                /* the wl_surface (and thus the EGL surface) survives the
+                 * resize — only the wl_egl_window's buffer geometry moves.
+                 * Accumulation targets re-allocate via ensure_target. */
+                r->wl_egl_window_resize(r->win[win].eglwin, (int)w, (int)h, 0, 0);
+                r->win[win].w = w;
+                r->win[win].h = h;
+                return;
+        }
+        /* X11: surface is re-created lazily on next begin() when the native
+         * handle changes; accum is re-allocated by ensure_target on size
+         * change. */
         if (r->win[win].surf) {
                 r->eglDestroySurface(r->dpy, r->win[win].surf);
                 r->win[win].surf = NULL;
@@ -888,6 +1005,15 @@ static void gl_fini(RRenderer *rr)
                 for (int i = 0; i < REV_PLATFORM_MAX_OUTPUTS; i++)
                         if (r->win[i].surf && r->eglDestroySurface)
                                 r->eglDestroySurface(r->dpy, r->win[i].surf);
+                for (int i = 0; i < REV_PLATFORM_MAX_OUTPUTS; i++) {
+                        /* hand the wl_surface back before the wrapper dies */
+                        if (r->win[i].eglwin) {
+                                wlshim_set_gl_surface(i, false);
+                                if (r->wl_egl_window_destroy)
+                                        r->wl_egl_window_destroy(r->win[i].eglwin);
+                                r->win[i].eglwin = NULL;
+                        }
+                }
                 if (r->ctx && r->eglMakeCurrent)
                         r->eglMakeCurrent(r->dpy, NULL, NULL, NULL);
                 for (int i = 0; i < PROG_COUNT; i++)
@@ -905,6 +1031,8 @@ static void gl_fini(RRenderer *rr)
                         g->glDeleteFramebuffers(1, &r->accum[i][1].fbo);
                 }
         }
+        if (r->wegl_lib)
+                dlclose(r->wegl_lib);
         if (r->lib)
                 dlclose(r->lib);
         free(r);

@@ -14,6 +14,8 @@
 
 #include "rev_types.h"
 
+#include "platform.h"
+
 typedef struct X11 X11;
 
 /* Connects to the display in $DISPLAY (unix socket preferred). */
@@ -32,6 +34,15 @@ bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h);
 
 /* Polls the root pointer: root-relative coords + button mask. */
 bool x11_query_pointer(X11 *x, i32 *rx, i32 *ry, u32 *mask);
+
+/* Latched button edges since the last x11_pointer() call: press/release
+ * transitions observed in the event stream, so a click whose press AND
+ * release both happen between two polls still registers. */
+bool x11_pointer(X11 *x, RPointerState *out);
+
+/* Event-loop sleep: polls the X connection fd for up to `seconds` while
+ * draining events — input keeps flowing between frames. */
+void x11_wait_frame(X11 *x, f64 seconds);
 
 /* Reads pending events, updating internal window geometry. */
 void x11_pump_events(X11 *x);

@@ -382,6 +382,9 @@ int main(int argc, char **argv)
         f64 t0 = rev_monotonic();
         f64 last_frame = t0;
         f64 last_reload_check = t0;
+        f64 last_stat = t0;
+        u32 frames = 0;
+        u64 last_drops = 0;
         bool shot_done = false;
         RTFrameList fl;
 
@@ -413,7 +416,8 @@ int main(int argc, char **argv)
                         }
                 }
 
-                /* pointer */
+                /* pointer (consume-on-read: dx/dy and click edges are each
+                 * delivered exactly once by the platform layer) */
                 RPointerState ptr;
                 if (plat->pointer(plat, &ptr)) {
                         for (int i = 0; i < nmon; i++) {
@@ -422,6 +426,13 @@ int main(int argc, char **argv)
                                 f64 dx = ptr.dx * fb_scale[i];
                                 f64 dy = ptr.dy * fb_scale[i];
                                 rtscene_pointer(sf.sc, i, lx, ly, dx, dy, ptr.pressed);
+                                /* a click whose press AND release both landed
+                                 * between two polls is still a click — splash
+                                 * it at the latched press position */
+                                if (ptr.click)
+                                        rtscene_click(sf.sc, i,
+                                                      (ptr.click_x - mons[i].x) * fb_scale[i],
+                                                      (ptr.click_y - mons[i].y) * fb_scale[i]);
                         }
                 }
 
@@ -499,20 +510,65 @@ int main(int argc, char **argv)
                         }
                 }
 
-                /* frame pacing */
+                /* periodic perf stat — the field-debug line: actual frame rate
+                 * plus any presents the compositor dropped (both wl_shm slots
+                 * still held when the next frame was ready) */
+                if (now - last_stat >= 5.0) {
+                        u64 drops = plat->dropped_frames ? plat->dropped_frames(plat) : 0;
+                        LOGI("perf: %.1f fps", (f64)frames / (now - last_stat));
+                        if (drops > last_drops) {
+                                LOGI("perf: %llu frame(s) dropped by the compositor",
+                                     (unsigned long long)(drops - last_drops));
+                                last_drops = drops;
+                        }
+                        frames = 0;
+                        last_stat = now;
+                }
+
+                /* frame pacing: hold until the next frame boundary — through
+                 * wait_frame() when the platform provides it, so input keeps
+                 * flowing during the wait and (Wayland) the wake aligns with
+                 * the compositor's repaint cycle instead of a blind nanosleep.
+                 * A slow frame can no longer swallow the events that arrived
+                 * while it rendered. */
                 int fps = fps_override > 0 ? fps_override : rtscene_fps(sf.sc);
+                if (fps_override <= 0 && plat->monitor_refresh) {
+                        /* cap scene fps to the fastest connected display — the
+                         * extra frames could never be shown (they would just
+                         * pile up as compositor drops). An explicit --fps
+                         * override is always honored as-is. */
+                        int hz = 0;
+                        for (int i = 0; i < nmon; i++) {
+                                int r = plat->monitor_refresh(plat, i);
+                                if (r > hz)
+                                        hz = r;
+                        }
+                        if (hz > 0 && fps > hz) {
+                                LOGD("pacing: scene %d fps capped to display %d Hz", fps, hz);
+                                fps = hz;
+                        }
+                }
                 if (fps < 1) fps = 1;
                 if (fps > 240) fps = 240;
                 f64 frame_len = 1.0 / fps;
-                f64 spent = rev_monotonic() - now;
-                f64 sleep = frame_len - spent;
-                if (sleep > 0.0005) {
-                        struct timespec ts;
-                        ts.tv_sec = (time_t)sleep;
-                        ts.tv_nsec = (long)((sleep - (f64)ts.tv_sec) * 1e9);
-                        nanosleep(&ts, NULL);
+                f64 deadline = now + frame_len;
+                for (;;) {
+                        f64 rem = deadline - rev_monotonic();
+                        if (rem <= 0.0005)
+                                break;
+                        if (plat->wait_frame)
+                                plat->wait_frame(plat, rem);
+                        else {
+                                struct timespec ts;
+                                ts.tv_sec = (time_t)rem;
+                                ts.tv_nsec = (long)((rem - (f64)ts.tv_sec) * 1e9);
+                                nanosleep(&ts, NULL);
+                        }
+                        if (!g_run || plat->should_close(plat))
+                                break;    /* quit arrived during the wait */
                 }
                 last_frame = rev_monotonic();
+                frames++;
         }
 
         LOGI("shutting down");

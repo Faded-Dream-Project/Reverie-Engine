@@ -20,6 +20,10 @@ void ripple_configure(RevRipple *r, f64 strength, f64 damping, f64 radius);
 /* Pointer in layer-relative [0..1] coordinates. */
 void ripple_pointer(RevRipple *r, f64 x, f64 y, bool pressed);
 
+/* One-shot splash (a full click, press+release, possibly entirely between
+ * two polls — the platform layer latches such edges). x/y in [0..1]. */
+void ripple_click(RevRipple *r, f64 x, f64 y);
+
 void ripple_step(RevRipple *r, f64 dt);
 
 /* Applies refraction + highlights: `below` is the composited content under

@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "util.h"
 
 #define X11_MAX_WINS 8
 #define REPLY_MAX    (64 * 1024)
@@ -56,6 +57,10 @@ struct X11 {
         int evq_n;
         u8 *reply;
         size_t reply_cap;
+        /* latched button edges (consume-on-read via x11_pointer) */
+        bool ppressed, press_edge, release_edge, click, click_pending;
+        f64 click_x, click_y;
+        u32 clicks;
 };
 
 /* --------------------------------------------------------------------------
@@ -680,7 +685,9 @@ static bool xwin_create(X11 *x, XWin *w, RRect geom)
         put32(q + 32, 0);         /* background pixel: black */
         put32(q + 36, (1u << 15)  /* ExposureMask */
                       | (1u << 17)/* StructureNotifyMask */
-                      | (1u << 22)/* PropertyChangeMask */);
+                      | (1u << 22)/* PropertyChangeMask */
+                      | (1u << 4) /* ButtonPressMask   */
+                      | (1u << 5));/* ButtonReleaseMask */
         if (!send_req(x, q, 40))
                 return false;
 
@@ -952,6 +959,68 @@ bool x11_query_pointer(X11 *x, i32 *rx, i32 *ry, u32 *mask)
         return true;
 }
 
+bool x11_pointer(X11 *x, RPointerState *out)
+{
+        if (!x || !out)
+                return false;
+        memset(out, 0, sizeof *out);
+        i32 rx = 0, ry = 0;
+        u32 mask = 0;
+        if (!x11_query_pointer(x, &rx, &ry, &mask)) {
+                /* position unknown — but edges still need consuming */
+                out->press_edge = x->press_edge;
+                out->release_edge = x->release_edge;
+                out->click = x->click;
+                out->click_x = x->click_x;
+                out->click_y = x->click_y;
+                out->clicks = x->clicks;
+                out->pressed = x->ppressed;
+                x->press_edge = x->release_edge = x->click = false;
+                return false;
+        }
+        out->valid = true;
+        out->x = rx;
+        out->y = ry;
+        out->pressed = x->ppressed || (mask & ((1u << 8) | (1u << 9) | (1u << 10))) != 0;
+        out->press_edge = x->press_edge;
+        out->release_edge = x->release_edge;
+        out->click = x->click;
+        out->click_x = x->click_x;
+        out->click_y = x->click_y;
+        out->clicks = x->clicks;
+        /* consume-on-read */
+        x->press_edge = false;
+        x->release_edge = false;
+        x->click = false;
+        return true;
+}
+
+void x11_wait_frame(X11 *x, f64 seconds)
+{
+        if (!x || seconds <= 0)
+                return;
+        f64 deadline = rev_monotonic() + seconds;
+        for (;;) {
+                f64 rem = deadline - rev_monotonic();
+                if (rem <= 0)
+                        return;
+                fd_set rf;
+                FD_ZERO(&rf);
+                FD_SET(x->fd, &rf);
+                struct timeval tv;
+                f64 slice = rem < 0.016 ? rem : 0.016;
+                tv.tv_sec = (long)slice;
+                tv.tv_usec = (long)((slice - (f64)tv.tv_sec) * 1e6);
+                int r = select(x->fd + 1, &rf, NULL, NULL, &tv);
+                if (r > 0) {
+                        x11_pump_events(x);    /* events keep flowing while waiting */
+                        continue;
+                }
+                if (rev_monotonic() >= deadline)
+                        return;
+        }
+}
+
 bool x11_win_geometry(X11 *x, int win, RRect *geom)
 {
         if (!x || win < 0 || win >= x->nwins)
@@ -995,6 +1064,29 @@ void x11_pump_events(X11 *x)
                                         x->wins[i].w = nw;
                                         x->wins[i].h = nh;
                                 }
+                        }
+                } else if (code == 4 || code == 5) {
+                        /* ButtonPress / ButtonRelease — root coords at
+                         * ev[20]/ev[22] (u16). Latched into edge state that
+                         * x11_pointer() consumes: a full click between two
+                         * polls still reports a click edge. */
+                        bool down = code == 4;
+                        i32 rx = (i16)get16(ev + 20);
+                        i32 ry = (i16)get16(ev + 22);
+                        if (down) {
+                                x->ppressed = true;
+                                x->press_edge = true;
+                                x->click_x = (f64)rx;
+                                x->click_y = (f64)ry;
+                                x->click_pending = true;
+                        } else {
+                                x->ppressed = false;
+                                x->release_edge = true;
+                                if (x->click_pending) {
+                                        x->click = true;
+                                        x->clicks++;
+                                }
+                                x->click_pending = false;
                         }
                 }
                 /* Expose etc. are no-ops: we repaint continuously or on demand */

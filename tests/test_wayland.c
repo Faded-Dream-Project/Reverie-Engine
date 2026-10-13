@@ -929,7 +929,37 @@ int main(void)
                 CHECK(ok && px1[0] == 0xff0000ff, "buffer1 pixel after double-buffer cycle");
         }
 
-        /* 8. buffer release + pointer events */
+        /* 7b. frame callback: wl_present requested one AFTER the commit
+         * (wl_surface.frame, opcode 3, new_id payload — the strict validator
+         * must accept it; a hallucinated opcode here is a protocol kill on
+         * any real compositor). The server replies wl_callback.done(u) and
+         * wl_wait_frame() must wake on it — exactly once. */
+        {
+                n = s_read_msg(msg, sizeof msg, NULL);
+                CHECK(n == 12, "frame request is a 12-byte message");
+                CHECK(s_get32(msg) == S.surface && msg_opcode(msg) == 3,
+                      "frame request: wl_surface opcode 3");
+                CHECK(s_check(msg, n), "frame request passes the strict validator");
+                u32 cb_id = (n >= 12) ? s_get32(msg + 8) : 0;
+                CHECK(cb_id != 0, "frame request carries a new callback id");
+                u32 cbdata = 4711;    /* wl_callback.done(callback_data) */
+                s_send(cb_id, 0, (const u8 *)&cbdata, 4);
+        }
+        CHECK(wl_wait_frame(wl, 0.2), "wl_wait_frame wakes on the frame callback");
+        CHECK(!wl_wait_frame(wl, 0.02), "callback consumed — single-shot wake");
+
+        /* 7c. dropped frames: server holds BOTH slots -> present is dropped,
+         * counted, and does not corrupt the connection (no request sent) */
+        ok = wl_present(wl, 0, frame, 800, 600);
+        CHECK(ok, "present with both slots held still returns ok");
+        CHECK(wl_dropped_frames(wl) == 1, "dropped frame counted");
+
+        /* 7d. refresh rate: the mode event carried 60000 mHz -> 60 Hz */
+        CHECK(wl_monitor_refresh(wl, 0) == 60, "wl_monitor_refresh parses mHz -> Hz");
+
+        /* 8. buffer release + pointer events: enter, TWO motions (deltas must
+         * accumulate into the TOTAL drag), press + release (a full click that
+         * lives entirely between two polls must still register) */
         s_send(buf_ids[0], 0, NULL, 0);   /* release buffer 0 */
         {
                 u8 p[24];
@@ -942,20 +972,41 @@ int main(void)
                 s_put32(m, 999);        /* time */
                 s_put32(m + 4, 120 << 8);
                 s_put32(m + 8, 180 << 8);
-                s_send(A.pointer_id, 2, m, 12);   /* motion */
+                s_send(A.pointer_id, 2, m, 12);   /* motion (100,150)->(120,180) */
+                u8 m2[16];
+                s_put32(m2, 1001);      /* time */
+                s_put32(m2 + 4, 140 << 8);
+                s_put32(m2 + 8, 200 << 8);
+                s_send(A.pointer_id, 2, m2, 12);  /* motion (120,180)->(140,200) */
                 u8 b[20];
                 s_put32(b, 7);          /* serial */
                 s_put32(b + 4, 1000);   /* time */
                 s_put32(b + 8, 272);    /* left button */
                 s_put32(b + 12, 1);     /* pressed */
-                s_send(A.pointer_id, 3, b, 16);   /* button */
+                s_send(A.pointer_id, 3, b, 16);   /* button press */
+                u8 b2[20];
+                s_put32(b2, 8);         /* serial */
+                s_put32(b2 + 4, 1002);  /* time */
+                s_put32(b2 + 8, 272);   /* left button */
+                s_put32(b2 + 12, 0);    /* released */
+                s_send(A.pointer_id, 3, b2, 16);  /* button release */
         }
         wl_pump(wl);
-        f64 px, py, dx, dy;
-        bool pressed;
-        CHECK(wl_pointer(wl, &px, &py, &dx, &dy, &pressed), "pointer state valid");
-        CHECK(px == 120.0 && py == 180.0, "pointer at (120,180)");
-        CHECK(pressed, "pointer pressed");
+        RPointerState pst;
+        CHECK(wl_pointer(wl, &pst), "pointer state valid");
+        CHECK(pst.x == 140.0 && pst.y == 200.0, "pointer at (140,200)");
+        CHECK(pst.dx == 40.0 && pst.dy == 50.0,
+              "drag deltas accumulate across motion events");
+        CHECK(pst.click, "full click latched (press+release between reads)");
+        CHECK(pst.click_x == 140.0 && pst.click_y == 200.0,
+              "click position latched at the press");
+        CHECK(pst.clicks == 1, "click count monotonic");
+        CHECK(!pst.pressed, "button released");
+        RPointerState pst2;
+        CHECK(wl_pointer(wl, &pst2), "pointer state still valid");
+        CHECK(pst2.dx == 0.0 && pst2.dy == 0.0 && !pst2.click,
+              "consume-on-read: no stale deltas or click repeats");
+        CHECK(pst2.clicks == 1, "total click count survives reads");
 
         /* 9. closed event */
         s_send(S.layer_surface, 1, NULL, 0);

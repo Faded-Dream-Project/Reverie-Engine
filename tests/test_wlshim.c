@@ -383,6 +383,8 @@ static int attach_count;              /* attach #1 -> slot 0, #2 -> slot 1, #3 -
 static bool saw_pool, saw_buf[2], saw_attach, saw_cycling;
 static bool saw_layer0, saw_ns_reverie, saw_size00, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
 static bool closed_sent, pointer_sent, saw_configure_sent;
+static volatile int hold_releases;   /* test gate: server skips wl_buffer.release */
+static int frame_cb_replies;         /* wl_callback.done replies sent           */
 static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
 
 static int failures = 0;
@@ -496,7 +498,8 @@ static void verify_present_pixels(int slot)
 }
 
 /* pointer events exercising the shim's listener wiring through real
- * libwayland dispatch: enter(surface, 100,150), motion(120,180), button(press) */
+ * libwayland dispatch: enter(surface, 100,150), motion(120,180), button
+ * press + release — a full click living entirely between two polls */
 static void send_pointer_events(void)
 {
         {
@@ -520,7 +523,15 @@ static void send_pointer_events(void)
                 s_put32(b + 4, 1000);      /* time */
                 s_put32(b + 8, 272);       /* left button */
                 s_put32(b + 12, 1);        /* pressed */
-                s_send(id_pointer, 3, b, 16);   /* button */
+                s_send(id_pointer, 3, b, 16);   /* button press */
+        }
+        {
+                u8 b[16];
+                s_put32(b, 8);             /* serial */
+                s_put32(b + 4, 1001);      /* time */
+                s_put32(b + 8, 272);       /* left button */
+                s_put32(b + 12, 0);        /* released */
+                s_send(id_pointer, 3, b, 16);   /* button release */
         }
         pointer_sent = true;
 }
@@ -646,6 +657,16 @@ static void *server(void *arg)
                               "buffer offset places slot in the pool");
                         continue;
                 }
+                if (t == T_SURFACE && op == 3) {
+                        /* wl_surface.frame(new_id) — the v0.2.0 pacing request.
+                         * Reply wl_callback.done(data) exactly like a compositor
+                         * that latched the presented frame. */
+                        u32 nid = s_get32(msg + 8);
+                        u32 cbdata = 4242;
+                        s_send(nid, 0, (const u8 *)&cbdata, 4);
+                        frame_cb_replies++;
+                        continue;
+                }
                 if (t == T_SURFACE && op == 1) {
                         /* attach(buffer, x, y) — x/y must be 0 */
                         u32 bid = s_get32(msg + 8);
@@ -726,10 +747,11 @@ static void *server(void *arg)
                         } else {
                                 /* present commit: verify the pixels the client
                                  * premultiplied into the pool, then release the
-                                 * slots so the next present can cycle */
+                                 * slots so the next present can cycle (unless the
+                                 * test is holding releases to force a drop) */
                                 int slot = attach_count == 2 ? 1 : 0;
                                 verify_present_pixels(slot);
-                                if (attach_count >= 2) {
+                                if (attach_count >= 2 && !hold_releases) {
                                         s_send(id_buf[0], 0, NULL, 0);   /* release */
                                         s_send(id_buf[1], 0, NULL, 0);   /* release */
                                 }
@@ -844,20 +866,33 @@ int main(void)
                               "wl_surface handle exposed for EGL/Vulkan");
                         CHECK(wlshim_display_handle() != NULL,
                               "wl_display handle exposed for EGL/Vulkan");
+                        CHECK(wlshim_monitor_refresh(0) == 60,
+                              "monitor refresh parsed from the mode event (60Hz)");
                 }
 
                 /* 5. pointer events (sent by the server after the ack) — pump
-                 * until they arrive (server thread may lag a moment). */
+                 * until the whole batch lands; pointer state is CONSUMED ON
+                 * READ (v0.2.0), so poll on the monotonic click count and
+                 * then inspect the snapshot of that final read. */
                 RPointerState ptr;
                 memset(&ptr, 0, sizeof ptr);
-                for (int i = 0; i < 200 && !ptr.valid; i++) {
-                        wlshim_pump(&ptr);
-                        if (!ptr.valid)
+                for (int i = 0; i < 200 && ptr.clicks < 1; i++) {
+                        wlshim_pump(NULL);
+                        wlshim_pointer(&ptr);
+                        if (ptr.clicks < 1)
                                 usleep(10000);
                 }
                 CHECK(ptr.valid && ptr.x == 120.0 && ptr.y == 180.0,
                       "pointer at (120,180) via libwayland event dispatch");
-                CHECK(ptr.pressed, "pointer pressed");
+                CHECK(ptr.click, "full click latched (press+release between polls)");
+                CHECK(ptr.click_x == 120.0 && ptr.click_y == 180.0,
+                      "click position latched at the press");
+                CHECK(!ptr.pressed, "press+release both processed");
+                {
+                        RPointerState again;
+                        CHECK(wlshim_pointer(&again) && !again.click && again.clicks == 1,
+                              "consume-on-read: click edge delivered exactly once");
+                }
 
                 /* 5b. wl_shm present path (v0.1.5): the shim pools an 800x600
                  * device-pixel frame (logical 400x300 @ scale 2), premultiplies
@@ -872,12 +907,18 @@ int main(void)
                         frame[7] = 0x80408040;                 /* semi-transparent probe */
                         CHECK(wlshim_present_cpu(win, frame, 800, 600),
                               "frame 1 presented via wl_shm through libwayland");
+                        CHECK(wlshim_wait_frame(1.0),
+                              "wait_frame wakes on the frame callback (frame 1)");
 
                         usleep(100000);                        /* let the server see commit #1 */
                         for (int i = 0; i < 800 * 600; i++)
                                 frame[i] = 0xFF00FF00;        /* opaque green */
                         CHECK(wlshim_present_cpu(win, frame, 800, 600),
                               "frame 2 presented (slot 1 — slot 0 still in flight)");
+                        CHECK(wlshim_wait_frame(1.0),
+                              "wait_frame wakes again (per-present callbacks)");
+                        CHECK(!wlshim_wait_frame(0.02),
+                              "callback consumed — single-shot wake");
 
                         /* frame 3: retry until the server's releases land and
                          * slot 0 comes back — the engine drops frames while
@@ -894,6 +935,23 @@ int main(void)
                                         third = true;
                         }
                         CHECK(third, "double-buffer cycling: slot 0 reused after wl_buffer.release");
+
+                        /* v0.2.0 drop accounting, deterministic: hold the
+                         * server's releases, then burst three presents — A
+                         * takes slot 0, B takes slot 1, C finds both held and
+                         * must be counted as dropped, silently (no wire
+                         * traffic, connection stays clean) */
+                        hold_releases = 1;
+                        usleep(100000);        /* server drains and stops releasing */
+                        u64 drops_before = wlshim_dropped_frames();
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst A -> slot 0");
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst B -> slot 1");
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst C — dropped");
+                        CHECK(wlshim_dropped_frames() == drops_before + 1,
+                              "dropped frame counted when both slots are held");
+                        CHECK(frame_cb_replies >= 2,
+                              "server saw and answered the frame callback requests");
+                        hold_releases = 0;
                         free(frame);
                 }
 

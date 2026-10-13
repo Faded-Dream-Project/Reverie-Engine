@@ -14,19 +14,19 @@
 #include "rev_types.h"
 
 enum {
-	LT_IMAGE = 0,
-	LT_GRADIENT,
-	LT_SOLID,
-	LT_FLUID,
-	LT_RIPPLE,
-	LT_PARTICLES
+        LT_IMAGE = 0,
+        LT_GRADIENT,
+        LT_SOLID,
+        LT_FLUID,
+        LT_RIPPLE,
+        LT_PARTICLES
 };
 
 enum {
-	FIT_FILL = 0,     /* cover  */
-	FIT_CONTAIN,      /* fit    */
-	FIT_STRETCH,
-	FIT_TILE
+        FIT_FILL = 0,     /* cover  */
+        FIT_CONTAIN,      /* fit    */
+        FIT_STRETCH,
+        FIT_TILE
 };
 
 #define RT_MAX_MONITORS 8
@@ -47,6 +47,11 @@ bool rtscene_is_animated(const RTScene *sc);
 /* Pointer state for a monitor (device pixels, monitor-local). */
 void rtscene_pointer(RTScene *sc, int mon, f64 x, f64 y, f64 dx, f64 dy,
                      bool pressed);
+
+/* Latched click edge (device pixels, monitor-local): queues a one-shot
+ * splash on ripple layers and a spark burst on particle layers, consumed
+ * by the next render. Safe before the first render. */
+void rtscene_click(RTScene *sc, int mon, f64 x, f64 y);
 
 #define RT_FRAME_MAX_LAYERS 64
 

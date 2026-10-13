@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "log.h"
+#include "util.h"
 #include "x11.h"
 
 typedef struct {
@@ -56,6 +57,13 @@ static f64 px_monitor_scale(RPlatform *p, int mon)
         return 1.0;    /* X11 core has no output scale concept */
 }
 
+static int px_monitor_refresh(RPlatform *p, int mon)
+{
+        (void)p;
+        (void)mon;
+        return 0;    /* X11 core protocol has no refresh rate; pacing uses scene fps */
+}
+
 static int px_add_window(RPlatform *p, RRect geom)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
@@ -84,23 +92,29 @@ static void px_pump(RPlatform *p)
 static bool px_pointer(RPlatform *p, RPointerState *out)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
-        memset(out, 0, sizeof *out);
-        i32 rx = 0, ry = 0;
-        u32 mask = 0;
-        if (!x11_query_pointer(c->x, &rx, &ry, &mask))
+        if (!x11_pointer(c->x, out))
                 return false;
-        out->valid = true;
-        out->x = rx;
-        out->y = ry;
-        out->pressed = (mask & ((1u << 8) | (1u << 9) | (1u << 10))) != 0;
         if (c->have_last) {
-                out->dx = (f64)(rx - c->last_px);
-                out->dy = (f64)(ry - c->last_py);
+                out->dx = (f64)((i32)out->x - c->last_px);
+                out->dy = (f64)((i32)out->y - c->last_py);
         }
-        c->last_px = rx;
-        c->last_py = ry;
+        c->last_px = (i32)out->x;
+        c->last_py = (i32)out->y;
         c->have_last = true;
         return true;
+}
+
+static bool px_wait_frame(RPlatform *p, f64 seconds)
+{
+        PlatX11 *c = (PlatX11 *)p->ctx;
+        x11_wait_frame(c->x, seconds);
+        return false;    /* no compositor frame signal on X11 core */
+}
+
+static u64 px_dropped_frames(RPlatform *p)
+{
+        (void)p;
+        return 0;    /* MIT-SHM double-buffer presents are never dropped */
 }
 
 static bool px_win_geometry(RPlatform *p, int win, RRect *geom)
@@ -155,6 +169,7 @@ RPlatform *plat_x11_create(void)
         p->fini = px_fini;
         p->monitors = px_monitors;
         p->monitor_scale = px_monitor_scale;
+        p->monitor_refresh = px_monitor_refresh;
         p->add_window = px_add_window;
         p->present_cpu = px_present_cpu;
         p->has_gpu = true;
@@ -163,6 +178,8 @@ RPlatform *plat_x11_create(void)
         p->resize_window = px_resize_window;
         p->pump = px_pump;
         p->pointer = px_pointer;
+        p->wait_frame = px_wait_frame;
+        p->dropped_frames = px_dropped_frames;
         p->win_geometry = px_win_geometry;
         p->sync = px_sync;
         p->should_close = px_should_close;

@@ -105,11 +105,14 @@ struct RTScene {
         bool animated;
         RTLayer *layers;
         int n;
-        /* per-monitor pointer state */
+        /* per-monitor pointer state (consume-on-read fields are drained by
+         * render_core each frame) */
         struct {
                 f64 x, y, dx, dy;
                 bool pressed;
                 bool seen;
+                f64 click_x, click_y;   /* last click position (device px) */
+                u32 clicks;             /* pending clicks since last render  */
         } ptr[RT_MAX_MONITORS];
         char *base_dir;
         RArena *ir_arena;     /* borrowed: IR must outlive the scene */
@@ -506,6 +509,17 @@ void rtscene_pointer(RTScene *sc, int mon, f64 x, f64 y, f64 dx, f64 dy, bool pr
         sc->ptr[mon].seen = true;
 }
 
+void rtscene_click(RTScene *sc, int mon, f64 x, f64 y)
+{
+        if (!sc || mon < 0 || mon >= RT_MAX_MONITORS)
+                return;
+        /* latched click edge -> pending splash/burst, consumed by the next
+         * render (works even when it lands before the sims exist) */
+        sc->ptr[mon].click_x = x;
+        sc->ptr[mon].click_y = y;
+        sc->ptr[mon].clicks++;
+}
+
 void rtscene_flush_caches(RTScene *sc)
 {
         if (!sc)
@@ -805,12 +819,18 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
         /* normalized pointer for this monitor (default center) */
         f64 px = 0.5, py = 0.5, pdx = 0, pdy = 0;
         bool pressed = false;
+        f64 click_x = 0.5, click_y = 0.5;
+        u32 clicks = 0;
         if (sc->ptr[mon].seen) {
                 px = sc->ptr[mon].x / W;
                 py = sc->ptr[mon].y / H;
                 pdx = sc->ptr[mon].dx / W;
                 pdy = sc->ptr[mon].dy / H;
                 pressed = sc->ptr[mon].pressed;
+                click_x = sc->ptr[mon].click_x / W;
+                click_y = sc->ptr[mon].click_y / H;
+                clicks = sc->ptr[mon].clicks;
+                sc->ptr[mon].clicks = 0;    /* consume */
         }
 
         RFb scratch = { 0 };
@@ -853,6 +873,10 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         if (in->ripple) {
                                 ripple_configure(in->ripple, e.strength, L->r_damping, L->r_radius);
                                 ripple_pointer(in->ripple, px, py, pressed);
+                                /* latched clicks: a full press+release between two
+                                 * polls still makes a splash */
+                                for (u32 c = 0; c < clicks; c++)
+                                        ripple_click(in->ripple, click_x, click_y);
                                 ripple_step(in->ripple, dt);
                                 if (!below_snap)
                                         below_snap = (u32 *)malloc((size_t)fb->w * fb->h * 4);
@@ -908,6 +932,9 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         }
                         if (in->parts) {
                                 particles_pointer(in->parts, px, py, pressed);
+                                if (clicks)
+                                        particles_burst(in->parts, click_x, click_y,
+                                                        (int)(clicks > 4 ? 4 : clicks) * 24);
                                 particles_step(in->parts, dt);
                                 RFb *target;
                                 if (fl) {
