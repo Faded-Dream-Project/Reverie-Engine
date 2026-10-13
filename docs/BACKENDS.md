@@ -96,13 +96,43 @@ and logged as such.)
 |---------------------|-----------------------------------------------------|
 | `REV_RENDERER`      | same as `--renderer`                                |
 | `REV_BACKEND`       | same as `--backend`                                 |
-| `REV_VK_PRESENT`    | `wsi` = vulkan tier presents via its swapchain (default: platform SHM path) |
+| `REV_VK_PRESENT`    | `wsi` = vulkan tier presents via its swapchain (default: platform SHM path; on Wayland+shim that is the shim's own wl_shm presenter) |
 | `REV_WAYLAND_GPU`   | `1` = activate the experimental Wayland WSI shim    |
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 
 ## Troubleshooting
 
+* **`REV_WAYLAND_GPU=1` segfaults at startup / listener tables (0.1.5
+  postmortem)** — field report on KWin: the daemon died with a silent
+  SIGSEGV right after loading the scene, before any backend log line.
+  Root cause: `wl_output` was bound at **version 4** but its listener
+  table stopped at 4 slots (`geometry`, `mode`, `done`, `scale`) — and v4
+  compositors (KWin, weston >= 10) send `wl_output.name` and
+  `wl_output.description` (opcodes 4/5) immediately after the bind.
+  libwayland indexes `implementation[opcode]` with **no bounds check**:
+  the handler pointer is read past the array into whatever sits there and
+  called — depending on the binary layout that is a wild jump (segfault,
+  the field report) or a NULL (libwayland aborts with `listener function
+  for opcode N of wl_output is NULL`, the local weston repro). The 0.1.4
+  regression net missed it because the fake compositor never sent v4-only
+  events and the weston E2E ran the raw client only. Fixed by covering
+  every event of the bound version (six slots for wl_output, wl_shm
+  format, wl_buffer release), dispatching roundtrip #2 *before* the
+  layer-shell gate so even shell-less compositors exercise the event
+  path, teaching the fake server the v4 burst, and adding
+  `e2e-wayland.sh` part C (shim against live weston — the old table
+  aborts there, verified A/B).
+* **GPU mode presented nothing (0.1.5)** — with the shim active the
+  default `REV_VK_PRESENT=platform` path called `wlshim_present_cpu`,
+  which logged "CPU present requested in GPU mode" and returned false —
+  every frame was rendered and dropped. The shim now runs its own
+  `wl_shm` presenter (memfd pool via `SCM_RIGHTS`, two ARGB8888 buffers
+  cycling on `wl_buffer.release`, premultiplied uploads,
+  `set_buffer_scale` + `damage_buffer` through libwayland), mirroring
+  the raw client's presenter; the fake-compositor test mmaps the pool
+  and checks pixels + cycling. `REV_VK_PRESENT=wsi` keeps the true
+  swapchain path (driver-owned buffers on the shim's wl_surface).
 * **"wlshim: missing libwayland symbols" / shim never activates (0.1.4
   postmortem)** — the GPU-on-Wayland path (`REV_WAYLAND_GPU=1`) was dead on
   arrival from 0.1.0 through 0.1.3: init failed at the symbol gate and the

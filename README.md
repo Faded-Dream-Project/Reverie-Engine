@@ -139,7 +139,32 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.4 (pre-release)
+## Status — 0.1.5 (pre-release)
+
+0.1.5 fixes the first field-reported 0.1.4 crash — `REV_WAYLAND_GPU=1`
+segfaulted at startup on real compositors (reported on KWin + NVIDIA):
+
+* **The `wl_output` listener table stopped at 4 slots while outputs are
+  bound at version 4** — and v4 compositors (KWin, weston >= 10) send
+  `wl_output.name` and `wl_output.description` (opcodes 4 and 5) right
+  after the bind. libwayland indexes `implementation[opcode]` with **no
+  bounds check**, so the handler pointer was read past the array into
+  unrelated data and called: silent segfault inside `wlshim_platform_init`,
+  before the first backend log line. The 0.1.4 fake-compositor test never
+  sent those events (the coverage hole); the weston E2E ran the *raw*
+  client only. Both are fixed: the fake server now delivers the v4 event
+  burst, the listener covers all six events, and `e2e-wayland.sh` part C
+  drives the shim against live weston (verified: the old table aborts
+  there, the new one dispatches cleanly).
+* **The shim rejected the default present path** — `wlshim_present_cpu`
+  logged "CPU present requested in GPU mode — skipped" and returned false,
+  so the default `REV_VK_PRESENT=platform` vulkan tier rendered into
+  nothing (a black desktop waiting behind the segfault). The shim now
+  presents through `wl_shm` itself — memfd pool via `SCM_RIGHTS`,
+  two ARGB8888 buffers cycling on `wl_buffer.release`, premultiplied,
+  `set_buffer_scale`/`damage_buffer` marshalled through libwayland —
+  mirroring the raw client's field-proven presenter. The regression test
+  mmaps the pool server-side and checks the pixels.
 
 0.1.4 makes the GPU-on-Wayland path (`REV_WAYLAND_GPU=1`, the libwayland WSI
 shim for EGL/Vulkan) actually work — it had been dead on arrival since 0.1.0,

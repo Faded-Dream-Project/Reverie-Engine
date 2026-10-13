@@ -36,6 +36,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -369,8 +370,14 @@ static bool s_check(const u8 *m, size_t len)
 /* ---- server scenario state --------------------------------------------------- */
 
 static u32 id_compositor, id_shell, id_seat, id_output, id_surface, id_layer_surface, id_pointer;
+static u32 id_shm, id_pool, id_buf[2];
+static int pool_fd = -1;
+static u32 pool_size_seen;
+static int attach_count;              /* attach #1 -> slot 0, #2 -> slot 1, #3 -> slot 0 again */
+static bool saw_pool, saw_buf[2], saw_attach, saw_cycling;
 static bool saw_layer0, saw_ns_reverie, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
-static bool closed_sent, pointer_sent;
+static bool closed_sent, pointer_sent, saw_configure_sent;
+static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
 
 static int failures = 0;
 #define CHECK(cond, msg) \
@@ -427,7 +434,59 @@ static void send_output_events(void)
                 s_put32(p, 2);             /* scale factor 2 */
                 s_send(id_output, 3, p, 4);
         }
+        {
+                /* wl_output.name (opcode 4) + .description (opcode 5) — v4
+                 * events EVERY real compositor delivers after the bind
+                 * (verified live: weston 14 AND KWin). The listener table
+                 * must cover them: libwayland indexes implementation[opcode]
+                 * with NO bounds check, so a 4-slot array reads past its end
+                 * and calls garbage — the silent v0.1.4 field segfault. */
+                u8 p[12];
+                s_put32(p, 8);             /* "reverie\0" */
+                memcpy(p + 4, "reverie", 8);
+                s_send(id_output, 4, p, 12);          /* name */
+                u8 q[16];
+                s_put32(q, 12);            /* "the desktop\0" */
+                memcpy(q + 4, "the desktop", 12);
+                s_send(id_output, 5, q, 16);          /* description */
+        }
         s_send(id_output, 2, NULL, 0);     /* done */
+}
+
+/* wl_shm.format burst — real compositors advertise formats right after
+ * the bind; exercises the shim's wl_shm listener slot. */
+static void send_shm_formats(void)
+{
+        u8 f[4];
+        s_put32(f, 0);                      /* WL_SHM_FORMAT_ARGB8888 */
+        s_send(id_shm, 0, f, 4);
+        s_put32(f, 1);                      /* WL_SHM_FORMAT_XRGB8888 */
+        s_send(id_shm, 0, f, 4);
+}
+
+/* verify pixels of the slot the client just committed — the server mmaps the
+ * SAME memfd the client sent via SCM_RIGHTS and reads the pool memory.
+ * frames: #1 red + one semi-transparent probe, #2 green, #3 red again. */
+static void verify_present_pixels(int slot)
+{
+        if (pool_fd < 0)
+                return;
+        static void *map;
+        if (!map) {
+                map = mmap(NULL, (size_t)800 * 600 * 4 * 2, PROT_READ, MAP_SHARED, pool_fd, 0);
+                CHECK(map != MAP_FAILED, "server mmap'ed the client wl_shm pool");
+                if (map == MAP_FAILED)
+                        return;
+        }
+        const u32 *px = (const u32 *)((const u8 *)map + (size_t)800 * 600 * 4 * slot);
+        if (attach_count == 1) {
+                CHECK(px[100] == 0xFF0000FF, "frame 1: opaque red pixel premultiplied-identical");
+                CHECK(px[7] == 0x80204020, "frame 1: semi-transparent pixel PREMULTIPLIED (0x80408040 -> 0x80204020)");
+        } else if (attach_count == 2) {
+                CHECK(px[100] == 0xFF00FF00, "frame 2: green pixel in slot 1");
+        } else {
+                CHECK(px[100] == 0xFF0000FF, "frame 3: red pixel back in slot 0 (cycled)");
+        }
 }
 
 /* pointer events exercising the shim's listener wiring through real
@@ -495,11 +554,15 @@ static void *server(void *arg)
         reply_sync(sync_cb);
 
         /* 3. everything else in one loop: binds (learn ids from the wire),
-         * syncs (reply), surface + layer-surface setup, configure, ack. */
+         * syncs (reply), surface + layer-surface setup, configure, ack,
+         * wl_shm present traffic (pool fd via SCM_RIGHTS, buffers, attaches). */
         for (;;) {
-                n = s_read_msg(msg, sizeof msg, NULL);
+                int fd = -1;
+                n = s_read_msg(msg, sizeof msg, &fd);
                 if (n < 8)
                         break;                   /* client disconnected */
+                if (fd >= 0)
+                        pending_fd = fd;         /* fd rides the byte position */
                 if (!s_check(msg, n))
                         break;                   /* violation posted; stop */
                 u32 obj = s_get32(msg);
@@ -537,10 +600,54 @@ static void *server(void *arg)
                                 u8 c[4];
                                 s_put32(c, 3);
                                 s_send(id_seat, 0, c, 4);
+                        } else if (!strcmp(iface, "wl_shm")) {
+                                id_shm = new_id;
+                                CHECK(version == 1, "wl_shm bound at v1");
+                                send_shm_formats();
                         } else if (!strcmp(iface, "wl_output")) {
                                 id_output = new_id;
                                 send_output_events();
                         }
+                        continue;
+                }
+                if (t == T_SHM && op == 0) {
+                        /* wl_shm.create_pool(new_id, fd, size) — fd arrived as
+                         * SCM_RIGHTS ancillary data on this (or a neighboring)
+                         * recvmsg, captured by s_read_msg. */
+                        id_pool = s_get32(msg + 8);
+                        pool_size_seen = s_get32(msg + 12);
+                        pool_fd = pending_fd;
+                        pending_fd = -1;
+                        saw_pool = true;
+                        CHECK(pool_fd >= 0, "pool fd received via SCM_RIGHTS");
+                        CHECK(pool_size_seen == 800u * 600u * 4u * 2u,
+                              "pool sized for 800x600 ARGB8888 x 2 buffers");
+                        continue;
+                }
+                if (t == T_POOL && op == 0) {
+                        /* wl_shm_pool.create_buffer(new_id, offset, w, h, stride, fmt) */
+                        u32 nid = s_get32(msg + 8);
+                        u32 off = s_get32(msg + 12);
+                        u32 bw = s_get32(msg + 16), bh = s_get32(msg + 20);
+                        u32 stride = s_get32(msg + 24), fmt = s_get32(msg + 28);
+                        int slot = off == 0 ? 0 : 1;
+                        id_buf[slot] = nid;
+                        saw_buf[slot] = true;
+                        CHECK(bw == 800 && bh == 600 && stride == 800 * 4,
+                              "buffer dims 800x600 stride 3200 (device pixels)");
+                        CHECK(fmt == 0, "buffer format ARGB8888 (premultiplied)");
+                        CHECK(off == (slot ? 800u * 600u * 4u : 0u),
+                              "buffer offset places slot in the pool");
+                        continue;
+                }
+                if (t == T_SURFACE && op == 1) {
+                        /* attach(buffer, x, y) — x/y must be 0 */
+                        u32 bid = s_get32(msg + 8);
+                        CHECK(s_type_of(bid) == T_BUFFER, "attach references a wl_buffer");
+                        CHECK(s_get32(msg + 12) == 0 && s_get32(msg + 16) == 0,
+                              "attach x/y == 0");
+                        attach_count++;
+                        saw_attach = true;
                         continue;
                 }
                 if (t == T_COMPOSITOR && op == 0) {
@@ -589,13 +696,28 @@ static void *server(void *arg)
                         continue;
                 }
                 if (t == T_SURFACE && op == 6) {
-                        /* initial commit — an all-edges layer surface is sized
-                         * by the compositor: configure(serial, w, h) */
-                        u8 p[12];
-                        s_put32(p, 77);
-                        s_put32(p + 4, 400);
-                        s_put32(p + 8, 300);
-                        s_send(id_layer_surface, 0, p, 12);
+                        if (!saw_configure_sent) {
+                                /* initial commit — an all-edges layer surface is
+                                 * sized by the compositor: configure(serial, w, h) */
+                                u8 p[12];
+                                s_put32(p, 77);
+                                s_put32(p + 4, 400);
+                                s_put32(p + 8, 300);
+                                s_send(id_layer_surface, 0, p, 12);
+                                saw_configure_sent = true;
+                        } else {
+                                /* present commit: verify the pixels the client
+                                 * premultiplied into the pool, then release the
+                                 * slots so the next present can cycle */
+                                int slot = attach_count == 2 ? 1 : 0;
+                                verify_present_pixels(slot);
+                                if (attach_count >= 2) {
+                                        s_send(id_buf[0], 0, NULL, 0);   /* release */
+                                        s_send(id_buf[1], 0, NULL, 0);   /* release */
+                                }
+                                if (attach_count >= 3)
+                                        saw_cycling = true;
+                        }
                         continue;
                 }
         }
@@ -719,6 +841,44 @@ int main(void)
                       "pointer at (120,180) via libwayland event dispatch");
                 CHECK(ptr.pressed, "pointer pressed");
 
+                /* 5b. wl_shm present path (v0.1.5): the shim pools an 800x600
+                 * device-pixel frame (logical 400x300 @ scale 2), premultiplies
+                 * into the memfd slot, attaches + damages + commits through
+                 * real libwayland, and cycles buffers on wl_buffer.release.
+                 * The server thread mmaps the SAME memfd and checks PIXELS. */
+                u32 *frame = (u32 *)malloc((size_t)800 * 600 * 4);
+                CHECK(frame != NULL, "frame buffer allocated");
+                if (frame) {
+                        for (int i = 0; i < 800 * 600; i++)
+                                frame[i] = 0xFF0000FF;        /* opaque red */
+                        frame[7] = 0x80408040;                 /* semi-transparent probe */
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600),
+                              "frame 1 presented via wl_shm through libwayland");
+
+                        usleep(100000);                        /* let the server see commit #1 */
+                        for (int i = 0; i < 800 * 600; i++)
+                                frame[i] = 0xFF00FF00;        /* opaque green */
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600),
+                              "frame 2 presented (slot 1 — slot 0 still in flight)");
+
+                        /* frame 3: retry until the server's releases land and
+                         * slot 0 comes back — the engine drops frames while
+                         * both buffers are busy, same as the raw client */
+                        for (int i = 0; i < 800 * 600; i++)
+                                frame[i] = 0xFF0000FF;
+                        bool third = false;
+                        for (int i = 0; i < 100 && !third; i++) {
+                                wlshim_present_cpu(win, frame, 800, 600);
+                                usleep(20000);
+                                /* saw_cycling is set by the server thread when
+                                 * the THIRD attach (buffer 0 again) commits */
+                                if (saw_cycling)
+                                        third = true;
+                        }
+                        CHECK(third, "double-buffer cycling: slot 0 reused after wl_buffer.release");
+                        free(frame);
+                }
+
                 /* 6. roundtrip: the server retires the layer surface right
                  * before replying — closed must be dispatched by then. */
                 wlshim_sync();
@@ -739,6 +899,10 @@ int main(void)
         CHECK(saw_zone_neg1, "set_exclusive_zone(-1) seen");
         CHECK(saw_interact0, "set_keyboard_interactivity(none) seen");
         CHECK(saw_ack77, "ack_configure(serial) seen");
+        CHECK(saw_pool, "wl_shm.create_pool with memfd seen");
+        CHECK(saw_buf[0] && saw_buf[1], "two wl_shm buffers created");
+        CHECK(saw_attach, "buffer attached through real libwayland");
+        CHECK(saw_cycling, "buffer cycled after release (third attach == slot 0)");
 
         /* the strict validator must have seen ZERO violations from REAL
          * libwayland working off OUR metadata tables across the whole
