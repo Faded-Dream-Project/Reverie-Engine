@@ -1,7 +1,5 @@
 # Reverie Engine
 
-[![ci](https://github.com/FemBoyGamerTechGuy/Reverie-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/FemBoyGamerTechGuy/Reverie-Engine/actions/workflows/ci.yml)
-
 **An interactive wallpaper engine written in pure C. The only things it links
 are libc, libm, and the Linux kernel — and when a GPU is present, it drives
 Vulkan or OpenGL entirely through `dlopen`, with zero build-time
