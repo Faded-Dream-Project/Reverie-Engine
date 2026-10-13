@@ -46,8 +46,10 @@ static void usage(void)
 "  -s, --size WxH      output size for --once (default 1920x1080)\n"
 "  -O, --out FILE      output PNG path for --once (default reverie.png)\n"
 "  -l, --list          list monitors and exit\n"
-"      --shot N FILE  after N seconds, screenshot every window to FILE\n"
-"                       and keep running (E2E test hook)\n"
+"      --shot FILE      screenshot every window to FILE and keep running\n"
+"                       (E2E test hook; needs a compositor readback)\n"
+"      --shot-after N   seconds to wait before the screenshot\n"
+"                       (--shot N FILE is also accepted)\n"
 "  -v, --verbose       debug logging\n"
 "  -q, --quiet         errors only\n"
 "  -h, --help          this help\n"
@@ -190,9 +192,28 @@ int main(int argc, char **argv)
                 } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) {
                         list = true;
                 } else if (!strcmp(argv[i], "--shot")) {
-                        if (i + 2 >= argc) { usage(); return 1; }
+                        /* two accepted forms:
+                         *   --shot SECONDS FILE           (legacy, scripts/e2e.sh)
+                         *   --shot FILE [--shot-after N]  (as documented in
+                         *                                 docs/BACKENDS.md) */
+                        if (i + 1 >= argc) { usage(); return 1; }
+                        {
+                                char *end = NULL;
+                                double sec = strtod(argv[i + 1], &end);
+                                if (end && *end == 0 && end != argv[i + 1]) {
+                                        /* numeric first arg: legacy form */
+                                        if (i + 2 >= argc) { usage(); return 1; }
+                                        shot_after = sec;
+                                        shot_file = argv[i + 2];
+                                        i += 2;
+                                } else {
+                                        shot_file = argv[i + 1];
+                                        i += 1;
+                                }
+                        }
+                } else if (!strcmp(argv[i], "--shot-after")) {
+                        if (i + 1 >= argc) { usage(); return 1; }
                         shot_after = atof(argv[++i]);
-                        shot_file = argv[++i];
                 } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
                         rev_log_set_level(REV_LOG_DEBUG);
                 } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
@@ -308,6 +329,7 @@ int main(int argc, char **argv)
         RFb fbs[REV_PLATFORM_MAX_OUTPUTS];
         u32 fb_scale[REV_PLATFORM_MAX_OUTPUTS];
         int winidx[REV_PLATFORM_MAX_OUTPUTS];
+        int any_window = 0;
         for (int i = 0; i < nmon; i++) {
                 f64 scale = plat->monitor_scale(plat, i);
                 fb_scale[i] = scale > 1.0 ? (u32)(scale + 0.5) : 1;
@@ -315,8 +337,27 @@ int main(int argc, char **argv)
                 fbs[i].h = (u32)(mons[i].h * fb_scale[i]);
                 fbs[i].px = (u32 *)calloc((size_t)fbs[i].w * fbs[i].h, 4);
                 winidx[i] = plat->add_window(plat, mons[i]);
-                if (winidx[i] < 0)
+                if (winidx[i] < 0) {
                         LOGW("monitor %d: window creation failed", i);
+                } else {
+                        any_window = 1;
+                }
+        }
+        if (nmon > 0 && !any_window) {
+                /* running with zero windows is pointless (and confusing:
+                 * the daemon looks alive in a process monitor while the
+                 * desktop shows nothing) — bail out with a clear error. */
+                fprintf(stderr, "reverie: no windows could be created on %s — exiting\n",
+                        plat->name);
+                for (int i = 0; i < nmon; i++)
+                        free(fbs[i].px);
+                platform_destroy(plat);
+                rtscene_free(sf.sc);
+                if (sf.pack_used)
+                        rev_pack_free(&sf.pack);
+                arena_destroy(sf.ir_arena);
+                free(base_dir);
+                return 1;
         }
 
         /* renderer selection happens AFTER windows exist (surfaces need them) */

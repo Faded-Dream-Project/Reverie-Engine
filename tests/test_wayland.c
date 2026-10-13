@@ -5,6 +5,13 @@
  * layer-surface configure flow, wl_shm pool with a real memfd (server
  * mmaps it and checks PIXELS), buffer attach/commit, and pointer events.
  *
+ * The fake compositor is STRICT: every client request is validated (target
+ * object must be known, opcode must exist for that interface, wire size must
+ * match, new_ids are registered) and violations receive a real
+ * wl_display.error — the same response a real compositor gives. The lenient
+ * 0.1.2 fake agreed with the client's shifted zwlr_layer_surface_v1 opcodes
+ * and the bug only surfaced on a real stacking compositor (KWin).
+ *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
 #include <errno.h>
@@ -38,7 +45,7 @@ typedef struct {
         u32 sync2;
 } PhaseA;
 static PhaseA A;
-static volatile bool saw_anchor = false, saw_size = false;
+static volatile bool saw_anchor = false, saw_zone = false, saw_interact = false;
 
 static u32 s_get32(const u8 *p)
 {
@@ -130,12 +137,239 @@ static u32 msg_size(const u8 *m)
         return s_get32(m + 4) >> 16;
 }
 
-/* ---- the fake compositor's object ids ---------------------------------------
- * The client picks its own ids starting at 2 (registry) then 3+ for binds.
- * The SERVER just needs to remember which id maps to what. */
+/* the fake compositor's object ids — the client picks its own ids starting
+ * at 2 (registry) then 3+ for binds; the SERVER just remembers the mapping */
 #define OBJ_DISPLAY 1
 #define OBJ_REGISTRY 2
 
+/* ---- strict request validator (mimics libwayland-server) ---------------------
+ * Every request must target a KNOWN object with a KNOWN opcode and the exact
+ * wire size; new_ids are registered as they are created; destructor requests
+ * retire their object. Violations post a wl_display.error exactly like a real
+ * compositor (KWin/weston) would.
+ *
+ * Regression net for the 0.1.2 field bug: the client encoded the whole
+ * zwlr_layer_surface_v1 request family with shifted opcodes —
+ * get_layer_surface as opcode 1 (which is destroy), ack_configure as opcode 6
+ * (also destroy), plus a set_size request that does not exist in the protocol
+ * at all — so KWin killed the connection with "invalid object 12" and the
+ * layer surface never configured. The old lenient fake compositor accepted
+ * the same wrong numbering (both sides were written together), so every test
+ * stayed green until a real compositor ran the client. */
+enum {
+        T_DISPLAY, T_REGISTRY, T_COMPOSITOR, T_SURFACE, T_SHM, T_POOL, T_BUFFER,
+        T_SEAT, T_POINTER, T_OUTPUT, T_SHELL, T_LAYER_SURFACE,
+};
+
+typedef struct { u32 id; u8 type; } SObj;
+static SObj sobjs[96];
+static int nsobjs;
+static char srv_err[128];    /* last validator error (empty = none seen) */
+static bool srv_error_posted;
+
+static void s_reset_objects(void)
+{
+        nsobjs = 0;
+        srv_err[0] = 0;
+        srv_error_posted = false;
+}
+
+static int s_find_idx(u32 id)
+{
+        for (int i = 0; i < nsobjs; i++)
+                if (sobjs[i].id == id)
+                        return i;
+        return -1;
+}
+
+static void s_reg(u32 id, u8 type)
+{
+        if (id && s_find_idx(id) < 0 && nsobjs < (int)(sizeof sobjs / sizeof sobjs[0])) {
+                sobjs[nsobjs].id = id;
+                sobjs[nsobjs].type = type;
+                nsobjs++;
+        }
+}
+
+static void s_unreg(u32 id)
+{
+        int i = s_find_idx(id);
+        if (i >= 0) {
+                sobjs[i] = sobjs[nsobjs - 1];
+                nsobjs--;
+        }
+}
+
+static u8 s_type_of(u32 obj)
+{
+        if (obj == OBJ_DISPLAY)
+                return T_DISPLAY;
+        if (obj == OBJ_REGISTRY)
+                return T_REGISTRY;
+        int i = s_find_idx(obj);
+        return i >= 0 ? sobjs[i].type : 0xff;
+}
+
+/* wl_display.error(object_id, code, message) — what KWin sent in the field */
+static void s_post_error(u32 obj, u32 code, const char *text)
+{
+        u32 ml = (u32)strlen(text) + 1;
+        u32 pad = (4 - (ml & 3)) & 3;
+        size_t plen = 4 + 4 + 4 + ml + pad;
+        u8 *p = (u8 *)calloc(1, plen);
+        if (!p)
+                return;
+        s_put32(p, obj);
+        s_put32(p + 4, code);
+        s_put32(p + 8, ml);
+        memcpy(p + 12, text, ml);
+        s_send(OBJ_DISPLAY, 0, p, plen);
+        free(p);
+        srv_error_posted = true;
+}
+
+/* validate ONE client request; false = violation (error already posted to
+ * the client, exactly like a real compositor would) */
+static bool s_check(const u8 *m, size_t len)
+{
+        u32 obj = s_get32(m);
+        u32 op = msg_opcode(m);
+        u32 size = msg_size(m);
+        u8 t = s_type_of(obj);
+        if (t == 0xff) {
+                snprintf(srv_err, sizeof srv_err, "invalid object %u", obj);
+                s_post_error(obj, 0, srv_err);
+                return false;
+        }
+        u32 want = 0;           /* expected wire size, 0 = reject */
+        int nidoff = -1;        /* payload offset of a new_id arg    */
+        u8 nid_type = 0xff;     /* type to register for that new_id  */
+        bool is_bind = false, varsz = false, destructor = false;
+        switch (t) {
+        case T_DISPLAY:                    /* 0 sync, 1 get_registry (callbacks not tracked) */
+                if (op == 0 || op == 1)
+                        want = 12;
+                break;
+        case T_REGISTRY:
+                if (op == 0)
+                        is_bind = true;    /* bind(name, iface, version, new_id) */
+                break;
+        case T_COMPOSITOR:
+                if (op == 0) { want = 12; nidoff = 8; nid_type = T_SURFACE; }
+                break;
+        case T_SHM:
+                if (op == 0) { want = 16; nidoff = 8; nid_type = T_POOL; }
+                break;
+        case T_POOL:
+                if (op == 0) { want = 32; nidoff = 8; nid_type = T_BUFFER; }
+                else if (op == 1) { want = 8; destructor = true; }
+                else if (op == 2) want = 12;               /* resize */
+                break;
+        case T_BUFFER:
+                if (op == 0) { want = 8; destructor = true; }
+                break;
+        case T_SURFACE:
+                if (op == 0) { want = 8; destructor = true; }          /* destroy */
+                else if (op == 1) want = 20;                          /* attach */
+                else if (op == 2 || op == 9) want = 24;               /* damage(_buffer) */
+                else if (op == 3) want = 12;                          /* frame (cb) */
+                else if (op == 4 || op == 5 || op == 7 || op == 8) want = 12;
+                else if (op == 6) want = 8;                           /* commit */
+                break;
+        case T_SEAT:
+                if (op <= 2) { want = 12; nidoff = 8; nid_type = T_POINTER; }
+                else if (op == 3) { want = 8; destructor = true; }    /* release */
+                break;
+        case T_POINTER:
+                if (op == 0) want = 24;                                 /* set_cursor */
+                else if (op == 1) { want = 8; destructor = true; }    /* release */
+                break;
+        case T_OUTPUT:
+                if (op == 0) { want = 8; destructor = true; }         /* release (v3) */
+                break;
+        case T_SHELL:                     /* zwlr_layer_shell_v1 */
+                if (op == 0)
+                        varsz = true;    /* get_layer_surface */
+                else if (op == 1) { want = 8; destructor = true; }    /* destroy */
+                break;
+        case T_LAYER_SURFACE:             /* zwlr_layer_surface_v1 */
+                if (op == 0 || op == 1 || op == 3 || op == 5) want = 12;
+                else if (op == 2) want = 24;                          /* set_margin */
+                else if (op == 4) want = 12;                          /* get_popup */
+                else if (op == 6) { want = 8; destructor = true; }    /* destroy */
+                else if (op == 7) want = 8;                           /* set_layer */
+                break;
+        }
+        if (is_bind) {
+                if (size < 24 || len < size) {
+                        snprintf(srv_err, sizeof srv_err, "test: bind bad size %u", size);
+                        s_post_error(obj, 1, srv_err);
+                        return false;
+                }
+                u32 slen = s_get32(m + 12);
+                if (slen == 0 || slen > 64 || 20 + ((slen + 3) & ~3u) > size) {
+                        snprintf(srv_err, sizeof srv_err, "test: bind interface string malformed");
+                        s_post_error(obj, 1, srv_err);
+                        return false;
+                }
+                char iface[64] = { 0 };
+                memcpy(iface, m + 16, slen - 1);
+                u32 new_id = s_get32(m + 20 + ((slen + 3) & ~3u));
+                u8 bt = T_SURFACE;
+                if (!strcmp(iface, "wl_compositor"))         bt = T_COMPOSITOR;
+                else if (!strcmp(iface, "wl_shm"))           bt = T_SHM;
+                else if (!strcmp(iface, "wl_seat"))          bt = T_SEAT;
+                else if (!strcmp(iface, "wl_output"))        bt = T_OUTPUT;
+                else if (!strcmp(iface, "zwlr_layer_shell_v1")) bt = T_SHELL;
+                s_reg(new_id, bt);
+                return true;
+        }
+        if (varsz) {
+                /* get_layer_surface(new_id, surface, output, layer, namespace) */
+                if (len < size || size < 32 || (size & 3)) {
+                        snprintf(srv_err, sizeof srv_err, "test: get_layer_surface bad size %u", size);
+                        s_post_error(obj, 1, srv_err);
+                        return false;
+                }
+                u32 nid = s_get32(m + 8);
+                u32 surf = s_get32(m + 12);
+                u32 outp = s_get32(m + 16);
+                u32 slen = s_get32(m + 24);
+                if (s_type_of(surf) != T_SURFACE || (outp && s_type_of(outp) != T_OUTPUT)) {
+                        snprintf(srv_err, sizeof srv_err,
+                                 "test: get_layer_surface bad object refs");
+                        s_post_error(obj, 0, srv_err);
+                        return false;
+                }
+                if (slen == 0 || 28 + ((slen + 3) & ~3u) > size) {
+                        snprintf(srv_err, sizeof srv_err,
+                                 "test: get_layer_surface namespace malformed");
+                        s_post_error(obj, 1, srv_err);
+                        return false;
+                }
+                s_reg(nid, T_LAYER_SURFACE);
+                return true;
+        }
+        if (want == 0) {
+                snprintf(srv_err, sizeof srv_err, "test: unknown opcode %u on object %u",
+                         op, obj);
+                s_post_error(obj, 1, srv_err);
+                return false;
+        }
+        if (size != want || len != size) {
+                snprintf(srv_err, sizeof srv_err, "test: object %u opcode %u size %u != %u",
+                         obj, op, size, want);
+                s_post_error(obj, 1, srv_err);
+                return false;
+        }
+        if (nidoff >= 0 && nid_type != 0xff)
+                s_reg(s_get32(m + nidoff), nid_type);
+        if (destructor)
+                s_unreg(obj);
+        return true;
+}
+
+/* ---- the fake compositor's state -------------------------------------------- */
 typedef struct {
         u32 compositor;   /* client id of wl_compositor          */
         u32 shm;          /* client id of wl_shm                 */
@@ -179,6 +413,8 @@ static void *phase_a(void *arg)
                 CHECK(s_get32(msg) == OBJ_DISPLAY && msg_opcode(msg) == 1,
                       "get_registry addressed to wl_display opcode 1");
                 CHECK(msg_size(msg) == 12, "get_registry message size 12");
+                if (n >= 8)
+                        s_check(msg, n);    /* strict: object 1, opcode 1 */
                 {
                         static const u8 golden_registry[12] = {
                                 0x01, 0x00, 0x00, 0x00,   /* object 1       */
@@ -193,6 +429,8 @@ static void *phase_a(void *arg)
                 /* 2. sync (object 1, opcode 0) */
                 n = s_read_msg(msg, sizeof msg, NULL);
                 CHECK(n >= 12, "received sync");
+                if (n >= 8)
+                        s_check(msg, n);
                 u32 sync_cb = s_get32(msg + 8);
                 CHECK(msg_opcode(msg) == 0, "sync opcode 0");
                 CHECK(msg_size(msg) == 12, "sync message size 12");
@@ -222,6 +460,8 @@ static void *phase_a(void *arg)
                         CHECK(n >= 24, "received bind");
                         if (n < 24)
                                 continue;    /* client gone: skip stale-buffer parsing */
+                        if (!s_check(msg, n))
+                                continue;    /* violation posted; client will die */
                         u32 name = s_get32(msg + 8);
                         u32 slen = s_get32(msg + 12);
                         char iface[64] = { 0 };
@@ -272,8 +512,12 @@ static void *phase_a(void *arg)
                 n = s_read_msg(msg, sizeof msg, NULL);
                 CHECK(n >= 12, "received get_pointer");
                 CHECK(msg_opcode(msg) == 0, "get_pointer opcode 0");
+                if (n >= 8)
+                        s_check(msg, n);    /* registers the pointer object */
                 u32 pointer_id = s_get32(msg + 8);
                 n = s_read_msg(msg, sizeof msg, NULL);
+                if (n >= 8)
+                        s_check(msg, n);
                 u32 sync2 = s_get32(msg + 8);
                 CHECK(msg_opcode(msg) == 0, "second sync");
                 s_send(sync2, 0, NULL, 0);
@@ -301,7 +545,11 @@ static void *phase_flood(void *arg)
         /* client opens with get_registry + sync (golden bytes checked below
          * in the canonical scenario; here we only need the framing) */
         n = s_read_msg(msg, sizeof msg, NULL);
+        if (n >= 8)
+                s_check(msg, n);
         n = s_read_msg(msg, sizeof msg, NULL);
+        if (n >= 8)
+                s_check(msg, n);
         u32 sync_cb = s_get32(msg + 8);
 
         /* 57 globals, required ones at their field positions: wl_shm #2,
@@ -348,6 +596,8 @@ static void *phase_flood(void *arg)
                 CHECK(n >= 24, "flood: received bind");
                 if (n < 24)
                         continue;    /* client gone: skip stale-buffer parsing */
+                if (!s_check(msg, n))
+                        continue;
                 u32 name = s_get32(msg + 8);
                 u32 slen = s_get32(msg + 12);
                 char iface[64] = { 0 };
@@ -403,9 +653,12 @@ static void *phase_flood(void *arg)
 
         /* get_pointer THEN the final sync (client order) */
         n = s_read_msg(msg, sizeof msg, NULL);
+        if (n >= 8)
+                s_check(msg, n);
         n = s_read_msg(msg, sizeof msg, NULL);
         if (n < 12)
                 return NULL;    /* client gone before the final roundtrip */
+        s_check(msg, n);
         u32 sync2 = s_get32(msg + 8);
         s_send(sync2, 0, NULL, 0);
         return NULL;
@@ -415,34 +668,47 @@ static void *phase_b(void *arg)
 {
         (void)arg;
         n = s_read_msg(msg, sizeof msg, NULL);
+        CHECK(n >= 12, "received create_surface");
         CHECK(s_get32(msg) == S.compositor && msg_opcode(msg) == 0,
-              "compositor.create_surface");
+              "compositor.create_surface (opcode 0)");
         S.surface = s_get32(msg + 8);
+        if (n >= 8)
+                s_check(msg, n);    /* registers the surface object */
 
         n = s_read_msg(msg, sizeof msg, NULL);
-        CHECK(s_get32(msg) == S.layer_shell && msg_opcode(msg) == 1,
-              "layer_shell.get_layer_surface");
+        CHECK(n >= 32, "received get_layer_surface");
+        /* opcode MUST be 0: opcode 1 is destroy — the 0.1.2 client sent the
+         * creation request as a destroy and KWin killed the connection. */
+        CHECK(s_get32(msg) == S.layer_shell && msg_opcode(msg) == 0,
+              "layer_shell.get_layer_surface (opcode 0)");
         S.layer_surface = s_get32(msg + 8);
         u32 surf_arg = s_get32(msg + 12);
         u32 output_arg = s_get32(msg + 16);
         u32 layer = s_get32(msg + 20);
         CHECK(surf_arg == S.surface, "get_layer_surface(surface) is our surface");
         CHECK(output_arg == S.output, "get_layer_surface(output) is our output");
-        CHECK(layer == 1, "layer == BACKGROUND(1)");
+        CHECK(layer == 0, "layer == BACKGROUND(0)");
+        if (n >= 8)
+                s_check(msg, n);    /* registers the layer_surface object */
 
-        /* drain set_anchor/zone/interactivity/size + commit(null) */
+        /* drain set_anchor / set_exclusive_zone / set_keyboard_interactivity
+         * + commit(null) — each strictly validated */
         for (int i = 0; i < 8; i++) {
                 n = s_read_msg(msg, sizeof msg, NULL);
                 if (n < 8)
-                break;
+                        break;
+                if (!s_check(msg, n))
+                        break;    /* violation: client connection is dead */
                 u32 op = msg_opcode(msg);
                 u32 obj = s_get32(msg);
-                if (obj == S.layer_surface && op == 1 && n >= 12 && s_get32(msg + 8) == 15)
-                saw_anchor = true;
-                if (obj == S.layer_surface && op == 0 && n >= 16)
-                saw_size = true;
+                if (obj == S.layer_surface && op == 0 && n == 12 && s_get32(msg + 8) == 15)
+                        saw_anchor = true;
+                if (obj == S.layer_surface && op == 1 && n == 12 && (i32)s_get32(msg + 8) == -1)
+                        saw_zone = true;
+                if (obj == S.layer_surface && op == 3 && n == 12 && s_get32(msg + 8) == 0)
+                        saw_interact = true;
                 if (obj == S.surface && op == 6)
-                break;    /* commit(null) */
+                        break;    /* commit(null) */
         }
 
         /* configure -> client must ack and attach a first buffer */
@@ -491,6 +757,7 @@ int main(void)
 
         /* ---- flood regression run (fresh socket, fresh client state) ----- */
         {
+                s_reset_objects();
                 struct sockaddr_un fa;
                 memset(&fa, 0, sizeof fa);
                 fa.sun_family = AF_UNIX;
@@ -525,6 +792,7 @@ int main(void)
                 setenv("WAYLAND_DISPLAY", sock_name, 1);
                 memset(&S, 0, sizeof S);
                 flood_shell_name = flood_output_name = 0;
+                s_reset_objects();    /* new connection: ids restart at 2 */
         }
 
         /* client connects in a forked child? No — the client is in-process:
@@ -553,8 +821,9 @@ int main(void)
         int win = wl_add_window(wl, 0);
         CHECK(win == 0, "window created");
         pthread_join(thb, NULL);
-        CHECK(saw_anchor, "set_anchor(all edges)");
-        CHECK(saw_size, "set_size");
+        CHECK(saw_anchor, "set_anchor(all edges) — opcode 0");
+        CHECK(saw_zone, "set_exclusive_zone(-1) — opcode 1");
+        CHECK(saw_interact, "set_keyboard_interactivity(none) — opcode 3");
 
         /* client: ack_configure + create_pool (with fd!) + 2 buffers + attach + commit */
         bool saw_ack = false, saw_pool = false, saw_attach = false;
@@ -564,11 +833,14 @@ int main(void)
                 n = s_read_msg(msg, sizeof msg, &fd);
                 if (n < 8)
                         break;
+                if (!s_check(msg, n))
+                        break;
                 u32 obj = s_get32(msg);
                 u32 op = msg_opcode(msg);
-                if (obj == S.layer_surface && op == 6) {
+                if (obj == S.layer_surface && op == 5) {
+                        /* ack_configure is opcode 5 — opcode 6 is destroy */
                         saw_ack = true;
-                        CHECK(s_get32(msg + 8) == 77, "ack_configure(serial=77)");
+                        CHECK(s_get32(msg + 8) == 77, "ack_configure(serial=77) [opcode 5]");
                 } else if (obj == S.shm && op == 0) {
                         saw_pool = true;
                         S.pool = s_get32(msg + 8);
@@ -616,6 +888,8 @@ int main(void)
         for (int i = 0; i < 6; i++) {
                 n = s_read_msg(msg, sizeof msg, &fd);
                 if (n < 8)
+                        break;
+                if (!s_check(msg, n))
                         break;
                 u32 obj = s_get32(msg);
                 u32 op = msg_opcode(msg);
@@ -685,6 +959,14 @@ int main(void)
         }
         wl_pump(wl);
         CHECK(wl_fatal(wl), "wl_display.error flagged fatal");
+
+        /* the strict validator must have seen ZERO violations from the client
+         * across the whole session (handshake, binds, layer-surface setup,
+         * pool/buffers, present, pointer) — any protocol slip the lenient
+         * 0.1.2 fake would have waved through now fails the test here. */
+        CHECK(!srv_error_posted, "strict validator: zero protocol violations");
+        if (srv_error_posted)
+                printf("    strict validator says: %s\n", srv_err);
 
         wl_disconnect(wl);
         close(cli_fd);

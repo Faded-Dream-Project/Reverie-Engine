@@ -139,7 +139,24 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.2 (pre-release)
+## Status — 0.1.3 (pre-release)
+
+0.1.3 fixes a field-reported 0.1.2 bug — the Wayland wallpaper went black on
+real layer-shell compositors (KWin):
+
+* **The whole `zwlr_layer_surface_v1` request family was encoded with the
+  wrong opcodes** — `get_layer_surface` as opcode 1 (which is *destroy*),
+  `ack_configure` as opcode 6 (also *destroy*), a `set_size` request that
+  does not exist in the protocol, and layer value 1 (bottom) where 0
+  (background) was meant. KWin answered "invalid object 12", the layer
+  surface never configured, and no window was ever created. The
+  fake-compositor test had agreed with the wrong numbering (client and test
+  were written together), so it only surfaced against a real compositor.
+  0.1.3 sends the correct opcodes, sizes buffers from the compositor's
+  `configure` event, makes the fake compositor *strict* (object/opcode/size
+  validation with real `wl_display.error` responses), fixes the documented
+  `--shot FILE --shot-after N` CLI form, and exits with an error instead of
+  running windowless when window creation fails.
 
 0.1.2 fixes a field-reported 0.1.1 regression:
 

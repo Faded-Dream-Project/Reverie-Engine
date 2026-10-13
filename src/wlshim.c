@@ -55,17 +55,28 @@ extern const struct wl_interface_ *zwlr_layer_shell_v1_iface;
 extern const struct wl_interface_ *zwlr_layer_surface_v1_iface;
 
 static const struct wl_message_ layer_shell_methods[] = {
-        { "", NULL },                                    /* destroy                 */
-        { "n?oos", NULL },                               /* get_layer_surface       */
+        /* request opcodes are the array indices (wlr-layer-shell-unstable-v1):
+         *   0 get_layer_surface(new_id, surface, output, layer, namespace)
+         *   1 destroy (since v3) */
+        { "n?oous", NULL },                               /* get_layer_surface (op 0) */
+        { "", NULL },                                    /* destroy           (op 1) */
 };
 static const struct wl_message_ layer_surface_methods[] = {
-        { "uu", NULL },                                  /* set_size                */
-        { "u", NULL },                                   /* set_anchor              */
-        { "i", NULL },                                   /* set_exclusive_zone      */
-        { "iiii", NULL },                                /* set_margin              */
-        { "u", NULL },                                   /* set_keyboard_interactivity */
-        { "n?o", NULL },                                 /* get_popup               */
-        { "u", NULL },                                   /* ack_configure           */
+        /* request opcode order per protocol:
+         *   0 set_anchor(u)              1 set_exclusive_zone(i)
+         *   2 set_margin(iiii)           3 set_keyboard_interactivity(u)
+         *   4 get_popup(n?o)            5 ack_configure(u)
+         *   6 destroy                    7 set_layer (since v2)
+         * There is NO set_size request — the compositor sizes all-edges
+         * anchored surfaces and reports the result via configure(). */
+        { "u", NULL },                                   /* set_anchor              (0) */
+        { "i", NULL },                                   /* set_exclusive_zone      (1) */
+        { "iiii", NULL },                                /* set_margin              (2) */
+        { "u", NULL },                                   /* set_keyboard_interactivity (3) */
+        { "n?o", NULL },                                 /* get_popup               (4) */
+        { "u", NULL },                                   /* ack_configure           (5) */
+        { "", NULL },                                    /* destroy                 (6) */
+        { "", NULL },                                    /* set_layer               (7) */
 };
 static const struct wl_message_ layer_surface_events[] = {
         { "uuu", NULL },                                 /* configure(serial,w,h)  */
@@ -73,15 +84,15 @@ static const struct wl_message_ layer_surface_events[] = {
 };
 
 static const struct wl_interface_ zwlr_layer_shell_v1_i = {
-        "zwlr_layer_shell_v1", 1, 2, layer_shell_methods, 0, NULL
+        "zwlr_layer_shell_v1", 4, 2, layer_shell_methods, 0, NULL
 };
 static const struct wl_interface_ zwlr_layer_surface_v1_i = {
-        "zwlr_layer_surface_v1", 1, 7, layer_surface_methods, 2, layer_surface_events
+        "zwlr_layer_surface_v1", 4, 8, layer_surface_methods, 2, layer_surface_events
 };
 const struct wl_interface_ *zwlr_layer_shell_v1_iface = &zwlr_layer_shell_v1_i;
 const struct wl_interface_ *zwlr_layer_surface_v1_iface = &zwlr_layer_surface_v1_i;
 
-/* types arrays referenced by "n?oos" signatures — filled at runtime with
+/* types arrays referenced by "n?oous" signatures — filled at runtime with
  * dlsym'd libwayland interface symbols */
 static const void *get_layer_surface_types[4];
 
@@ -513,11 +524,11 @@ int wlshim_add_window(RRect geom)
         if (!win->surface)
                 return -1;
 
-        /* zwlr_layer_shell_v1.get_layer_surface(new_id, surface, output,
-         * layer=BACKGROUND(1), namespace) — opcode 1, signature "n?oos" */
+        /* zwlr_layer_shell_v1.get_layer_surface — opcode 0, signature "n?oous":
+         *   (new_id, surface, output, layer=BACKGROUND(0), namespace) */
         wl_proxy_ *out_proxy = S.outputs[mon].output;
-        win->layer_surface = S.proxy_marshal_flags(S.layer_shell, 1, zwlr_layer_surface_v1_iface,
-                                                   0, 1, win->surface, out_proxy, 1, "reverie");
+        win->layer_surface = S.proxy_marshal_flags(S.layer_shell, 0, zwlr_layer_surface_v1_iface,
+                                                   0, 1, win->surface, out_proxy, 0, "reverie");
         if (!win->layer_surface)
                 return -1;
 
@@ -527,13 +538,14 @@ int wlshim_add_window(RRect geom)
         };
         S.proxy_add_listener(win->layer_surface, (void (**)(void))layer_listener, NULL);
 
-        /* set_anchor(all) opcode 1; set_exclusive_zone(-1) opcode 2;
-         * set_keyboard_interactivity(none) opcode 4; set_size(w,h) opcode 0 */
-        S.proxy_marshal(win->layer_surface, 1, 15u);
-        S.proxy_marshal(win->layer_surface, 2, (i32)-1);
-        S.proxy_marshal(win->layer_surface, 4, 0u);
+        /* set_anchor(all) opcode 0; set_exclusive_zone(-1) opcode 1;
+         * set_keyboard_interactivity(none) opcode 3 — there is no set_size
+         * request; the compositor assigns the size of an all-edges-anchored
+         * surface and delivers it via configure(). */
+        S.proxy_marshal(win->layer_surface, 0, 15u);
+        S.proxy_marshal(win->layer_surface, 1, (i32)-1);
+        S.proxy_marshal(win->layer_surface, 3, 0u);
         i32 s = S.outputs[mon].scale < 1 ? 1 : S.outputs[mon].scale;
-        S.proxy_marshal(win->layer_surface, 0, (u32)(S.outputs[mon].pw / s), (u32)(S.outputs[mon].ph / s));
         S.surface_commit((wl_surface_ *)win->surface);
         S.flush(S.display);
 
@@ -545,7 +557,7 @@ int wlshim_add_window(RRect geom)
                 LOGW("wlshim: layer surface did not configure");
                 return -1;
         }
-        S.proxy_marshal(win->layer_surface, 6, win->cfg_serial);    /* ack_configure */
+        S.proxy_marshal(win->layer_surface, 5, win->cfg_serial);    /* ack_configure */
         S.flush(S.display);
 
         win->lw = (u32)(S.outputs[mon].pw / s);

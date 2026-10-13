@@ -136,7 +136,26 @@ and logged as such.)
   compositing are fine and the delta is the GPU init), and use
   `--shot out.png --shot-after 3` to read the window content back — a
   correct PNG under a black screen means the window is being obscured or
-  restacked by the WM, not mis-rendered.
+  restacked by the WM, not mis-rendered. (`--shot FILE --shot-after N` and
+  the legacy `--shot N FILE` forms are both accepted.)
+* **"compositor error … code 0: invalid object N" / "layer surface did not
+  configure" (0.1.2 postmortem)** — the raw client encoded the whole
+  `zwlr_layer_surface_v1` request family with opcodes shifted off the
+  protocol's numbering: `get_layer_surface` was sent as opcode 1 (which is
+  *destroy*), `ack_configure` as opcode 6 (also *destroy*), plus a
+  `set_size` request that does not exist in the protocol at all. The first
+  bad request made the compositor kill the connection — KWin reported
+  "invalid object 12" (the never-created layer surface) — so the surface
+  never configured, no window was created, and the desktop stayed black
+  while the daemon ran on. The fake-compositor test had agreed with the
+  wrong numbering because client and test were written together (same class
+  of bug as the 0.1.0 framing swap). Fixed in 0.1.3: correct opcodes, layer
+  enum BACKGROUND=0 (was sending 1 = bottom), no set_size (the size comes
+  from `configure`), and the fake compositor is now a *strict* one — it
+  tracks every object id, validates opcode and wire size of every request,
+  and answers violations with a real `wl_display.error` exactly like KWin.
+  The daemon also exits with an error when no window could be created
+  instead of running windowless.
 * **"protocol parse error" / "registry roundtrip timed out" (0.1.0
   postmortem)** — the wire client *encoded* requests with the correct header
   layout (`word1 = (size << 16) | opcode`) but *decoded* events with the two

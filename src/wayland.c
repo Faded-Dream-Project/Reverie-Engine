@@ -518,6 +518,11 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                         if (cw && ch) {
                                 win->w = cw;
                                 win->h = ch;
+                                /* the compositor's assignment is authoritative —
+                                 * buffers below are sized from it */
+                                i32 s = win->scale < 1 ? 1 : (i32)win->scale;
+                                win->pw = cw * (u32)s;
+                                win->ph = ch * (u32)s;
                         }
                         win->configured = true;
                 } else if (opcode == 1) { /* closed */
@@ -880,34 +885,40 @@ int wl_add_window(WLDisplay *w, int mon)
         wl_put_u32(w, win->surface);
 
         win->layer_surface = wl_obj_new(w, WK_LAYER_SURFACE, wi, -1);
-        /* get_layer_surface(new_id, surface, output, layer=1 background, ns) */
+        /* zwlr_layer_shell_v1.get_layer_surface — request opcode 0:
+         *   get_layer_surface(new_id, surface, output, layer, namespace)
+         * layer enum: background=0 bottom=1 top=2 overlay=3 (we want 0).
+         * Opcode 1 is destroy (since v3) — sending this request as opcode 1
+         * (the 0.1.2 bug) made KWin kill the connection with
+         * "invalid object <new_id>" and the layer surface never configured. */
         {
                 const char *ns = "reverie";
                 size_t nsl = strlen(ns) + 1;
                 size_t payload = 4 + 4 + 4 + 4 + 4 + nsl + ((4 - (nsl & 3)) & 3);
-                if (!wl_begin_req(w, w->layer_shell, 1, payload))
+                if (!wl_begin_req(w, w->layer_shell, 0, payload))
                         return -1;
                 wl_put_u32(w, win->layer_surface);
                 wl_put_u32(w, win->surface);
                 wl_put_u32(w, w->outputs[mon].obj);
-                wl_put_u32(w, 1);              /* layer: background */
+                wl_put_u32(w, 0);              /* layer: background */
                 wl_put_str(w, ns);
         }
-        /* set_anchor(all), set_exclusive_zone(-1), set_keyboard_interactivity(none),
-         * set_size(w,h) */
-        if (!wl_begin_req(w, win->layer_surface, 1, 4))
+        /* zwlr_layer_surface_v1 request opcodes (wlr-layer-shell-unstable-v1):
+         *   0 set_anchor(u32)             1 set_exclusive_zone(i32)
+         *   2 set_margin(4xi32)          3 set_keyboard_interactivity(u32)
+         *   4 get_popup                  5 ack_configure(u32)
+         *   6 destroy                    7 set_layer (since v2)
+         * There is NO set_size request: a surface anchored to all four edges
+         * is sized by the compositor and the size arrives via configure(). */
+        if (!wl_begin_req(w, win->layer_surface, 0, 4))    /* set_anchor */
                 return -1;
         wl_put_u32(w, 15);                 /* top|bottom|left|right */
-        if (!wl_begin_req(w, win->layer_surface, 2, 4))
+        if (!wl_begin_req(w, win->layer_surface, 1, 4))    /* set_exclusive_zone */
                 return -1;
-        wl_put_i32(w, -1);
-        if (!wl_begin_req(w, win->layer_surface, 4, 4))
+        wl_put_i32(w, -1);                 /* fill the whole output */
+        if (!wl_begin_req(w, win->layer_surface, 3, 4))    /* set_keyboard_interactivity */
                 return -1;
-        wl_put_u32(w, 0);
-        if (!wl_begin_req(w, win->layer_surface, 0, 8))
-                return -1;
-        wl_put_u32(w, win->w);
-        wl_put_u32(w, win->h);
+        wl_put_u32(w, 0);                  /* none */
 
         /* commit with no buffer */
         if (!wl_begin_req(w, win->surface, 6, 0))
@@ -935,8 +946,9 @@ int wl_add_window(WLDisplay *w, int mon)
                 return -1;
         }
 
-        /* ack_configure */
-        if (!wl_begin_req(w, win->layer_surface, 6, 4))
+        /* ack_configure — opcode 5 (opcode 6 is destroy: the 0.1.2 client
+         * acked by destroying its own layer surface). */
+        if (!wl_begin_req(w, win->layer_surface, 5, 4))
                 return -1;
         wl_put_u32(w, win->last_serial);
         win->acked = true;
@@ -1023,8 +1035,17 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
         WLWin *win = &w->wins[win_];
         if (win->closed || w->fatal)
                 return false;
-        if (width != win->pw || height != win->ph || !rgba)
+        if (width != win->pw || height != win->ph || !rgba) {
+                if (rgba && (width != win->pw || height != win->ph)) {
+                        static bool warned;
+                        if (!warned) {
+                                warned = true;
+                                LOGW("wayland: frame %ux%u != configured buffer %ux%u — dropping frames",
+                                     width, height, win->pw, win->ph);
+                        }
+                }
                 return false;
+        }
 
         /* pick a free buffer; dispatch first to collect releases */
         wl_dispatch_pending(w);
