@@ -108,9 +108,31 @@ and logged as such.)
 | `REV_WAYLAND_GPU`   | `1` = activate the experimental Wayland WSI shim    |
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
+| `REV_PROFILE`       | `1` = append a per-frame stage breakdown (`sim / raster / render+present` ms) to the periodic `perf:` line |
 
 ## Troubleshooting
 
+* **GPU renderer active but the scene is slow / one CPU core is pinned
+  (dev-cycle postmortem)** — field report: `--renderer opengl` on a GTX
+  1050 Ti showed the real NVIDIA renderer string (GL was finally doing
+  the compositing) yet the wallpaper ran at ~4 fps with a CPU fan
+  spinning. This is not the GPU path failing — the GPU tier composites
+  and presents, but the *scene work* (fluid simulation, animated layer
+  rasters) runs on the CPU, single-threaded, by design. The dev cycle
+  after that report removed the avoidable CPU costs: the fluid layer's
+  full-res bilinear upscale + `exp()` tonemap (now a LUT, and in GPU
+  compositing mode the layer is emitted at dye resolution and stretched
+  with linear texture sampling on the GPU), the f64 pressure solve (now
+  f32 — bit-identical for the power-of-two divisors it used), and the
+  animated-gradient polygon re-rasterization (now a direct rect fill,
+  which also fixed a smear bug where transparent gradient regions froze
+  at old content). What remains on the CPU is the simulation itself: the
+  engine has no threads, so a fluid scene will always keep one core
+  busy — less busy now, but busy. Run with `REV_PROFILE=1` and read the
+  `perf:` stage line before reporting: if `sim` dominates, that is the
+  single-threaded solver; if `render+present` dominates on a *hardware*
+  GPU, look at the driver path instead. Truly idle-CPU simulation means
+  GPU compute, which is future work.
 * **`eglCreateWindowSurface failed (0x300b)` with `--renderer opengl` on
   Wayland (dev-cycle postmortem)** — field report: with `REV_WAYLAND_GPU=1`
   active, the GL tier died at "renderer init" with EGL error 0x300b

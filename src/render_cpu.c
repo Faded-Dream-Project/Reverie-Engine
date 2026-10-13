@@ -70,6 +70,22 @@ static bool cpu_layer(RRenderer *r, const RLayerCmd *cmd)
 	if (!dst->px || !cmd->px)
 		return false;
 
+	u32 pw = cmd->place_w ? cmd->place_w : cmd->w;
+	u32 ph = cmd->place_h ? cmd->place_h : cmd->h;
+	if (pw != cmd->w || ph != cmd->h) {
+		/* sub-frame-resolution sim layer stretched over the frame:
+		 * bilinear upscale, then the normal placed blend */
+		u32 *tmp = (u32 *)malloc((size_t)pw * ph * 4);
+		if (!tmp)
+			return false;
+		rev_resample_bilinear((const u32 *)cmd->px, cmd->w, cmd->h,
+				      tmp, pw, ph);
+		RFb src = { tmp, pw, ph };
+		rev_comp_blend_at(dst, &src, cmd->dx, cmd->dy, cmd->blend, cmd->opacity);
+		free(tmp);
+		return true;
+	}
+
 	if (cmd->blur >= 0.5) {
 		/* blur into a scratch copy, then blend the copy */
 		RFb tmp = { NULL, cmd->w, cmd->h };

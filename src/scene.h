@@ -59,11 +59,13 @@ void rtscene_click(RTScene *sc, int mon, f64 x, f64 y);
  * matching RFb packing. */
 typedef struct {
         const u32 *px;
-        u32 w, h;
-        int blend;         /* REV_BLEND_*              */
-        f64 opacity;       /* 0..1                     */
-        f64 blur;          /* gaussian sigma px        */
-        i32 dx, dy;        /* placement into the frame */
+        u32 w, h;          /* texture size                      */
+        u32 place_w, place_h; /* placement size; 0 = same as w,h */
+        int blend;         /* REV_BLEND_*                       */
+        f64 opacity;       /* 0..1                              */
+        f64 blur;          /* gaussian sigma px                 */
+        i32 dx, dy;        /* top-left placement into the frame */
+        bool linear;       /* linear texture filtering (sub-frame-res sims) */
 } RTLayerCmd;
 
 /* A frame's layer list, filled by rtscene_render_layers(). Pixel buffers
@@ -85,6 +87,11 @@ void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt);
 
 /* GPU offload render: fills `fl` instead of compositing on the CPU. */
 void rtscene_render_layers(RTScene *sc, RTFrameList *fl, int mon, f64 t, f64 dt);
+
+/* Stage timings accumulated by the LAST render call (either mode), in
+ * milliseconds — sim step+render, static/animated raster builds. Read by
+ * main's REV_PROFILE perf line for field triage; reading resets them. */
+void rtscene_profile(RTScene *sc, f64 *sim_ms, f64 *raster_ms);
 
 /* Drops caches (e.g. after hot-reload of assets). */
 void rtscene_flush_caches(RTScene *sc);

@@ -387,6 +387,11 @@ int main(int argc, char **argv)
         u64 last_drops = 0;
         bool shot_done = false;
         RTFrameList fl;
+        /* REV_PROFILE=1: stage breakdown appended to the periodic perf line
+         * (sim / raster ms from the scene, render+present wall time) — the
+         * field-triage tool for "why is my wallpaper slow" reports. */
+        const bool prof_on = getenv("REV_PROFILE") != NULL;
+        f64 prof_sim = 0, prof_raster = 0, prof_render = 0;
 
         while (g_run) {
                 f64 now = rev_monotonic();
@@ -440,11 +445,16 @@ int main(int argc, char **argv)
                 for (int i = 0; i < nmon; i++) {
                         if (winidx[i] < 0 || !fbs[i].px)
                                 continue;
+                        f64 r_t0 = rev_monotonic();
                         if (gpu_layers) {
                                 fl.w = fbs[i].w;
                                 fl.h = fbs[i].h;
                                 fl.n = 0;
                                 rtscene_render_layers(sf.sc, &fl, i, t, dt);
+                                f64 s_ms, ra_ms;
+                                rtscene_profile(sf.sc, &s_ms, &ra_ms);
+                                prof_sim += s_ms;
+                                prof_raster += ra_ms;
                                 if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
                                         continue;
                                 for (int k = 0; k < fl.n; k++) {
@@ -452,19 +462,27 @@ int main(int argc, char **argv)
                                         cmd.px = fl.cmds[k].px;
                                         cmd.w = fl.cmds[k].w;
                                         cmd.h = fl.cmds[k].h;
+                                        cmd.place_w = fl.cmds[k].place_w;
+                                        cmd.place_h = fl.cmds[k].place_h;
                                         cmd.blend = fl.cmds[k].blend;
                                         cmd.opacity = fl.cmds[k].opacity;
                                         cmd.blur = fl.cmds[k].blur;
                                         cmd.dx = fl.cmds[k].dx;
                                         cmd.dy = fl.cmds[k].dy;
+                                        cmd.linear = fl.cmds[k].linear;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);
                         } else {
                                 memset(fbs[i].px, 0, (size_t)fbs[i].w * fbs[i].h * 4);
                                 rtscene_render(sf.sc, &fbs[i], i, t, dt);
+                                f64 s_ms, ra_ms;
+                                rtscene_profile(sf.sc, &s_ms, &ra_ms);
+                                prof_sim += s_ms;
+                                prof_raster += ra_ms;
                                 rend->end(rend, &fbs[i]);
                         }
+                        prof_render += rev_monotonic() - r_t0;
                 }
 
                 /* test hook: screenshot */
@@ -516,12 +534,19 @@ int main(int argc, char **argv)
                 if (now - last_stat >= 5.0) {
                         u64 drops = plat->dropped_frames ? plat->dropped_frames(plat) : 0;
                         LOGI("perf: %.1f fps", (f64)frames / (now - last_stat));
+                        if (prof_on)
+                                LOGI("perf: sim=%.1fms raster=%.1fms render+present=%.1fms"
+                                     " (per frame, avg)",
+                                     prof_sim / (frames ? frames : 1),
+                                     prof_raster / (frames ? frames : 1),
+                                     prof_render / (frames ? frames : 1) * 1000.0);
                         if (drops > last_drops) {
                                 LOGI("perf: %llu frame(s) dropped by the compositor",
                                      (unsigned long long)(drops - last_drops));
                                 last_drops = drops;
                         }
                         frames = 0;
+                        prof_sim = prof_raster = prof_render = 0;
                         last_stat = now;
                 }
 

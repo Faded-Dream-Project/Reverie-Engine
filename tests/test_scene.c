@@ -173,6 +173,85 @@ int main(void)
 		}
 	}
 
+	/* 4b. fluid GPU emission: dye-resolution texture stretched over the
+	 *     frame with linear filtering â not a full-res CPU upscale */
+	{
+		const char *txt =
+			"scene {"
+			"  layer f { type = fluid  res = 0.25 }"
+			"}";
+		RTScene *sc = compile(txt, err, sizeof err);
+		CHECK(sc != NULL, "compile: %s", err);
+		if (sc) {
+			RTFrameList fl;
+			fl.w = 400;
+			fl.h = 300;
+			rtscene_render_layers(sc, &fl, 0, 0.1, 1.0 / 30.0);
+			CHECK(fl.n == 1, "one layer emitted (n=%d)", fl.n);
+			if (fl.n == 1) {
+				RTLayerCmd *c = &fl.cmds[0];
+				CHECK(c->w == 200 && c->h == 150,
+				      "fluid texture at dye res 200x150 (got %ux%u)",
+				      c->w, c->h);
+				CHECK(c->place_w == 400 && c->place_h == 300,
+				      "placement covers the frame (got %ux%u)",
+				      c->place_w, c->place_h);
+				CHECK(c->linear, "linear filtering requested");
+				CHECK(c->dx == 0 && c->dy == 0,
+				      "stretched from the origin (%d,%d)", c->dx, c->dy);
+				CHECK(c->px != NULL, "pixels present");
+			}
+			rtscene_free(sc);
+		}
+	}
+
+	/* 4c. animated gradient rebuilds WRITE cleanly â the old path
+	 *     re-rasterized into the same buffer every frame and blended
+	 *     over the previous frame's raster, so once a region had been
+	 *     opaque it could never become transparent again (the sweep
+	 *     left a permanent smear). angle 0 -> 90 -> 0 over 2s. */
+	{
+		const char *txt =
+			"scene {"
+			"  layer g {"
+			"    type = gradient"
+			"    shape = linear"
+			"    angle = 0"
+			"    stops = [#00000000, (#ffffffff 0.35), #00000000]"
+			"    anim angle { from = 0; to = 90; dur = 1s; mode = pingpong }"
+			"  }"
+			"}";
+		RTScene *sc = compile(txt, err, sizeof err);
+		CHECK(sc != NULL, "compile: %s", err);
+		if (sc) {
+			RFb fb = { calloc((size_t)W * H, 4), W, H };
+			/* the daemon clears the frame before every composite
+			 * (main.c memsets fb) â mirror that here so this test
+			 * measures the LAYER RASTER, not accumulation in fb */
+			memset(fb.px, 0, (size_t)W * H * 4);
+			rtscene_render(sc, &fb, 0, 0.0, 1.0 / 30.0);
+			u32 left = fb.px[(H / 2) * W + 1];
+			CHECK((left >> 24) < 16, "left transparent at angle 0 (a=%u)",
+			      left >> 24);
+			memset(fb.px, 0, (size_t)W * H * 4);
+			rtscene_render(sc, &fb, 0, 1.0, 1.0 / 30.0);
+			u32 mid = fb.px[(H / 2) * W + 1];
+			CHECK((mid >> 24) > 150, "left near-opaque at angle 90 (a=%u)",
+			      mid >> 24);
+			/* t=2s: angle back at 0 â the left edge must go
+			 * transparent AGAIN. The old rebuild blended the new gradient
+			 * over the previous frame's RASTER, so the raster (and thus
+			 * the layer) never recovered. */
+			memset(fb.px, 0, (size_t)W * H * 4);
+			rtscene_render(sc, &fb, 0, 2.0, 1.0 / 30.0);
+			u32 back = fb.px[(H / 2) * W + 1];
+			CHECK((back >> 24) < 16, "left returns to transparent (a=%u)",
+			      back >> 24);
+			free(fb.px);
+			rtscene_free(sc);
+		}
+	}
+
 	/* 5. particles render */
 	{
 		const char *txt =

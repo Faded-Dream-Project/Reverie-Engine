@@ -32,11 +32,17 @@
  * packed u32 — identical to RFb contents. */
 typedef struct {
         const u32 *px;
-        u32 w, h;
-        int blend;         /* REV_BLEND_* */
-        f64 opacity;       /* 0..1 */
-        f64 blur;          /* gaussian sigma, px; 0 = none */
-        i32 dx, dy;        /* top-left placement into the target */
+        u32 w, h;              /* texture size                          */
+        u32 place_w, place_h;  /* placement size; 0 = same as w,h —
+                                  lets sub-frame-resolution sims (fluid
+                                  dye fields) stretch over the frame with
+                                  linear sampling instead of paying a
+                                  full-res CPU upscale every frame      */
+        int blend;             /* REV_BLEND_*                           */
+        f64 opacity;           /* 0..1                                  */
+        f64 blur;              /* gaussian sigma, px; 0 = none          */
+        i32 dx, dy;            /* top-left placement into the target    */
+        bool linear;           /* linear texture filtering              */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;

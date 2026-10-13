@@ -313,6 +313,61 @@ void rev_raster_fill(u32 *px, u32 w, u32 h, const RPoly *poly,
 	}
 }
 
+void rev_paint_fill_rect(u32 *px, u32 w, u32 h, const RPaint *p)
+{
+	if (!px || !w || !h || !p)
+		return;
+	if (p->kind == RPAINT_SOLID) {
+		u32 v = rev_pack_rgba(p->solid);
+		size_t n = (size_t)w * h;
+		for (size_t i = 0; i < n; i++)
+			px[i] = v;
+		return;
+	}
+	if (p->nstops <= 0)
+		return;
+
+	GradLut lut;
+	memset(&lut, 0, sizeof lut);
+	build_lut(p, &lut);
+
+	if (p->kind == RPAINT_LINEAR) {
+		f64 dx = p->lp1.x - p->lp0.x, dy = p->lp1.y - p->lp0.y;
+		f64 len2 = dx * dx + dy * dy;
+		if (len2 < 1e-18) {
+			/* degenerate axis — paint_t() maps everything to t=0 */
+			u32 c0 = lut.entries[0];
+			size_t n = (size_t)w * h;
+			for (size_t i = 0; i < n; i++)
+				px[i] = c0;
+			return;
+		}
+		f64 inv = 1.0 / len2;
+		for (u32 j = 0; j < h; j++) {
+			u32 *row = px + (size_t)j * w;
+			f64 vy = ((f64)j + 0.5 - p->lp0.y) * dy * inv;
+			for (u32 i = 0; i < w; i++) {
+				f64 t = ((f64)i + 0.5 - p->lp0.x) * dx * inv + vy;
+				t = apply_spread(t, p->spread);
+				row[i] = lut.entries[(int)(t * 255.0 + 0.5) & 0xff];
+			}
+		}
+		return;
+	}
+
+	/* radial: same focus math as paint_t() (scene radials are concentric,
+	 * which collapses it to |P-C|/r — but call the real thing so arbitrary
+	 * focuses stay correct). */
+	for (u32 j = 0; j < h; j++) {
+		u32 *row = px + (size_t)j * w;
+		for (u32 i = 0; i < w; i++) {
+			f64 t = apply_spread(paint_t(p, (f64)i + 0.5, (f64)j + 0.5),
+					     p->spread);
+			row[i] = lut.entries[(int)(t * 255.0 + 0.5) & 0xff];
+		}
+	}
+}
+
 /* --------------------------------------------------------------------------
  * stroker
  * ------------------------------------------------------------------------ */

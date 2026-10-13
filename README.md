@@ -145,8 +145,56 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number. The
 current dev cycle fixes the field-reported 0.1.6 GL failure on Wayland —
 `--renderer opengl` behind `REV_WAYLAND_GPU=1` died at window creation
-with `eglCreateWindowSurface failed (0x300b)` — and lands the
-frame-pacing and interaction overhaul the fix rode in on:
+with `eglCreateWindowSurface failed (0x300b)` — lands the frame-pacing
+and interaction overhaul the fix rode in on, and answers the second
+field report from that machine: the GL renderer was finally running on
+the NVIDIA card yet the scene crawled at ~4 fps with one CPU core
+pinned. That report was correct — the GPU composites, but the *scene*
+work behind it was pure CPU:
+
+* **The fluid layer paid a full-res CPU upscale + `exp()` tonemap every
+  frame.** `fluid_render` walked every output pixel (2M on 1080p) doing
+  three f64 bilinear samples plus an `exp()` and a division each —
+  ~150 ms/frame alone. Three changes: the soft-glow tonemap became a
+  2048-entry LUT (same curve, at most one 8-bit step of difference),
+  the bilinear loop got per-column coordinate/weight tables in f32, and
+  — in GPU compositing mode — the fluid layer is now emitted AT dye
+  resolution with `place_w/place_h` stretching it over the frame while
+  linear texture sampling does the upscale on the GPU. That is the same
+  upscale the CPU was doing (the dye field only exists at that
+  resolution); it just isn't charged to a CPU core anymore.
+* **The pressure solve promoted every cell to f64 and back.** The
+  Gauss-Seidel loop divided by `4.0` (a double literal) — 2 × 16
+  iterations over the velocity grid per step, in the hottest loop the
+  engine has. Multiplication by `0.25f` is bit-identical for powers of
+  two and stays in f32. Advection samples f64 bilinear per channel; the
+  channels now advect in one pass sharing the velocity sample, in f32.
+* **Animated gradients re-rasterized through the polygon scanline
+  machine every frame** — arena, path flatten, 4× supersampled sweep,
+  qsort per sub-row — ~30 ms/frame for what is a full-rect fill.
+  `rev_paint_fill_rect()` (raster.c) writes the gradient directly with
+  the same LUT, spread and geometry. This also fixed a real visual bug:
+  the rebuild used to *blend* over the previous frame's raster, so
+  transparent regions of an animated gradient froze at whatever had
+  been there and the sweep left a permanent smear. Gradients animated
+  only in opacity/blur/parallax no longer rebuild at all — those are
+  composite-time properties.
+* **`REV_PROFILE=1`** appends a stage breakdown to the periodic `perf:`
+  line — `sim=… raster=… render+present=…` ms per frame — so the next
+  "why is my wallpaper slow" report arrives with numbers attached.
+
+Net effect on the reporter's scene (`fluid-aurora.rev`, 1080p): every
+CPU-bound stage measured on the reference box dropped ~4-6×; the GPU
+tier's remaining CPU cost is the simulation itself (the engine is
+single-threaded by design — no pthreads). Truly idle-CPU wallpapers
+mean moving the sims to GPU compute, which is future work, not a bug
+fix. The X11 GL path, CPU tier, and Vulkan tiers all share the same
+scene pipeline and got the same wins; local verification: full build
+`-Werror -Wpedantic`, 7/7 suites (including two new regression tests:
+dye-res emission geometry, and the animated-gradient smear), e2e 4/4,
+e2e-wayland 3/3, ASan+UBSan clean with leak detection on.
+
+The GL fix itself, from the same cycle:
 
 * **The GL renderer handed the raw `wl_surface*` to EGL as a native
   window.** A wl_surface is *not* an `EGLNativeWindow`: on Wayland, EGL

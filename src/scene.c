@@ -118,6 +118,8 @@ struct RTScene {
         RArena *ir_arena;     /* borrowed: IR must outlive the scene */
         void *asset_ctx;
         RTAssetFn asset_fn;
+        /* stage timings accumulated by the current/last render pass (ms) */
+        f64 prof_sim_ms, prof_raster_ms;
 };
 
 /* --------------------------------------------------------------------------
@@ -599,18 +601,9 @@ static void eval_props(const RTLayer *L, f64 t, Eff *e)
 
 static void build_gradient_raster(RFb *fb, const RTLayer *L, Eff *e)
 {
-        RArena *ar = arena_create(4096);
-        RPath *p = rpath_new(ar);
-        rpath_move_to(p, (Vec2){ 0, 0 });
-        rpath_line_to(p, (Vec2){ (f64)fb->w, 0 });
-        rpath_line_to(p, (Vec2){ (f64)fb->w, (f64)fb->h });
-        rpath_line_to(p, (Vec2){ 0, (f64)fb->h });
-        rpath_close(p);
-        RPoly *poly = rpath_flatten(p, ar, 0.5);
-
         RPaint paint;
         memset(&paint, 0, sizeof paint);
-        RGradStop *stops = (RGradStop *)arena_alloc(ar, (size_t)L->ngstops * sizeof(RGradStop));
+        RGradStop stops[16];
         for (int i = 0; i < L->ngstops; i++) {
                 stops[i].off = L->goffs[i];
                 stops[i].c = L->gstops[i];
@@ -636,8 +629,11 @@ static void build_gradient_raster(RFb *fb, const RTLayer *L, Eff *e)
                 paint.rf = paint.rc;
                 paint.rr = L->gradius * (w > h ? w : h) * 0.5;
         }
-        rev_raster_fill(fb->px, fb->w, fb->h, poly, &paint, false, ar);
-        arena_destroy(ar);
+        /* full-rect direct fill: same LUT/spread/geometry as the scanline
+         * rasterizer (which this replaced) minus the polygon machinery —
+         * and it WRITES every pixel, so animated rebuilds no longer blend
+         * over the previous frame's raster through their transparent stops */
+        rev_paint_fill_rect(fb->px, fb->w, fb->h, &paint);
 }
 
 static void build_solid_raster(RFb *fb, RColor c)
@@ -814,6 +810,8 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                 mon = 0;
         if (dt <= 0) dt = 1.0 / sc->fps;
         if (dt > 0.1) dt = 0.1;
+        sc->prof_sim_ms = 0;
+        sc->prof_raster_ms = 0;
 
         f64 W = fb ? fb->w : fl->w, H = fb ? fb->h : fl->h;
         /* normalized pointer for this monitor (default center) */
@@ -854,6 +852,8 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
 
                 const RFb *srcfb = NULL;
                 f64 emit_blur = e.blur;    /* GPU mode: sigma passed through  */
+                bool emit_linear = false;  /* sub-frame-res sim: linear filter */
+                bool emit_stretch = false; /* sim texture stretches over frame */
 
                 if (L->type == LT_RIPPLE) {
                         if (fl) {
@@ -903,12 +903,28 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 fluid_configure(in->fluid, L->f_dye, L->f_dye2, e.force,
                                                 e.radius, L->f_dissip, L->f_ambient);
                                 fluid_pointer(in->fluid, px, py, pdx, pdy, pressed);
+                                f64 ms = rev_monotonic();
                                 fluid_step(in->fluid, dt);
+                                sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
                                 RFb *target;
+                                u32 tw = (u32)W, th = (u32)H;
                                 if (fl) {
-                                        if (!ensure_sim_fb(in, (u32)W, (u32)H))
+                                        /* GPU offload: render the dye at the
+                                         * resolution it actually exists at and
+                                         * stretch it over the frame with linear
+                                         * texture sampling — the old path did
+                                         * the SAME bilinear upscale per output
+                                         * pixel on the CPU (plus an exp()
+                                         * tonemap) every frame. */
+                                        u32 dw = 0, dh = 0;
+                                        fluid_dye_size(in->fluid, &dw, &dh);
+                                        tw = dw;
+                                        th = dh;
+                                        if (!ensure_sim_fb(in, dw, dh))
                                                 continue;
                                         target = &in->sim_fb;
+                                        emit_linear = true;
+                                        emit_stretch = (dw != (u32)W || dh != (u32)H);
                                 } else {
                                         if (!scratch.px || scratch.w != (u32)W || scratch.h != (u32)H) {
                                                 free(scratch.px);
@@ -919,7 +935,9 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         target = &scratch;
                                 }
                                 if (target->px) {
-                                        fluid_render(in->fluid, target->px, (u32)W, (u32)H);
+                                        ms = rev_monotonic();
+                                        fluid_render(in->fluid, target->px, tw, th);
+                                        sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
                                         srcfb = target;
                                 }
                         }
@@ -935,7 +953,9 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 if (clicks)
                                         particles_burst(in->parts, click_x, click_y,
                                                         (int)(clicks > 4 ? 4 : clicks) * 24);
+                                f64 ms = rev_monotonic();
                                 particles_step(in->parts, dt);
+                                sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
                                 RFb *target;
                                 if (fl) {
                                         if (!ensure_sim_fb(in, (u32)W, (u32)H))
@@ -967,6 +987,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 in->raster.h = rh;
                                 if (!in->raster.px)
                                         continue;
+                                f64 ms = rev_monotonic();
                                 if (L->type == LT_GRADIENT) {
                                         build_gradient_raster(&in->raster, L, &e);
                                 } else if (L->type == LT_SOLID) {
@@ -979,14 +1000,25 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         }
                                         build_image_raster(&in->raster, L, in);
                                 }
+                                sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
                                 in->raster_ok = true;
                                 in->blurred_ok = false;
                         }
 
-                        /* gradient angle is animatable -> rebuild when changed */
-                        if (L->type == LT_GRADIENT && L->nanims > 0) {
-                                /* cheap: rebuild every frame; gradients are fast */
-                                build_gradient_raster(&in->raster, L, &e);
+                        /* gradient angle is the ONLY raster-affecting animated
+                         * property (opacity/blur/parallax are applied at composite
+                         * time) — rebuild only when the angle actually animates,
+                         * and write it cleanly instead of blending over the
+                         * previous frame's raster */
+                        if (L->type == LT_GRADIENT) {
+                                bool angle_anim = false;
+                                for (int a = 0; a < L->nanims && !angle_anim; a++)
+                                        angle_anim = (L->anims[a].target == AT_ANGLE);
+                                if (angle_anim) {
+                                        f64 ms = rev_monotonic();
+                                        build_gradient_raster(&in->raster, L, &e);
+                                        sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
+                                }
                         }
 
                         if (e.blur >= 0.5 && !fl) {
@@ -1021,11 +1053,20 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         cmd->px = srcfb->px;
                         cmd->w = srcfb->w;
                         cmd->h = srcfb->h;
+                        cmd->place_w = 0;
+                        cmd->place_h = 0;
                         cmd->blend = L->blend;
                         cmd->opacity = e.opacity;
                         cmd->blur = (L->type == LT_IMAGE || L->type == LT_GRADIENT ||
                                      L->type == LT_SOLID) ? emit_blur : 0.0;
-                        if ((u32)srcfb->w == (u32)W && (u32)srcfb->h == (u32)H) {
+                        cmd->linear = emit_linear;
+                        if (emit_stretch) {
+                                /* sub-frame-res sim stretched over the whole frame */
+                                cmd->place_w = (u32)W;
+                                cmd->place_h = (u32)H;
+                                cmd->dx = 0;
+                                cmd->dy = 0;
+                        } else if ((u32)srcfb->w == (u32)W && (u32)srcfb->h == (u32)H) {
                                 cmd->dx = 0;
                                 cmd->dy = 0;
                         } else {
@@ -1052,6 +1093,19 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
 void rtscene_render(RTScene *sc, RFb *fb, int mon, f64 t, f64 dt)
 {
         render_core(sc, fb, NULL, mon, t, dt);
+}
+
+void rtscene_profile(RTScene *sc, f64 *sim_ms, f64 *raster_ms)
+{
+        if (sim_ms)
+                *sim_ms = sc ? sc->prof_sim_ms : 0.0;
+        if (raster_ms)
+                *raster_ms = sc ? sc->prof_raster_ms : 0.0;
+        if (sc) {
+                /* reading resets — counters accumulate per render pass */
+                sc->prof_sim_ms = 0;
+                sc->prof_raster_ms = 0;
+        }
 }
 
 void rtscene_render_layers(RTScene *sc, RTFrameList *fl, int mon, f64 t, f64 dt)

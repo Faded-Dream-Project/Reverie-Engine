@@ -39,10 +39,8 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
 
 	if (want_vk) {
 		r = render_vk_create();
-		if (r && try_init(r, p, why, sizeof why)) {
-			LOGI("renderer: %s (tier %d)", r->name, r->tier);
-			return r;
-		}
+		if (r && try_init(r, p, why, sizeof why))
+			return r;    /* caller logs name/tier/compositing */
 		renderer_destroy(r);
 		r = NULL;
 		LOGI("renderer: vulkan unavailable (%s)", why);
@@ -50,10 +48,8 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
 
 	if (want_gl) {
 		r = render_gl_create();
-		if (r && try_init(r, p, why, sizeof why)) {
-			LOGI("renderer: %s (tier %d)", r->name, r->tier);
+		if (r && try_init(r, p, why, sizeof why))
 			return r;
-		}
 		renderer_destroy(r);
 		r = NULL;
 		LOGI("renderer: opengl unavailable (%s)", why);

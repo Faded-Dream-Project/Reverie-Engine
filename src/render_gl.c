@@ -811,10 +811,15 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
         if (!cmd || !cmd->px || !cmd->w || !cmd->h)
                 return false;
 
-        /* 1. upload (straight RGBA) */
-        if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cmd->w, cmd->h, false))
+        /* 1. upload (straight RGBA). Sub-frame-resolution sims come in small
+         *    and let LINEAR sampling do the upscale during placement. */
+        if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cmd->w, cmd->h, cmd->linear))
                 return false;
         g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
+        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                           cmd->linear ? GL_LINEAR : GL_NEAREST);
+        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                           cmd->linear ? GL_LINEAR : GL_NEAREST);
         g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cmd->w, (int)cmd->h,
                            GL_RGBA, GL_UNSIGNED_BYTE, cmd->px);
 
@@ -902,7 +907,11 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
                 layer_tex = r->tex_d;
         }
 
-        /* 4. composite: read accum[cur], write accum[cur^1], flip */
+        /* 4. composite: read accum[cur], write accum[cur^1], flip.
+         * Placement may exceed the texture (sub-frame-res sims stretched
+         * over the frame) — the linear filter upsamples while compositing. */
+        u32 pw = cmd->place_w ? cmd->place_w : cmd->w;
+        u32 ph = cmd->place_h ? cmd->place_h : cmd->h;
         int wi = r->cur_win;
         RTarget *accum_rd = &r->accum[wi][r->accum_cur[wi]];
         RTarget *accum_wr = &r->accum[wi][r->accum_cur[wi] ^ 1];
@@ -920,8 +929,8 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
                                (float)((double)cmd->dy / (double)accum_wr->h));
         if (r->u[PROG_COMPOSITE].scale >= 0)
                 g->glUniform2f(r->u[PROG_COMPOSITE].scale,
-                               (float)((double)cmd->w / (double)accum_wr->w),
-                               (float)((double)cmd->h / (double)accum_wr->h));
+                               (float)((double)pw / (double)accum_wr->w),
+                               (float)((double)ph / (double)accum_wr->h));
         if (r->u[PROG_COMPOSITE].blend >= 0)
                 g->glUniform1i(r->u[PROG_COMPOSITE].blend, cmd->blend);
         if (r->u[PROG_COMPOSITE].opacity >= 0)

@@ -59,6 +59,15 @@ typedef struct {
 void rev_raster_fill(u32 *px, u32 w, u32 h, const RPoly *poly,
                      const RPaint *paint, bool evenodd, RArena *scratch);
 
+/* Fill a whole w x h rectangle with a paint, directly. Same LUT, spread
+ * and gradient geometry as rev_raster_fill — identical to rasterizing a
+ * full-canvas rectangle into a ZEROED buffer — but without the scanline
+ * machinery, and every pixel is WRITTEN, never blended over prior buffer
+ * contents (animated gradients rebuilt in place must not smear the
+ * previous frame through their transparent stops). This is the hot path
+ * for scene gradient layers; rev_raster_fill stays the path for shapes. */
+void rev_paint_fill_rect(u32 *px, u32 w, u32 h, const RPaint *p);
+
 /* Stroke polygon contours with the given stroke style. */
 void rev_raster_stroke(u32 *px, u32 w, u32 h, const RPoly *poly,
                        const RStroke *st, RArena *scratch);

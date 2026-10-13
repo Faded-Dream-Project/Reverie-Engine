@@ -29,4 +29,7 @@ void fluid_step(RevFluid *f, f64 dt);
 /* Renders dye into px (w x h from construction), straight alpha. */
 void fluid_render(const RevFluid *f, u32 *px, u32 w, u32 h);
 
+/* Dye grid size — the resolution the dye field actually exists at. */
+void fluid_dye_size(const RevFluid *f, u32 *w, u32 *h);
+
 #endif /* REV_FLUID_H */
