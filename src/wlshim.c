@@ -8,7 +8,11 @@
  * connection (dlopen("libwayland-client.so.0"), never linked) and exposes
  * the resulting handles to the renderers. The wire opcodes and the zwlr
  * layer-shell interface metadata below are hand-written; core-protocol
- * calls use the library's own exported symbols.
+ * requests are marshalled through the library's EXPORTED wl_proxy_marshal*
+ * entry points with its exported wl_*_interface data symbols — the inline
+ * wrappers (wl_compositor_create_surface, wl_surface_commit,
+ * wl_seat_get_pointer, ...) exist only in wayland-client-protocol.h and
+ * are NOT dlsym-able symbols of the shared object.
  *
  * When the shim is off (default), Wayland runs the fully hand-written raw
  * client (wayland.c) with the CPU compositor — zero libwayland involved.
@@ -36,7 +40,13 @@ typedef struct wl_output wl_output_;
 typedef struct wl_surface wl_surface_;
 typedef int wl_fixed_t_;
 
+/* wl_message ABI (wayland-util.h) — THREE fields, name FIRST.  A two-field
+ * declaration shifts every metadata table: the signature string lands in the
+ * name slot, the signature slot reads NULL, and types reads out of bounds —
+ * marshalling through such tables segfaults or silently sends nothing
+ * (verified against libwayland 1.23.1 with a byte-logging probe). */
 struct wl_message_ {
+        const char *name;
         const char *signature;
         const void *const *types;
 };
@@ -54,12 +64,16 @@ struct wl_interface_ {
 extern const struct wl_interface_ *zwlr_layer_shell_v1_iface;
 extern const struct wl_interface_ *zwlr_layer_surface_v1_iface;
 
+/* types for "no?ous": [0]=new_id iface, [1]=surface, [2]=output —
+ * interface data symbols dlsym'd from libwayland at init */
+static const void *get_layer_surface_types[4];
+
 static const struct wl_message_ layer_shell_methods[] = {
         /* request opcodes are the array indices (wlr-layer-shell-unstable-v1):
          *   0 get_layer_surface(new_id, surface, output, layer, namespace)
          *   1 destroy (since v3) */
-        { "n?oous", NULL },                               /* get_layer_surface (op 0) */
-        { "", NULL },                                    /* destroy           (op 1) */
+        { "get_layer_surface", "no?ous", get_layer_surface_types },
+        { "destroy",           "",       NULL                     },
 };
 static const struct wl_message_ layer_surface_methods[] = {
         /* request opcode order per protocol:
@@ -69,18 +83,18 @@ static const struct wl_message_ layer_surface_methods[] = {
          *   6 destroy                    7 set_layer (since v2)
          * There is NO set_size request — the compositor sizes all-edges
          * anchored surfaces and reports the result via configure(). */
-        { "u", NULL },                                   /* set_anchor              (0) */
-        { "i", NULL },                                   /* set_exclusive_zone      (1) */
-        { "iiii", NULL },                                /* set_margin              (2) */
-        { "u", NULL },                                   /* set_keyboard_interactivity (3) */
-        { "n?o", NULL },                                 /* get_popup               (4) */
-        { "u", NULL },                                   /* ack_configure           (5) */
-        { "", NULL },                                    /* destroy                 (6) */
-        { "", NULL },                                    /* set_layer               (7) */
+        { "set_anchor",                 "u",    NULL },
+        { "set_exclusive_zone",         "i",    NULL },
+        { "set_margin",                 "iiii", NULL },
+        { "set_keyboard_interactivity", "u",    NULL },
+        { "get_popup",                  "n?o",  NULL },
+        { "ack_configure",              "u",    NULL },
+        { "destroy",                    "",     NULL },
+        { "set_layer",                  "u",    NULL },
 };
 static const struct wl_message_ layer_surface_events[] = {
-        { "uuu", NULL },                                 /* configure(serial,w,h)  */
-        { "", NULL },                                    /* closed                  */
+        { "configure", "uuu", NULL },
+        { "closed",    "",    NULL },
 };
 
 static const struct wl_interface_ zwlr_layer_shell_v1_i = {
@@ -91,10 +105,6 @@ static const struct wl_interface_ zwlr_layer_surface_v1_i = {
 };
 const struct wl_interface_ *zwlr_layer_shell_v1_iface = &zwlr_layer_shell_v1_i;
 const struct wl_interface_ *zwlr_layer_surface_v1_iface = &zwlr_layer_surface_v1_i;
-
-/* types arrays referenced by "n?oous" signatures — filled at runtime with
- * dlsym'd libwayland interface symbols */
-static const void *get_layer_surface_types[4];
 
 /* ---- shim state ----------------------------------------------------------- */
 typedef struct {
@@ -129,6 +139,7 @@ static struct {
         wl_proxy_ *seat;
         wl_proxy_ *pointer;
         wl_proxy_ *layer_shell;
+        u32 shell_version;   /* version the shell was bound at (caps layer_surface v) */
         const struct wl_interface_ *wl_surface_iface;
         const struct wl_interface_ *wl_output_iface;
 
@@ -145,7 +156,10 @@ static struct {
         u32 seat_caps;
         bool close_requested;
 
-        /* libwayland symbols */
+        /* libwayland symbols (EXPORTED functions only — the generated inline
+         * wrappers like wl_display_get_registry / wl_registry_bind /
+         * wl_compositor_create_surface exist only in the protocol headers
+         * and are NOT symbols of the shared object) */
         wl_display_ *(*connect)(const char *);
         void (*disconnect)(wl_display_ *);
         int (*dispatch)(wl_display_ *);
@@ -153,17 +167,38 @@ static struct {
         int (*roundtrip)(wl_display_ *);
         int (*flush)(wl_display_ *);
         int (*get_fd)(wl_display_ *);
-        wl_registry_ *(*get_registry)(wl_display_ *);
-        int (*registry_add_listener)(wl_registry_ *, void (**)(void), void *);
-        void *(*registry_bind)(wl_registry_ *, u32, const void *, u32);
         int (*proxy_add_listener)(wl_proxy_ *, void (**)(void), void *);
         void (*proxy_marshal)(wl_proxy_ *, u32, ...);
         wl_proxy_ *(*proxy_marshal_flags)(wl_proxy_ *, u32, const struct wl_interface_ *,
                                           u32, u32, ...);
+        wl_proxy_ *(*proxy_marshal_constructor)(wl_proxy_ *, u32, const struct wl_interface_ *, ...);
         void (*proxy_destroy)(wl_proxy_ *);
-        wl_surface_ *(*compositor_create_surface)(wl_compositor_ *);
-        void (*surface_commit)(wl_surface_ *);
+        const struct wl_interface_ *wl_pointer_iface;
+        const struct wl_interface_ *wl_registry_iface;
 } S;
+
+/* core-protocol request opcodes the inline wrappers would have sent:
+ *   wl_display.get_registry        = 1
+ *   wl_registry.bind               = 0
+ *   wl_compositor.create_surface   = 0
+ *   wl_seat.get_pointer            = 0
+ *   wl_surface.commit              = 6                                    */
+#define WL_DISPLAY_GET_REGISTRY      1
+#define WL_REGISTRY_BIND             0
+#define WL_COMPOSITOR_CREATE_SURFACE 0
+#define WL_SEAT_GET_POINTER          0
+#define WL_SURFACE_COMMIT            6
+
+/* wl_registry.bind — opcode 0, marshalled exactly like the generated inline
+ * wrapper does: proxy_marshal_flags(registry, 0, iface, version, 0,
+ *                                   name, iface->name, version, NULL)
+ * (the trailing NULL feeds the new_id vararg slot) */
+static wl_proxy_ *bind_global(u32 name, const struct wl_interface_ *iface, u32 version)
+{
+        return S.proxy_marshal_flags((wl_proxy_ *)S.registry, WL_REGISTRY_BIND,
+                                     iface, version, 0,
+                                     name, iface->name, version, NULL);
+}
 
 /* ---- listeners ------------------------------------------------------------ */
 
@@ -200,7 +235,36 @@ static void on_seat_caps(void *data, wl_proxy_ *seat, u32 caps)
         S.seat_caps = caps;
 }
 
+/* wl_seat.name (v2+) — informational; must exist or libwayland ABORTS the
+ * process on a NULL listener slot when the event arrives. */
+static void on_seat_name(void *data, wl_proxy_ *seat, const char *name)
+{
+        (void)data; (void)seat; (void)name;
+}
+
 /* seat capabilities + pointer events + output events + layer surface events */
+
+static void on_ptr_leave(void *data, wl_proxy_ *ptr, u32 serial, wl_proxy_ *surface)
+{
+        (void)data; (void)ptr; (void)serial;
+        for (int i = 0; i < S.nwins; i++)
+                if (S.wins[i].surface == surface) {
+                        S.ptr_win = -1;
+                        return;
+                }
+}
+
+/* wl_pointer frame/axis family (v5+) — not used by the engine, but every
+ * listener slot must be non-NULL or libwayland aborts on arrival. */
+static void on_ptr_noop(void *data, wl_proxy_ *ptr)
+{
+        (void)data; (void)ptr;
+}
+
+static void on_ptr_noop_u32(void *data, wl_proxy_ *ptr, u32 a, u32 b, u32 c)
+{
+        (void)data; (void)ptr; (void)a; (void)b; (void)c;
+}
 
 static void on_ptr_enter(void *data, wl_proxy_ *ptr, u32 serial, wl_proxy_ *surface,
                          wl_fixed_t_ sx, wl_fixed_t_ sy)
@@ -280,6 +344,13 @@ static void on_output_scale(void *data, wl_proxy_ *out, i32 factor)
                 }
 }
 
+/* wl_output.done — real compositors send it after the mode/scale burst; a
+ * NULL slot here makes libwayland abort the whole process. */
+static void on_output_done(void *data, wl_proxy_ *out)
+{
+        (void)data; (void)out;
+}
+
 static void on_layer_configure(void *data, wl_proxy_ *ls, u32 serial, u32 w, u32 h)
 {
         (void)data;
@@ -315,10 +386,15 @@ bool wlshim_active(void)
                 const char *env = getenv("REV_WAYLAND_GPU");
                 if (!env || strcmp(env, "1") != 0)
                         return false;
-                S.lib = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
+                /* REV_WL_LIB: explicit .so path (tests pin a known library);
+                 * default resolves the system libwayland-client. */
+                const char *lib = getenv("REV_WL_LIB");
+                if (!lib || !*lib)
+                        lib = "libwayland-client.so.0";
+                S.lib = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
                 if (!S.lib) {
-                        LOGI("wlshim: libwayland-client.so.0 unavailable (%s) — staying on the raw client",
-                             dlerror());
+                        LOGI("wlshim: %s unavailable (%s) — staying on the raw client",
+                             lib, dlerror());
                         return false;
                 }
                 S.active = true;
@@ -344,18 +420,14 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
         SYM(roundtrip, "wl_display_roundtrip");
         SYM(flush, "wl_display_flush");
         SYM(get_fd, "wl_display_get_fd");
-        SYM(get_registry, "wl_display_get_registry");
-        SYM(registry_add_listener, "wl_registry_add_listener");
-        SYM(registry_bind, "wl_registry_bind");
         SYM(proxy_add_listener, "wl_proxy_add_listener");
         SYM(proxy_marshal, "wl_proxy_marshal");
         SYM(proxy_marshal_flags, "wl_proxy_marshal_flags");
+        SYM(proxy_marshal_constructor, "wl_proxy_marshal_constructor");
         SYM(proxy_destroy, "wl_proxy_destroy");
-        SYM(compositor_create_surface, "wl_compositor_create_surface");
-        SYM(surface_commit, "wl_surface_commit");
 #undef SYM
-        if (!S.connect || !S.get_registry || !S.registry_add_listener || !S.registry_bind ||
-            !S.proxy_add_listener || !S.proxy_marshal_flags || !S.compositor_create_surface) {
+        if (!S.connect || !S.proxy_add_listener || !S.proxy_marshal_flags ||
+            !S.proxy_marshal_constructor || !S.proxy_marshal || !S.roundtrip) {
                 snprintf(err, errcap, "wlshim: missing libwayland symbols");
                 return false;
         }
@@ -365,7 +437,25 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
                 snprintf(err, errcap, "wlshim: wl_display_connect failed");
                 return false;
         }
-        S.registry = S.get_registry(S.display);
+
+        /* surface/output/pointer/registry interfaces (EXPORTED data symbols) —
+         * the request marshalling below and the types table need them */
+        *(void **)&S.wl_surface_iface = dlsym(S.lib, "wl_surface_interface");
+        *(void **)&S.wl_output_iface = dlsym(S.lib, "wl_output_interface");
+        *(void **)&S.wl_pointer_iface = dlsym(S.lib, "wl_pointer_interface");
+        *(void **)&S.wl_registry_iface = dlsym(S.lib, "wl_registry_interface");
+        if (!S.wl_surface_iface || !S.wl_output_iface || !S.wl_pointer_iface ||
+            !S.wl_registry_iface) {
+                snprintf(err, errcap, "wlshim: interface data symbols missing");
+                return false;
+        }
+
+        /* wl_display.get_registry — opcode 1, inline-only wrapper in the
+         * headers, marshalled here exactly like the generated binding does
+         * (the display singleton is protocol version 1; trailing NULL feeds
+         * the new_id vararg slot) */
+        S.registry = (wl_registry_ *)S.proxy_marshal_flags((wl_proxy_ *)S.display, WL_DISPLAY_GET_REGISTRY,
+                                                          S.wl_registry_iface, 1, 0, NULL);
         if (!S.registry) {
                 snprintf(err, errcap, "wlshim: get_registry failed");
                 return false;
@@ -375,48 +465,44 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
                 (void (*)(void))on_global,
                 (void (*)(void))on_global_remove,
         };
-        S.registry_add_listener(S.registry, (void (**)(void))registry_listener, NULL);
+        S.proxy_add_listener((wl_proxy_ *)S.registry, (void (**)(void))registry_listener, NULL);
 
-        /* surface/output interfaces (data symbols) for the metadata tables */
-        *(void **)&S.wl_surface_iface = dlsym(S.lib, "wl_surface_interface");
-        *(void **)&S.wl_output_iface = dlsym(S.lib, "wl_output_interface");
-        if (!S.wl_surface_iface || !S.wl_output_iface) {
-                snprintf(err, errcap, "wlshim: interface data symbols missing");
-                return false;
-        }
         get_layer_surface_types[0] = zwlr_layer_surface_v1_iface;
         get_layer_surface_types[1] = S.wl_surface_iface;
         get_layer_surface_types[2] = S.wl_output_iface;
         get_layer_surface_types[3] = NULL;
-        ((struct wl_message_ *)&layer_shell_methods[1])->types = get_layer_surface_types;
 
         S.roundtrip(S.display);
 
-        /* bind the globals we need */
+        /* bind the globals we need (via bind_global: wl_registry.bind
+         * opcode 0, mirroring the generated inline binding) */
         int have_shell = 0, have_comp = 0;
         for (int i = 0; i < S.nglobals; i++) {
                 ShimGlobal *g = &S.globals[i];
                 if (strcmp(g->iface, "wl_compositor") == 0) {
-                        S.compositor = S.registry_bind(S.registry, g->name,
-                                                       dlsym(S.lib, "wl_compositor_interface"),
-                                                       g->version < 4 ? g->version : 4);
+                        const struct wl_interface_ *ci =
+                                (const struct wl_interface_ *)dlsym(S.lib, "wl_compositor_interface");
+                        S.compositor = ci ? (wl_compositor_ *)bind_global(g->name, ci, g->version < 4 ? g->version : 4)
+                                          : NULL;
                         have_comp = S.compositor != NULL;
                 } else if (strcmp(g->iface, "zwlr_layer_shell_v1") == 0) {
-                        S.layer_shell = S.registry_bind(S.registry, g->name, zwlr_layer_shell_v1_iface,
-                                                        g->version > 4 ? 4 : g->version);
+                        u32 v = g->version > 4 ? 4 : g->version;
+                        S.layer_shell = bind_global(g->name, zwlr_layer_shell_v1_iface, v);
+                        if (S.layer_shell)
+                                S.shell_version = v;
                         have_shell = S.layer_shell != NULL;
                 } else if (strcmp(g->iface, "wl_seat") == 0) {
-                        S.seat = S.registry_bind(S.registry, g->name, dlsym(S.lib, "wl_seat_interface"),
-                                                 g->version < 5 ? g->version : 5);
+                        const struct wl_interface_ *si =
+                                (const struct wl_interface_ *)dlsym(S.lib, "wl_seat_interface");
+                        S.seat = si ? bind_global(g->name, si, g->version < 5 ? g->version : 5) : NULL;
                 } else if (strcmp(g->iface, "wl_output") == 0 && S.noutputs < 8) {
-                        wl_output_ *out = S.registry_bind(S.registry, g->name,
-                                                          dlsym(S.lib, "wl_output_interface"),
-                                                          g->version < 4 ? g->version : 4);
+                        wl_output_ *out = (wl_output_ *)bind_global(g->name, S.wl_output_iface,
+                                                                  g->version < 4 ? g->version : 4);
                         if (out) {
                                 static void (*const output_listener[])(void) = {
                                         (void (*)(void))on_output_geometry,
                                         (void (*)(void))on_output_mode,
-                                        NULL,    /* done  */
+                                        (void (*)(void))on_output_done,
                                         (void (*)(void))on_output_scale,
                                 };
                                 S.proxy_add_listener((wl_proxy_ *)out, (void (**)(void))output_listener, NULL);
@@ -432,33 +518,38 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
                 return false;
         }
 
-        /* seat capabilities listener */
+        /* seat capabilities listener (name event gets a no-op: NULL slots
+         * make libwayland abort when the event arrives) */
         if (S.seat) {
                 static void (*const seat_listener[])(void) = {
                         (void (*)(void))on_seat_caps,
-                        NULL,
+                        (void (*)(void))on_seat_name,
                 };
                 S.proxy_add_listener(S.seat, (void (**)(void))seat_listener, NULL);
         }
 
         S.roundtrip(S.display);
 
-        /* pointer: wl_seat_get_pointer (exported symbol) */
+        /* pointer: wl_seat.get_pointer — an inline-only wrapper in the
+         * protocol headers, so marshal opcode 0 ourselves via the exported
+         * constructor (new_id consumes the trailing NULL vararg). */
         if (S.seat) {
-                wl_pointer_ *(*get_pointer)(wl_proxy_ *) = NULL;
-                *(void **)(&get_pointer) = dlsym(S.lib, "wl_seat_get_pointer");
-                if (get_pointer) {
-                        S.pointer = (wl_proxy_ *)get_pointer((wl_proxy_ *)S.seat);
-                        if (S.pointer) {
-                                static void (*const pointer_listener[])(void) = {
-                                        (void (*)(void))on_ptr_enter,
-                                        NULL,             /* leave    */
-                                        (void (*)(void))on_ptr_motion,
-                                        (void (*)(void))on_ptr_button,
-                                        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                                };
-                                S.proxy_add_listener(S.pointer, (void (**)(void))pointer_listener, NULL);
-                        }
+                S.pointer = S.proxy_marshal_constructor(S.seat, WL_SEAT_GET_POINTER,
+                                                        S.wl_pointer_iface, NULL);
+                if (S.pointer) {
+                        static void (*const pointer_listener[])(void) = {
+                                (void (*)(void))on_ptr_enter,
+                                (void (*)(void))on_ptr_leave,
+                                (void (*)(void))on_ptr_motion,
+                                (void (*)(void))on_ptr_button,
+                                (void (*)(void))on_ptr_noop_u32,    /* axis          */
+                                (void (*)(void))on_ptr_noop,        /* frame    (v5) */
+                                (void (*)(void))on_ptr_noop,        /* axis_source */
+                                (void (*)(void))on_ptr_noop_u32,    /* axis_stop    */
+                                (void (*)(void))on_ptr_noop_u32,    /* axis_discrete*/
+                                (void (*)(void))on_ptr_noop_u32,    /* axis_value120*/
+                        };
+                        S.proxy_add_listener(S.pointer, (void (**)(void))pointer_listener, NULL);
                 }
         }
 
@@ -470,6 +561,43 @@ void wlshim_platform_fini(RPlatform *p)
 {
         (void)p;
         if (S.display) {
+                /* libwayland frees proxies ONLY on explicit wl_proxy_destroy
+                 * (wl_display_disconnect releases the id maps, not the proxy
+                 * structs) — destroy everything we created, children first,
+                 * or every engine cycle leaks them (ASan-visible). */
+                if (S.proxy_destroy) {
+                        for (int i = 0; i < S.nwins; i++) {
+                                if (S.wins[i].layer_surface)
+                                        S.proxy_destroy(S.wins[i].layer_surface);
+                                if (S.wins[i].surface)
+                                        S.proxy_destroy(S.wins[i].surface);
+                                S.wins[i].layer_surface = NULL;
+                                S.wins[i].surface = NULL;
+                        }
+                        if (S.pointer) {
+                                S.proxy_destroy(S.pointer);
+                                S.pointer = NULL;
+                        }
+                        if (S.seat) {
+                                S.proxy_destroy(S.seat);
+                                S.seat = NULL;
+                        }
+                        for (int i = 0; i < S.noutputs; i++)
+                                if (S.outputs[i].output)
+                                        S.proxy_destroy(S.outputs[i].output);
+                        if (S.layer_shell) {
+                                S.proxy_destroy(S.layer_shell);
+                                S.layer_shell = NULL;
+                        }
+                        if (S.compositor) {
+                                S.proxy_destroy((wl_proxy_ *)S.compositor);
+                                S.compositor = NULL;
+                        }
+                        if (S.registry) {
+                                S.proxy_destroy((wl_proxy_ *)S.registry);
+                                S.registry = NULL;
+                        }
+                }
                 S.disconnect(S.display);
                 S.display = NULL;
         }
@@ -520,15 +648,27 @@ int wlshim_add_window(RRect geom)
         win->out = mon;
         S.outputs[mon].win = wi;
 
-        win->surface = (wl_proxy_ *)S.compositor_create_surface(S.compositor);
+        /* wl_compositor.create_surface — inline-only wrapper in the headers;
+         * marshal opcode 0 via the exported constructor (NULL = new_id slot). */
+        win->surface = S.proxy_marshal_constructor((wl_proxy_ *)S.compositor,
+                                                   WL_COMPOSITOR_CREATE_SURFACE,
+                                                   S.wl_surface_iface, NULL);
         if (!win->surface)
                 return -1;
 
-        /* zwlr_layer_shell_v1.get_layer_surface — opcode 0, signature "n?oous":
-         *   (new_id, surface, output, layer=BACKGROUND(0), namespace) */
+        /* zwlr_layer_shell_v1.get_layer_surface — opcode 0, signature "no?ous":
+         *   (new_id, surface, output, layer=BACKGROUND(0), namespace)
+         * wl_proxy_marshal_flags ABI (verified against libwayland 1.23 and the
+         * generated wlr-layer-shell bindings):
+         *   (proxy, opcode, new_iface, VERSION, FLAGS, ...args incl. new_id slot)
+         * - the new_id slot CONSUMES a vararg — pass NULL as its placeholder;
+         *   omitting it shifts every later argument by one (garbage on the wire)
+         * - flags: 0 (WL_MARSHAL_FLAG_DESTROY=1 would destroy the shell proxy)
+         * - version: the shell's bound version becomes the new proxy's version */
         wl_proxy_ *out_proxy = S.outputs[mon].output;
         win->layer_surface = S.proxy_marshal_flags(S.layer_shell, 0, zwlr_layer_surface_v1_iface,
-                                                   0, 1, win->surface, out_proxy, 0, "reverie");
+                                                   S.shell_version, 0,
+                                                   NULL, win->surface, out_proxy, 0, "reverie");
         if (!win->layer_surface)
                 return -1;
 
@@ -546,15 +686,29 @@ int wlshim_add_window(RRect geom)
         S.proxy_marshal(win->layer_surface, 1, (i32)-1);
         S.proxy_marshal(win->layer_surface, 3, 0u);
         i32 s = S.outputs[mon].scale < 1 ? 1 : S.outputs[mon].scale;
-        S.surface_commit((wl_surface_ *)win->surface);
+        /* wl_surface.commit (opcode 6) — inline-only wrapper, marshalled directly */
+        S.proxy_marshal(win->surface, WL_SURFACE_COMMIT);
         S.flush(S.display);
+
+        /* REGISTER the window BEFORE waiting: the configure (and any pointer)
+         * events dispatched below must find this win in S.wins[] — listeners
+         * search by proxy pointer, and S.nwins is the search bound. Registering
+         * only after the wait (the old bug) made every configure event MISS,
+         * so the dispatch loop blocked forever on the first follow-up read —
+         * the daemon stayed alive with a black desktop. */
+        S.nwins++;
 
         /* wait for configure */
         for (int spin = 0; spin < 100 && !win->configured; spin++) {
-                S.dispatch(S.display);
+                if (S.dispatch(S.display) < 0)
+                        break;           /* connection error: stop waiting */
         }
         if (!win->configured) {
                 LOGW("wlshim: layer surface did not configure");
+                S.nwins--;               /* retire the failed slot */
+                S.outputs[mon].win = -1;
+                win->surface = NULL;
+                win->layer_surface = NULL;
                 return -1;
         }
         S.proxy_marshal(win->layer_surface, 5, win->cfg_serial);    /* ack_configure */
@@ -562,7 +716,6 @@ int wlshim_add_window(RRect geom)
 
         win->lw = (u32)(S.outputs[mon].pw / s);
         win->lh = (u32)(S.outputs[mon].ph / s);
-        S.nwins++;
         return wi;
 }
 

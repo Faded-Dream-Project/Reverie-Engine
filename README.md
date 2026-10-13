@@ -139,7 +139,47 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.3 (pre-release)
+## Status — 0.1.4 (pre-release)
+
+0.1.4 makes the GPU-on-Wayland path (`REV_WAYLAND_GPU=1`, the libwayland WSI
+shim for EGL/Vulkan) actually work — it had been dead on arrival since 0.1.0,
+silently falling back to the raw client, because five independent bug
+families only surface when a *real* libwayland marshals our hand-written
+interface metadata:
+
+* **`wl_message` was declared with two fields instead of three** (`name`
+  first, then `signature`, then `types`) — every metadata table was shifted
+  a slot; libwayland read the signature as the name and dereferenced past
+  the struct for the types array.
+* **`wl_proxy_marshal_flags` was called wrong** — without the `NULL`
+  placeholder the new_id vararg slot consumes (every later argument shifted),
+  with flags=1 (`WL_MARSHAL_FLAG_DESTROY` — destroys the shell proxy) instead
+  of 0, and with version 0 instead of the shell's bound version.
+* **Inline-only wrapper functions were dlsym'd as if they were symbols of
+  the shared object** — `wl_display_get_registry`, `wl_registry_bind`,
+  `wl_registry_add_listener`, `wl_compositor_create_surface`,
+  `wl_surface_commit`, and `wl_seat_get_pointer` exist only inside
+  `wayland-client-protocol.h`; dlsym returns NULL for all of them, so shim
+  init failed at the symbol gate and *always* fell back. These calls are now
+  marshalled directly via the exported `wl_proxy_marshal_flags` /
+  `wl_proxy_marshal_constructor` with the library's exported
+  `wl_*_interface` data symbols.
+* **NULL listener slots aborted the process** — real compositors routinely
+  send `wl_output.done`, `wl_seat.name`, and `wl_pointer.leave`/axis events;
+  a NULL slot in the listener array makes libwayland call abort() when the
+  event arrives. All slots are now populated (no-ops where unused).
+* **The layer surface was registered only *after* waiting for configure** —
+  `on_layer_configure` searches `S.wins[]` bounded by `S.nwins`, which was
+  incremented at the end of `wlshim_add_window`, so every configure event
+  missed its window, and the dispatch loop then blocked forever on the next
+  read: daemon alive, desktop black.
+
+The new `tests/test_wlshim.c` is the regression net: it drives the shim
+end-to-end against a strict fake compositor with a genuine libwayland-client
+doing the marshalling (handshakes, binds through our hand-written metadata,
+`get_layer_surface` on the wire with layer/background/namespace pinned,
+configure/ack, pointer events, closed, zero validator violations, ASan+UBSan
+clean). It would have caught every one of the five families.
 
 0.1.3 fixes a field-reported 0.1.2 bug — the Wayland wallpaper went black on
 real layer-shell compositors (KWin):

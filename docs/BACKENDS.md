@@ -98,10 +98,41 @@ and logged as such.)
 | `REV_BACKEND`       | same as `--backend`                                 |
 | `REV_VK_PRESENT`    | `wsi` = vulkan tier presents via its swapchain (default: platform SHM path) |
 | `REV_WAYLAND_GPU`   | `1` = activate the experimental Wayland WSI shim    |
+| `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 
 ## Troubleshooting
 
+* **"wlshim: missing libwayland symbols" / shim never activates (0.1.4
+  postmortem)** — the GPU-on-Wayland path (`REV_WAYLAND_GPU=1`) was dead on
+  arrival from 0.1.0 through 0.1.3: init failed at the symbol gate and the
+  platform silently fell back to the raw client, so nobody noticed. Five bug
+  families, all invisible until a *real* libwayland actually marshals the
+  shim's hand-written metadata:
+  (1) `wl_message` declared two-field instead of three-field (`name`
+  first) — every metadata table shifted by a slot;
+  (2) `wl_proxy_marshal_flags` called without the NULL placeholder the
+  new_id vararg consumes, with flags=1 (DESTROY!) instead of 0, and
+  version 0 instead of the shell's bound version;
+  (3) dlsym of inline-only protocol wrappers (`wl_display_get_registry`,
+  `wl_registry_bind`, `wl_compositor_create_surface`, `wl_surface_commit`,
+  `wl_seat_get_pointer`, ...) which are NOT symbols of the shared object —
+  dlsym returns NULL for every one; all such calls are now marshalled
+  directly via the exported `wl_proxy_marshal_flags` /
+  `wl_proxy_marshal_constructor` entry points with the exported
+  `wl_*_interface` data symbols;
+  (4) NULL listener slots (`wl_output.done`, `wl_seat.name`,
+  `wl_pointer.leave`/axis family) — libwayland aborts the process when an
+  event lands on a NULL slot, and real compositors send those routinely;
+  (5) the layer surface was registered in `S.wins[]` only *after* waiting
+  for configure — the configure listener searches by `S.nwins`, so the
+  event missed, and the dispatch loop blocked forever on the next read
+  (daemon alive, desktop black). Fixed in 0.1.4; the regression net is
+  `tests/test_wlshim.c`: the shim runs end-to-end against the strict fake
+  compositor with a genuine libwayland-client doing the marshalling —
+  binds prove our interface metadata, `get_layer_surface` proves the
+  wl_message tables and the marshal ABI, and the strict validator sees
+  zero violations (ASan+UBSan clean, proxies destroyed on fini).
 * **"compositor lacks ... zwlr_layer_shell_v1"** — GNOME Wayland, or a
   compositor without layer-shell (stock weston is another). See the caveat
   above; use X11 (XWayland counts as X11) or a wlroots/KDE compositor.
