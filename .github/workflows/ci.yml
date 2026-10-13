@@ -1,0 +1,115 @@
+# ============================================================================
+#  Reverie Engine — CI.
+#
+#  The engine needs nothing but a C11 compiler, make, and libc to build,
+#  which makes coverage cheap. Three jobs on every push to main and every
+#  pull request:
+#
+#    unit        — the in-process suites: PNG codec + DEFLATE, scene
+#                  language, pack format, fake X11 and Wayland compositors
+#                  (strict wire-level validators), and the WSI shim suite
+#                  that runs REAL libwayland against a fake server
+#                  (dlopen'd; skips gracefully where it is absent).
+#                  Matrix over gcc and clang — the tree is strict C11
+#                  (-Wall -Wextra -Werror -Wpedantic), so both must agree.
+#
+#    e2e         — the daemon live under Xvfb on every renderer tier, with
+#                  llvmpipe EGL and lavapipe Vulkan installed so the
+#                  opengl and vulkan legs (platform-SHM present AND WSI
+#                  swapchain present) actually run instead of skipping.
+#                  A displayless --once render is checked first — that
+#                  path needs no display at all.
+#
+#    sanitizers  — the same suite built and run under ASan + UBSan with
+#                  leak detection on.
+#
+#  scripts/e2e-wayland.sh (live weston) is intentionally NOT run here: it
+#  needs the private weston test stack and skips without it. The
+#  wire-level Wayland coverage lives in the unit suites.
+# ============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: build + unit tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libwayland (real-libwayland shim suite)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwayland-client0
+
+      - name: Build (warnings are errors)
+        run: make -j"$(nproc)"
+
+      - name: Unit tests
+        run: make test
+
+  e2e:
+    name: E2E — Xvfb + llvmpipe EGL + lavapipe Vulkan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install display + software driver stack
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              xvfb \
+              libegl1 libegl-mesa0 libgl1-mesa-dri \
+              libvulkan1 mesa-vulkan-drivers \
+              libwayland-client0
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Displayless smoke render (--once needs no display)
+        run: |
+          ./build/reverie --once --out "$RUNNER_TEMP/smoke.png" scenes/mountain-dusk.rev
+          test -s "$RUNNER_TEMP/smoke.png"
+
+      - name: E2E — all present paths (cpu / opengl / vulkan-shm / vulkan-wsi)
+        run: scripts/e2e.sh
+
+  sanitizers:
+    name: ASan + UBSan (leaks on)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libwayland (real-libwayland shim suite)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwayland-client0
+
+      - name: Build + test under sanitizers
+        env:
+          ASAN_OPTIONS: >-
+            detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          make clean
+          make -j"$(nproc)" \
+              CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+              all test
