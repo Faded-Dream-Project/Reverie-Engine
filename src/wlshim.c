@@ -88,21 +88,31 @@ static const struct wl_message_ layer_shell_methods[] = {
         { "destroy",           "",       NULL                     },
 };
 static const struct wl_message_ layer_surface_methods[] = {
-        /* request opcode order per protocol:
-         *   0 set_anchor(u)              1 set_exclusive_zone(i)
-         *   2 set_margin(iiii)           3 set_keyboard_interactivity(u)
-         *   4 get_popup(n?o)            5 ack_configure(u)
-         *   6 destroy                    7 set_layer (since v2)
-         * There is NO set_size request — the compositor sizes all-edges
-         * anchored surfaces and reports the result via configure(). */
+        /* request opcode order per wlr-layer-shell-unstable-v1.xml (the
+         * canonical upstream protocol sway/wlroots/KWin implement):
+         *   0 set_size(uu)                1 set_anchor(u)
+         *   2 set_exclusive_zone(i)       3 set_margin(iiii)
+         *   4 set_keyboard_interactivity(u)
+         *   5 get_popup(o)                6 ack_configure(u)
+         *   7 destroy                     8 set_layer(u) since v2
+         *   9 set_exclusive_edge(u) since v5 (never sent — we bind v4)
+         * set_size(0,0) + all-edges anchor is the canonical wallpaper
+         * pattern: 0 means "the anchors determine the size", the
+         * compositor's assignment arrives via configure(). The 0.1.5 table
+         * believed set_size did not exist and dropped it — libwayland then
+         * marshalled the anchor value as a 4-byte opcode-0 frame which
+         * strict compositors reject ("invalid arguments for set_size")
+         * because set_size(uu) needs 8 payload bytes. */
+        { "set_size",                  "uu",   NULL },
         { "set_anchor",                 "u",    NULL },
         { "set_exclusive_zone",         "i",    NULL },
         { "set_margin",                 "iiii", NULL },
         { "set_keyboard_interactivity", "u",    NULL },
-        { "get_popup",                  "n?o",  NULL },
+        { "get_popup",                  "o",    NULL },
         { "ack_configure",              "u",    NULL },
         { "destroy",                    "",     NULL },
         { "set_layer",                  "u",    NULL },
+        { "set_exclusive_edge",         "u",    NULL },
 };
 static const struct wl_message_ layer_surface_events[] = {
         { "configure", "uuu", NULL },
@@ -113,7 +123,7 @@ static const struct wl_interface_ zwlr_layer_shell_v1_i = {
         "zwlr_layer_shell_v1", 4, 2, layer_shell_methods, 0, NULL
 };
 static const struct wl_interface_ zwlr_layer_surface_v1_i = {
-        "zwlr_layer_surface_v1", 4, 8, layer_surface_methods, 2, layer_surface_events
+        "zwlr_layer_surface_v1", 4, 10, layer_surface_methods, 2, layer_surface_events
 };
 const struct wl_interface_ *zwlr_layer_shell_v1_iface = &zwlr_layer_shell_v1_i;
 const struct wl_interface_ *zwlr_layer_surface_v1_iface = &zwlr_layer_surface_v1_i;
@@ -782,13 +792,16 @@ int wlshim_add_window(RRect geom)
         };
         S.proxy_add_listener(win->layer_surface, (void (**)(void))layer_listener, NULL);
 
-        /* set_anchor(all) opcode 0; set_exclusive_zone(-1) opcode 1;
-         * set_keyboard_interactivity(none) opcode 3 — there is no set_size
-         * request; the compositor assigns the size of an all-edges-anchored
-         * surface and delivers it via configure(). */
-        S.proxy_marshal(win->layer_surface, 0, 15u);
-        S.proxy_marshal(win->layer_surface, 1, (i32)-1);
-        S.proxy_marshal(win->layer_surface, 3, 0u);
+        /* REAL request numbering per wlr-layer-shell-unstable-v1.xml:
+         * set_size(0,0) opcode 0 (uu — 8 payload bytes; 0 means the anchors
+         * determine the size), set_anchor(all) opcode 1,
+         * set_exclusive_zone(-1) opcode 2, set_keyboard_interactivity(none)
+         * opcode 4 — the compositor's size assignment arrives via
+         * configure(). */
+        S.proxy_marshal(win->layer_surface, 0, 0u, 0u);
+        S.proxy_marshal(win->layer_surface, 1, 15u);
+        S.proxy_marshal(win->layer_surface, 2, (i32)-1);
+        S.proxy_marshal(win->layer_surface, 4, 0u);
         i32 s = S.outputs[mon].scale < 1 ? 1 : S.outputs[mon].scale;
         /* wl_surface.commit (opcode 6) — inline-only wrapper, marshalled directly */
         S.proxy_marshal(win->surface, WL_SURFACE_COMMIT);
@@ -815,7 +828,7 @@ int wlshim_add_window(RRect geom)
                 win->layer_surface = NULL;
                 return -1;
         }
-        S.proxy_marshal(win->layer_surface, 5, win->cfg_serial);    /* ack_configure */
+        S.proxy_marshal(win->layer_surface, 6, win->cfg_serial);    /* ack_configure — opcode 6 (5 is get_popup) */
         S.flush(S.display);
 
         win->lw = (u32)(S.outputs[mon].pw / s);

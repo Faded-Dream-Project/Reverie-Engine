@@ -290,12 +290,18 @@ static bool s_check(const u8 *m, size_t len)
                         varsz = true;    /* get_layer_surface */
                 else if (op == 1) { want = 8; destructor = true; }    /* destroy */
                 break;
-        case T_LAYER_SURFACE:             /* zwlr_layer_surface_v1 */
-                if (op == 0 || op == 1 || op == 3 || op == 5) want = 12;
-                else if (op == 2) want = 24;                          /* set_margin */
-                else if (op == 4) want = 12;                          /* get_popup */
-                else if (op == 6) { want = 8; destructor = true; }    /* destroy */
-                else if (op == 7) want = 8;                           /* set_layer */
+        case T_LAYER_SURFACE:             /* zwlr_layer_surface_v1 — REAL
+                                          * numbering, 1:1 with
+                                          * wlr-layer-shell-unstable-v1.xml */
+                if (op == 0) want = 16;                               /* set_size(uu) */
+                else if (op == 1 || op == 2 || op == 4) want = 12;    /* set_anchor /
+                                                                          * set_exclusive_zone /
+                                                                          * set_keyboard_interactivity */
+                else if (op == 3) want = 24;                          /* set_margin(iiii) */
+                else if (op == 5) want = 12;                          /* get_popup(o) */
+                else if (op == 6) want = 12;                          /* ack_configure(u) */
+                else if (op == 7) { want = 8; destructor = true; }    /* destroy */
+                else if (op == 8) want = 12;                          /* set_layer(u) v2 */
                 break;
         }
         if (is_bind) {
@@ -375,7 +381,7 @@ static int pool_fd = -1;
 static u32 pool_size_seen;
 static int attach_count;              /* attach #1 -> slot 0, #2 -> slot 1, #3 -> slot 0 again */
 static bool saw_pool, saw_buf[2], saw_attach, saw_cycling;
-static bool saw_layer0, saw_ns_reverie, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
+static bool saw_layer0, saw_ns_reverie, saw_size00, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
 static bool closed_sent, pointer_sent, saw_configure_sent;
 static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
 
@@ -675,21 +681,33 @@ static void *server(void *arg)
                         continue;
                 }
                 if (t == T_LAYER_SURFACE) {
+                        /* REAL opcodes/sizes per wlr-layer-shell-unstable-v1.xml;
+                         * s_check already enforced the frame size — the checks
+                         * here pin the VALUES. The 0.1.5 shim marshalled the
+                         * anchor value as a 4-byte opcode-0 frame (set_size in
+                         * reality needs 8 payload bytes) — libwayland built it
+                         * from our wrong table, so the table AND these pins
+                         * must match the XML. */
                         if (op == 0) {
-                                bool ok = n == 12 && s_get32(msg + 8) == 15;
-                                CHECK(ok, "set_anchor(all edges=15) — opcode 0");
-                                saw_anchor15 = ok;
+                                bool ok = n == 16 && s_get32(msg + 8) == 0 &&
+                                          s_get32(msg + 12) == 0;
+                                CHECK(ok, "set_size(0,0) — opcode 0, 16-byte frame");
+                                saw_size00 = ok;
                         } else if (op == 1) {
+                                bool ok = n == 12 && s_get32(msg + 8) == 15;
+                                CHECK(ok, "set_anchor(all edges=15) — opcode 1");
+                                saw_anchor15 = ok;
+                        } else if (op == 2) {
                                 bool ok = n == 12 && (i32)s_get32(msg + 8) == -1;
-                                CHECK(ok, "set_exclusive_zone(-1) — opcode 1");
+                                CHECK(ok, "set_exclusive_zone(-1) — opcode 2");
                                 saw_zone_neg1 = ok;
-                        } else if (op == 3) {
+                        } else if (op == 4) {
                                 bool ok = n == 12 && s_get32(msg + 8) == 0;
-                                CHECK(ok, "set_keyboard_interactivity(none) — opcode 3");
+                                CHECK(ok, "set_keyboard_interactivity(none) — opcode 4");
                                 saw_interact0 = ok;
-                        } else if (op == 5) {
+                        } else if (op == 6) {
                                 bool ok = s_get32(msg + 8) == 77;
-                                CHECK(ok, "ack_configure(serial=77) — opcode 5");
+                                CHECK(ok, "ack_configure(serial=77) — opcode 6");
                                 saw_ack77 = ok;
                                 send_pointer_events();
                         }
@@ -895,6 +913,7 @@ int main(void)
          * they are authoritative even if the thread raced the CHECKs) */
         CHECK(saw_layer0, "layer=background(0) on the wire");
         CHECK(saw_ns_reverie, "namespace=\"reverie\" on the wire");
+        CHECK(saw_size00, "set_size(0,0) seen");
         CHECK(saw_anchor15, "set_anchor(all) seen");
         CHECK(saw_zone_neg1, "set_exclusive_zone(-1) seen");
         CHECK(saw_interact0, "set_keyboard_interactivity(none) seen");

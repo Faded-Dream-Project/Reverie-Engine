@@ -903,20 +903,32 @@ int wl_add_window(WLDisplay *w, int mon)
                 wl_put_u32(w, 0);              /* layer: background */
                 wl_put_str(w, ns);
         }
-        /* zwlr_layer_surface_v1 request opcodes (wlr-layer-shell-unstable-v1):
-         *   0 set_anchor(u32)             1 set_exclusive_zone(i32)
-         *   2 set_margin(4xi32)          3 set_keyboard_interactivity(u32)
-         *   4 get_popup                  5 ack_configure(u32)
-         *   6 destroy                    7 set_layer (since v2)
-         * There is NO set_size request: a surface anchored to all four edges
-         * is sized by the compositor and the size arrives via configure(). */
-        if (!wl_begin_req(w, win->layer_surface, 0, 4))    /* set_anchor */
+        /* zwlr_layer_surface_v1 request opcodes — REAL numbering per
+         * wlr-layer-shell-unstable-v1.xml (canonical upstream, the same file
+         * sway/wlroots/KWin implement):
+         *   0 set_size(uu)              1 set_anchor(u)
+         *   2 set_exclusive_zone(i)     3 set_margin(iiii)
+         *   4 set_keyboard_interactivity(u)
+         *   5 get_popup(o)              6 ack_configure(u)
+         *   7 destroy                   8 set_layer (since v2)
+         * set_size(0,0) + anchor(all four edges) is the canonical wallpaper
+         * pattern: 0 means "let the anchors determine the size" — the
+         * compositor's assignment arrives via configure(). The 0.1.5 table
+         * dropped set_size and shifted the whole family by one: the anchor
+         * value 15 went out as a 4-byte payload on opcode 0, which strict
+         * compositors demarshal as set_size(uu) needing 8 bytes and kill the
+         * connection with "invalid arguments for set_size". */
+        if (!wl_begin_req(w, win->layer_surface, 0, 8))    /* set_size(0,0) */
+                return -1;
+        wl_put_u32(w, 0);
+        wl_put_u32(w, 0);
+        if (!wl_begin_req(w, win->layer_surface, 1, 4))    /* set_anchor */
                 return -1;
         wl_put_u32(w, 15);                 /* top|bottom|left|right */
-        if (!wl_begin_req(w, win->layer_surface, 1, 4))    /* set_exclusive_zone */
+        if (!wl_begin_req(w, win->layer_surface, 2, 4))    /* set_exclusive_zone */
                 return -1;
         wl_put_i32(w, -1);                 /* fill the whole output */
-        if (!wl_begin_req(w, win->layer_surface, 3, 4))    /* set_keyboard_interactivity */
+        if (!wl_begin_req(w, win->layer_surface, 4, 4))    /* set_keyboard_interactivity */
                 return -1;
         wl_put_u32(w, 0);                  /* none */
 
@@ -946,9 +958,10 @@ int wl_add_window(WLDisplay *w, int mon)
                 return -1;
         }
 
-        /* ack_configure — opcode 5 (opcode 6 is destroy: the 0.1.2 client
-         * acked by destroying its own layer surface). */
-        if (!wl_begin_req(w, win->layer_surface, 5, 4))
+        /* ack_configure — opcode 6 per the real protocol (opcode 5 is
+         * get_popup, opcode 7 is destroy). The 0.1.5 client acked via the
+         * get_popup slot after the set_size deletion shifted the table. */
+        if (!wl_begin_req(w, win->layer_surface, 6, 4))
                 return -1;
         wl_put_u32(w, win->last_serial);
         win->acked = true;
@@ -999,15 +1012,25 @@ int wl_add_window(WLDisplay *w, int mon)
                 wl_put_u32(w, win->buf[0]);
                 wl_put_i32(w, 0);
                 wl_put_i32(w, 0);
-                /* damage_buffer (op 9) exists since wl_surface v4; for older
-                 * compositors use logical damage (op 2) */
-                if (!wl_begin_req(w, win->surface, w->comp_version >= 4 ? 9 : 2,
-                                  w->comp_version >= 4 ? 16 : 20))
-                        return -1;
-                wl_put_i32(w, 0);
-                wl_put_i32(w, 0);
-                wl_put_u32(w, win->pw);
-                wl_put_u32(w, win->ph);
+                /* damage_buffer (op 9) exists since wl_surface v4 and takes
+                 * BUFFER coords (16-byte payload); older compositors get
+                 * logical damage (op 2) in surface-local coords — also
+                 * 16 bytes, never the 20 the 0.1.5 client sent */
+                if (w->comp_version >= 4) {
+                        if (!wl_begin_req(w, win->surface, 9, 16))
+                                return -1;
+                        wl_put_i32(w, 0);
+                        wl_put_i32(w, 0);
+                        wl_put_u32(w, win->pw);
+                        wl_put_u32(w, win->ph);
+                } else {
+                        if (!wl_begin_req(w, win->surface, 2, 16))
+                                return -1;
+                        wl_put_i32(w, 0);
+                        wl_put_i32(w, 0);
+                        wl_put_u32(w, win->w);
+                        wl_put_u32(w, win->h);
+                }
                 if (win->scale > 1 && w->comp_version >= 3) {
                         if (!wl_begin_req(w, win->surface, 8, 4))    /* set_buffer_scale */
                                 return -1;
@@ -1084,13 +1107,21 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
         wl_put_u32(w, win->buf[b]);
         wl_put_i32(w, 0);
         wl_put_i32(w, 0);
-        if (!wl_begin_req(w, win->surface, w->comp_version >= 4 ? 9 : 2,
-                          w->comp_version >= 4 ? 16 : 20))
-                return false;    /* damage(_buffer) */
-        wl_put_i32(w, 0);
-        wl_put_i32(w, 0);
-        wl_put_u32(w, width);
-        wl_put_u32(w, height);
+        if (w->comp_version >= 4) {
+                if (!wl_begin_req(w, win->surface, 9, 16))
+                        return false;   /* damage_buffer: buffer coords */
+                wl_put_i32(w, 0);
+                wl_put_i32(w, 0);
+                wl_put_u32(w, width);
+                wl_put_u32(w, height);
+        } else {
+                if (!wl_begin_req(w, win->surface, 2, 16))
+                        return false;   /* damage: surface-local coords */
+                wl_put_i32(w, 0);
+                wl_put_i32(w, 0);
+                wl_put_u32(w, win->w);
+                wl_put_u32(w, win->h);
+        }
         if (!wl_begin_req(w, win->surface, 6, 0))     /* commit */
                 return false;
         if (!wl_flush(w))

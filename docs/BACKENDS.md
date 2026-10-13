@@ -103,6 +103,33 @@ and logged as such.)
 
 ## Troubleshooting
 
+* **`invalid arguments for zwlr_layer_surface_v1#N.set_size` at startup
+  (0.1.6 postmortem)** — field report on a strict compositor: BOTH Wayland
+  paths (`REV_WAYLAND_GPU=1` and the raw client behind `--renderer
+  opengl`) died at "monitor 0: window creation failed" with a
+  `wl_display` error naming `set_size`, a request reverie's opcode table
+  claimed did not exist. Root cause: the hand-written
+  `zwlr_layer_surface_v1` request table had dropped `set_size` — request
+  0 in the real `wlr-layer-shell-unstable-v1.xml` — shifting the whole
+  family by one. The anchor value 15 was sent as a 4-byte payload on
+  opcode 0; strict compositors demarshal that as `set_size(uu)` (needs 8
+  payload bytes), post error 1 on the display, and drop the connection.
+  Behind it waited two more latent kills: `set_keyboard_interactivity`
+  was going out as `set_margin(iiii)` (4 of 16 payload bytes) and
+  `ack_configure` as `get_popup`. Why the tests never caught it: the
+  fake compositor validated against the same wrong table (client and
+  validator were written together), and weston — the only *real*
+  compositor in the E2E — does not implement layer-shell, so no live
+  test ever reached the request burst. Fixed by rebuilding the client,
+  the shim's `wl_message` metadata, and both fake servers from the
+  canonical XML: `set_size(0,0)+anchor(all)+zone(-1)+interactivity(none)`
+  in real opcodes, `ack_configure` at opcode 6, per-request wire sizes
+  enforced, and an A/B proof that the 0.1.5 client fails the corrected
+  suite with the exact field symptom while the fixed one passes. Bonus
+  fix: the pre-v4 `damage` fallback now sends the protocol's 16-byte
+  payload with logical coordinates. If you still see a compositor error
+  after 0.1.6, run with `REV_WL_TRACE=1` and check the reported
+  request name against the XML tables in `tests/test_wayland.c`.
 * **`REV_WAYLAND_GPU=1` segfaults at startup / listener tables (0.1.5
   postmortem)** — field report on KWin: the daemon died with a silent
   SIGSEGV right after loading the scene, before any backend log line.

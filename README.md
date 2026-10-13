@@ -139,7 +139,37 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.1.5 (pre-release)
+## Status — 0.1.6 (pre-release)
+
+0.1.6 fixes the field-reported 0.1.5 startup failure — on strict compositors
+both Wayland paths died at window creation with
+`wl_display#1: error 1: invalid arguments for zwlr_layer_surface_v1#N.set_size`:
+
+* **The hand-written `zwlr_layer_surface_v1` opcode table was wrong** — it
+  believed the protocol has no `set_size` request and dropped it, shifting
+  the whole family by one. Reverie sent its anchor value 15 as a 4-byte
+  payload on opcode 0, which is really `set_size(width, height)` (8 payload
+  bytes); compositors that validate request framing strictly (KWin et al.)
+  post `invalid arguments ... set_size` and kill the connection — while the
+  lenient weston-based E2E never reached layer-shell at all (weston does not
+  implement the protocol). The client now sends the canonical wallpaper
+  sequence from the real `wlr-layer-shell-unstable-v1.xml`: `set_size(0,0)`
+  (zero = let the anchors decide), `set_anchor(all edges)`,
+  `set_exclusive_zone(-1)`, `set_keyboard_interactivity(none)`, and — the
+  request that would have failed next — `ack_configure` moved to its real
+  opcode 6 (it was being sent as `get_popup`). The same corrections went
+  into the WSI shim's `wl_message` metadata, so libwayland now marshals
+  real frames. A latent raw-client bug went with it: the pre-v4
+  `wl_surface.damage` fallback sent a 20-byte payload where the protocol
+  defines 16 (and buffer coords where logical coords belong).
+* **Why four green releases shipped it**: the fake-compositor tests and the
+  client were written together off the same wrong table — both sides of the
+  socket agreed with each other and with nothing else. The fake servers now
+  validate every request against the canonical XML (real opcodes, real
+  per-request wire sizes, values pinned by name), and the A/B proof is in
+  the tree: the 0.1.5 client fails the corrected suite with the exact field
+  symptom ("layer surface did not configure") while the fixed one passes
+  7/7.
 
 0.1.5 fixes the first field-reported 0.1.4 crash — `REV_WAYLAND_GPU=1`
 segfaulted at startup on real compositors (reported on KWin + NVIDIA):

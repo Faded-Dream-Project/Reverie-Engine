@@ -45,7 +45,7 @@ typedef struct {
         u32 sync2;
 } PhaseA;
 static PhaseA A;
-static volatile bool saw_anchor = false, saw_zone = false, saw_interact = false;
+static volatile bool saw_size = false, saw_anchor = false, saw_zone = false, saw_interact = false;
 
 static u32 s_get32(const u8 *p)
 {
@@ -148,14 +148,21 @@ static u32 msg_size(const u8 *m)
  * retire their object. Violations post a wl_display.error exactly like a real
  * compositor (KWin/weston) would.
  *
- * Regression net for the 0.1.2 field bug: the client encoded the whole
- * zwlr_layer_surface_v1 request family with shifted opcodes —
- * get_layer_surface as opcode 1 (which is destroy), ack_configure as opcode 6
- * (also destroy), plus a set_size request that does not exist in the protocol
- * at all — so KWin killed the connection with "invalid object 12" and the
- * layer surface never configured. The old lenient fake compositor accepted
- * the same wrong numbering (both sides were written together), so every test
- * stayed green until a real compositor ran the client. */
+ * Regression net for two field bugs, both caused by hand-written opcode
+ * tables drifting from the real protocol (validated here against the
+ * canonical wlr-layer-shell-unstable-v1.xml, the same file sway/wlroots/
+ * KWin implement):
+ *   - 0.1.2: get_layer_surface sent as opcode 1 (destroy) — KWin killed the
+ *     connection with "invalid object 12".
+ *   0.1.5: the fix for that bug over-corrected and DELETED set_size from
+ *     the zwlr_layer_surface_v1 table, shifting every request by one. The
+ *     anchor value 15 went out as a 4-byte payload on opcode 0; strict
+ *     compositors demarshal opcode 0 as set_size(uu) — 8 payload bytes —
+ *     and post "invalid arguments for zwlr_layer_surface_v1#N.set_size",
+ *     exactly as reported from the field. Both times the lenient fake
+ *     agreed with the client's wrong table (both sides were written
+ *     together), so every test stayed green until a real compositor ran
+ *     the client. The tables below now match the XML 1:1. */
 enum {
         T_DISPLAY, T_REGISTRY, T_COMPOSITOR, T_SURFACE, T_SHM, T_POOL, T_BUFFER,
         T_SEAT, T_POINTER, T_OUTPUT, T_SHELL, T_LAYER_SURFACE,
@@ -292,12 +299,17 @@ static bool s_check(const u8 *m, size_t len)
                         varsz = true;    /* get_layer_surface */
                 else if (op == 1) { want = 8; destructor = true; }    /* destroy */
                 break;
-        case T_LAYER_SURFACE:             /* zwlr_layer_surface_v1 */
-                if (op == 0 || op == 1 || op == 3 || op == 5) want = 12;
-                else if (op == 2) want = 24;                          /* set_margin */
-                else if (op == 4) want = 12;                          /* get_popup */
-                else if (op == 6) { want = 8; destructor = true; }    /* destroy */
-                else if (op == 7) want = 8;                           /* set_layer */
+        case T_LAYER_SURFACE:             /* zwlr_layer_surface_v1 — REAL
+                                          * numbering, 1:1 with the XML */
+                if (op == 0) want = 16;                               /* set_size(uu) */
+                else if (op == 1 || op == 2 || op == 4) want = 12;    /* set_anchor /
+                                                                          * set_exclusive_zone /
+                                                                          * set_keyboard_interactivity */
+                else if (op == 3) want = 24;                          /* set_margin(iiii) */
+                else if (op == 5) want = 12;                          /* get_popup(o) */
+                else if (op == 6) want = 12;                          /* ack_configure(u) */
+                else if (op == 7) { want = 8; destructor = true; }    /* destroy */
+                else if (op == 8) want = 12;                          /* set_layer(u) v2 */
                 break;
         }
         if (is_bind) {
@@ -691,8 +703,9 @@ static void *phase_b(void *arg)
         if (n >= 8)
                 s_check(msg, n);    /* registers the layer_surface object */
 
-        /* drain set_anchor / set_exclusive_zone / set_keyboard_interactivity
-         * + commit(null) — each strictly validated */
+        /* drain set_size / set_anchor / set_exclusive_zone /
+         * set_keyboard_interactivity + commit(null) — each strictly validated
+         * against the REAL protocol sizes by s_check above */
         for (int i = 0; i < 8; i++) {
                 n = s_read_msg(msg, sizeof msg, NULL);
                 if (n < 8)
@@ -701,11 +714,14 @@ static void *phase_b(void *arg)
                         break;    /* violation: client connection is dead */
                 u32 op = msg_opcode(msg);
                 u32 obj = s_get32(msg);
-                if (obj == S.layer_surface && op == 0 && n == 12 && s_get32(msg + 8) == 15)
+                if (obj == S.layer_surface && op == 0 && n == 16 &&
+                    s_get32(msg + 8) == 0 && s_get32(msg + 12) == 0)
+                        saw_size = true;
+                if (obj == S.layer_surface && op == 1 && n == 12 && s_get32(msg + 8) == 15)
                         saw_anchor = true;
-                if (obj == S.layer_surface && op == 1 && n == 12 && (i32)s_get32(msg + 8) == -1)
+                if (obj == S.layer_surface && op == 2 && n == 12 && (i32)s_get32(msg + 8) == -1)
                         saw_zone = true;
-                if (obj == S.layer_surface && op == 3 && n == 12 && s_get32(msg + 8) == 0)
+                if (obj == S.layer_surface && op == 4 && n == 12 && s_get32(msg + 8) == 0)
                         saw_interact = true;
                 if (obj == S.surface && op == 6)
                         break;    /* commit(null) */
@@ -821,9 +837,10 @@ int main(void)
         int win = wl_add_window(wl, 0);
         CHECK(win == 0, "window created");
         pthread_join(thb, NULL);
-        CHECK(saw_anchor, "set_anchor(all edges) — opcode 0");
-        CHECK(saw_zone, "set_exclusive_zone(-1) — opcode 1");
-        CHECK(saw_interact, "set_keyboard_interactivity(none) — opcode 3");
+        CHECK(saw_size, "set_size(0,0) — opcode 0, 16-byte frame");
+        CHECK(saw_anchor, "set_anchor(all edges) — opcode 1");
+        CHECK(saw_zone, "set_exclusive_zone(-1) — opcode 2");
+        CHECK(saw_interact, "set_keyboard_interactivity(none) — opcode 4");
 
         /* client: ack_configure + create_pool (with fd!) + 2 buffers + attach + commit */
         bool saw_ack = false, saw_pool = false, saw_attach = false;
@@ -837,10 +854,12 @@ int main(void)
                         break;
                 u32 obj = s_get32(msg);
                 u32 op = msg_opcode(msg);
-                if (obj == S.layer_surface && op == 5) {
-                        /* ack_configure is opcode 5 — opcode 6 is destroy */
+                if (obj == S.layer_surface && op == 6) {
+                        /* ack_configure is opcode 6 — opcode 5 is get_popup,
+                         * opcode 7 is destroy (the 0.1.5 client acked via
+                         * the get_popup slot after the table shift) */
                         saw_ack = true;
-                        CHECK(s_get32(msg + 8) == 77, "ack_configure(serial=77) [opcode 5]");
+                        CHECK(s_get32(msg + 8) == 77, "ack_configure(serial=77) [opcode 6]");
                 } else if (obj == S.shm && op == 0) {
                         saw_pool = true;
                         S.pool = s_get32(msg + 8);
