@@ -230,7 +230,7 @@ int main(void)
 			rtscene_free(sc);
 		}
 
-		/* v0.2.0 click latch, isolated on a FRESH scene so every changed
+		/* dev: click latch, isolated on a FRESH scene so every changed
 		 * pixel is attributable to the click alone: a full press+release
 		 * between two renders (no held pointer at all) must still splash
 		 * via rtscene_click. Consume-once semantics are pinned by the

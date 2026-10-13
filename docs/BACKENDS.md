@@ -112,7 +112,7 @@ and logged as such.)
 ## Troubleshooting
 
 * **`eglCreateWindowSurface failed (0x300b)` with `--renderer opengl` on
-  Wayland (0.2.0 postmortem)** — field report: with `REV_WAYLAND_GPU=1`
+  Wayland (dev-cycle postmortem)** — field report: with `REV_WAYLAND_GPU=1`
   active, the GL tier died at "renderer init" with EGL error 0x300b
   (`EGL_BAD_NATIVE_WINDOW`). Root cause: the renderer passed the shim's
   raw `wl_surface*` as the EGL native window. On X11 the XID *is* the
@@ -134,7 +134,7 @@ and logged as such.)
   reproduces both paths against a live weston: path A (raw surface)
   fails — the exact EGL error code varies by driver/version; the field
   report was 0x300b — and path B (wrapper) reaches 5 successful
-  `eglSwapBuffers`. If EGL still fails after 0.2.0, check that
+  `eglSwapBuffers`. If EGL still fails in the dev tree, check that
   `libwayland-egl.so.1` is installed alongside the driver's `libEGL.so.1`
   (Mesa ships both; hybrid NVIDIA setups must point EGL at a vendor that
   supports the Wayland platform).

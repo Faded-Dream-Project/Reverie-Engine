@@ -20,7 +20,7 @@ into a single self-contained `.revpack` binary for distribution.
 
 ```
  ~ $ reverie scenes/mountain-dusk.rev
- [info] reverie 0.1.2 — backend=auto renderer=auto
+ [info] reverie 0.1.0-dev — backend=auto renderer=auto
  [info] backend: x11
  [info] renderer: vulkan (tier 3, CPU compositing)
  [info] vulkan: GPU present capable (queue family 0); presenting via platform SHM path
@@ -139,12 +139,14 @@ revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 ```
 
-## Status — 0.2.0 (pre-release)
+## Status — 0.1.0-dev (development, unstable)
 
-0.2.0 fixes the field-reported 0.1.6 GL failure on Wayland — `--renderer
-opengl` behind `REV_WAYLAND_GPU=1` died at window creation with
-`eglCreateWindowSurface failed (0x300b)` — and lands the frame-pacing and
-interaction overhaul the fix rode in on:
+No release yet: active development, everything unstable, not ready for
+public use — the tree stays a -dev version until it earns a number. The
+current dev cycle fixes the field-reported 0.1.6 GL failure on Wayland —
+`--renderer opengl` behind `REV_WAYLAND_GPU=1` died at window creation
+with `eglCreateWindowSurface failed (0x300b)` — and lands the
+frame-pacing and interaction overhaul the fix rode in on:
 
 * **The GL renderer handed the raw `wl_surface*` to EGL as a native
   window.** A wl_surface is *not* an `EGLNativeWindow`: on Wayland, EGL

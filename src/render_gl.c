@@ -8,7 +8,7 @@
  *         hand-written X11 client. No Xlib is ever linked or loaded by us.
  * Wayland: requires the WSI shim (wlshim.c) to provide wl_display/wl_surface
  *          handles; without it init fails and the chain falls to CPU.
- *          v0.2.0: the display is opened through the EGL platform API
+ *          dev: the display is opened through the EGL platform API
  *          (EGL_EXT_platform_wayland) when available, and every window
  *          surface is created on a wl_egl_window from libwayland-egl —
  *          handing the RAW wl_surface to eglCreateWindowSurface is the

@@ -658,7 +658,7 @@ static void *server(void *arg)
                         continue;
                 }
                 if (t == T_SURFACE && op == 3) {
-                        /* wl_surface.frame(new_id) — the v0.2.0 pacing request.
+                        /* wl_surface.frame(new_id) — the dev pacing request.
                          * Reply wl_callback.done(data) exactly like a compositor
                          * that latched the presented frame. */
                         u32 nid = s_get32(msg + 8);
@@ -872,7 +872,7 @@ int main(void)
 
                 /* 5. pointer events (sent by the server after the ack) — pump
                  * until the whole batch lands; pointer state is CONSUMED ON
-                 * READ (v0.2.0), so poll on the monotonic click count and
+                 * READ (dev), so poll on the monotonic click count and
                  * then inspect the snapshot of that final read. */
                 RPointerState ptr;
                 memset(&ptr, 0, sizeof ptr);
@@ -936,7 +936,7 @@ int main(void)
                         }
                         CHECK(third, "double-buffer cycling: slot 0 reused after wl_buffer.release");
 
-                        /* v0.2.0 drop accounting, deterministic: hold the
+                        /* dev: drop accounting, deterministic: hold the
                          * server's releases, then burst three presents — A
                          * takes slot 0, B takes slot 1, C finds both held and
                          * must be counted as dropped, silently (no wire

@@ -149,7 +149,7 @@ typedef struct {
         u32 pw, ph;         /* buffer (device-pixel) size */
         bool buf_free[2];
         int cur;
-        /* v0.2.0 frame pacing */
+        /* dev: frame pacing */
         wl_proxy_ *frame_cb;   /* pending wl_surface.frame callback       */
         bool frame_ready;      /* callback fired since last wait          */
         bool gl_surface;       /* EGL owns this surface: the wl_shm

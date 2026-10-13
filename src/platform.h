@@ -20,7 +20,7 @@ typedef struct RPlatform RPlatform;
  * updated by pump(). dx/dy are deltas accumulated since the last pointer()
  * call (consume-on-read).
  *
- * Edge latching (v0.2.0): a click whose press AND release both arrive between
+ * Edge latching (dev): a click whose press AND release both arrive between
  * two polls must still register. Button transitions are latched as edge flags
  * and consumed by pointer() — a click is reported even when it lived entirely
  * inside a single event batch (or a single slow frame). */
@@ -81,7 +81,7 @@ struct RPlatform {
         /* True when the compositor/server asked to close (Wayland "closed"). */
         bool (*should_close)(RPlatform *p);
 
-        /* ---- frame pacing (v0.2.0) ------------------------------------------
+        /* ---- frame pacing (dev) ------------------------------------------
          * wait_frame(): block up to `seconds` (>= 0) while PROCESSING INPUT
          * EVENTS, returning early when the display signals readiness (the
          * Wayland frame callback latched the last presented frame). Replaces
