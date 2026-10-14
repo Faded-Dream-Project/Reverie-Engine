@@ -26,6 +26,11 @@ void ripple_click(RevRipple *r, f64 x, f64 y);
 
 void ripple_step(RevRipple *r, f64 dt);
 
+/* True while the height field carries energy (or an injection is pending
+ * since the last step): a fully calm field is an exact pass-through, so
+ * callers can skip the full-screen refraction entirely. */
+bool ripple_active(const RevRipple *r);
+
 /* Applies refraction + highlights: `below` is the composited content under
  * this layer (modified in place is NOT done; output written to `out`,
  * which may be `below` itself only if aliased intentionally). */

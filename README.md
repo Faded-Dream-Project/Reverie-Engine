@@ -224,6 +224,25 @@ Still no tags and no GitHub releases. This dev cycle:
   black-screen path when a ripple scene fell back to CPU compositing on
   the GL tier, and honest GPU timer-query detection (a functional probe
   must pass before "available" is logged).
+* **The ripple blow-up fixed (2026-10, second field report).** "After
+  clicking, the effect expands until it reaches the sides of the screen,
+  glitches, and clicking again does nothing; on Vulkan one CPU core stays
+  maxed out." Root cause: the wave update was ANTI-damped — its smooth-mode
+  pole sat at `1 + sqrt(damping*0.05) ≈ 1.06`, so a click's energy grew
+  ~×38/second until the height field hit inf/NaN (~3 s on the GL tier's
+  RGBA16F targets, ~27 s on f32). A NaN field refracts garbage and swallows
+  every later click; the same runaway kept the CPU/Vulkan tiers' sim time
+  climbing (13.3 → 36.0 ms on the reporter's box) with a permanently busy
+  core. The update is now the stable damped form plus an absorbing screen
+  border (waves die at the edges), a sub-visible fade, and a quiescence
+  tracker: the lake calms to an EXACT zero field ~15–20 s after a click,
+  later clicks splash normally (new unit + e2e click-after-calm tests on
+  both CPU and GPU tiers), and the idle CPU/Vulkan tier costs composite +
+  upload only (sim 0.0 ms at 1080p, measured). While waves visibly roll
+  the CPU-compositing tiers still pay full-screen refraction (~16–28 ms
+  at 1080p for the waves' ~20 s life) — `-R opengl` is the zero-CPU-sim
+  path; GPU rendering inside the Vulkan tier itself remains future work
+  (see docs/BACKENDS.md for the postmortem with the numbers).
 
 * **GPU-first rendering, everywhere it belongs.** The maintainer's
   direction after the 1050 Ti field report (fluid-aurora at 57-59 fps —
@@ -258,9 +277,11 @@ Still no tags and no GitHub releases. This dev cycle:
   GPU color conversion. docs/VIDEO.md records the full decoder
   architecture assessment (why a from-scratch H.264 decoder is the
   wrong project, licensing notes, and the phase-2 hardware-decode plan).
-* **Verification.** 8 unit suites (new: theme, video), e2e 11/11 under
+* **Verification.** 9 unit suites (new: theme, video), e2e 16/16 under
   Xvfb (new legs: GPU ripple, folder/packed theme parity, corrupt-pack
-  rejection, video on CPU and GL tiers), ASan+UBSan clean. Field
+  rejection, video on CPU and GL tiers, delayed click-after-calm on CPU
+  and GL tiers), ASan+UBSan clean including daemon smokes with clicks on
+  the CPU and Vulkan tiers. Field
   validation on the 1050 Ti box remains open: the GPU-path performance
   claims come from paired measurements on this 2-core sandbox plus the
   user's prior report; the profiler now gives the next field run the

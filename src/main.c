@@ -347,6 +347,31 @@ int main(int argc, char **argv)
                         fprintf(stderr, "reverie: unknown option '%s'\n", argv[i]);
                         usage();
                         return 1;
+                } else if (strchr(argv[i], '=') && argv[i][0] != '-' &&
+                           argv[i][0] != '/') {
+                        /* a NAME=VALUE positional is almost always an env var
+                         * that belongs BEFORE the command (REV_VK_VALIDATE=1
+                         * ./build/reverie ...), never a scene path */
+                        const char *eq = strchr(argv[i], '=');
+                        bool name_ok = eq != argv[i];
+                        for (const char *c = argv[i]; c < eq && name_ok; c++)
+                                if (!((*c >= 'A' && *c <= 'Z') ||
+                                      (*c >= '0' && *c <= '9') || *c == '_'))
+                                        name_ok = false;
+                        if (name_ok) {
+                                fprintf(stderr, "reverie: '%.*s' looks like an "
+                                        "environment variable — put it before the "
+                                        "command, e.g. %s ./build/reverie ...%s\n",
+                                        (int)(eq - argv[i] + 1), argv[i], argv[i],
+                                        scene_path ? " (a scene was already given)" : "");
+                                return 1;
+                        }
+                        if (!scene_path) {
+                                scene_path = argv[i];
+                        } else {
+                                fprintf(stderr, "reverie: multiple scenes given\n");
+                                return 1;
+                        }
                 } else if (!scene_path) {
                         scene_path = argv[i];
                 } else {
@@ -487,8 +512,19 @@ int main(int argc, char **argv)
         /* renderer selection happens AFTER windows exist (surfaces need them) */
         RRenderer *rend = renderer_create(renderer_pref, plat, err, sizeof err);
         if (!rend) {
+                /* full cleanup — the explicit-failure path used to leak the
+                 * frame buffers + the scene/theme (ASan: 4 MB per attempt) */
                 fprintf(stderr, "reverie: %s\n", err);
+                for (int i = 0; i < nmon; i++)
+                        free(fbs[i].px);
                 platform_destroy(plat);
+                rtscene_free(sf.sc);
+                if (sf.pack_used)
+                        rev_pack_free(&sf.pack);
+                if (sf.theme)
+                        theme_free(sf.theme);
+                arena_destroy(sf.ir_arena);
+                free(base_dir);
                 return 1;
         }
         if (!rend->wants_layers && strcmp(rend->name, "vulkan") == 0)
@@ -563,15 +599,18 @@ int main(int argc, char **argv)
         if (fake_ptr_speed > 0)
                 LOGI("fake pointer active (test hook): %.2f circuit/s", fake_ptr_speed);
 
-        /* REV_FAKE_CLICK="x,y[;x,y ...]": TEST hook — synthesizes full clicks
-         * (press+release) at normalized [0..1] positions, one every 0.2 s
-         * starting at t=0.3 s, so CLICK-driven interaction (ripple splash
-         * placement, particle bursts) is regression-testable headlessly —
-         * the drag path had REV_FAKE_POINTER, the click path had nothing.
-         * The real pointer stays untouched; only the click events are
-         * injected. Never active unless the env var is set. */
+        /* REV_FAKE_CLICK="x,y[@t][;x,y@t ...]": TEST hook — synthesizes
+         * full clicks (press+release) at normalized [0..1] positions.
+         * @t fires that click at t seconds since start (default: one every
+         * 0.2 s starting at t=0.3 s) — delayed clicks are how the
+         * click-after-calm regression is tested headlessly. CLICK-driven
+         * interaction (ripple splash placement, particle bursts) is
+         * regression-testable without a display server — the drag path had
+         * REV_FAKE_POINTER, the click path had nothing. The real pointer
+         * stays untouched; only the click events are injected. Never active
+         * unless the env var is set. */
         enum { FAKE_CLICK_MAX = 8 };
-        f64 fc_x[FAKE_CLICK_MAX], fc_y[FAKE_CLICK_MAX];
+        f64 fc_x[FAKE_CLICK_MAX], fc_y[FAKE_CLICK_MAX], fc_t[FAKE_CLICK_MAX];
         int fc_n = 0, fc_next = 0;
         {
                 const char *spec = getenv("REV_FAKE_CLICK");
@@ -591,6 +630,14 @@ int main(int argc, char **argv)
                                 p = end;
                                 fc_x[fc_n] = x;
                                 fc_y[fc_n] = y;
+                                fc_t[fc_n] = 0.3 + 0.2 * (f64)fc_n;   /* default cadence */
+                                if (*p == '@') {
+                                        double at = strtod(p + 1, &end);
+                                        if (end != p + 1) {
+                                                fc_t[fc_n] = at;
+                                                p = end;
+                                        }
+                                }
                                 fc_n++;
                                 if (*p != ';')
                                         break;
@@ -658,10 +705,11 @@ int main(int argc, char **argv)
                         }
                 }
 
-                /* synthetic clicks (test hook): fire at 0.3 s + 0.2 s spacing —
-                 * same entry point a real click takes (rtscene_click), at the
-                 * same device-pixel transform main.c applies to real clicks */
-                while (fc_next < fc_n && t >= 0.3 + 0.2 * (f64)fc_next) {
+                /* synthetic clicks (test hook): each fires at its own @t (default
+                 * 0.3 s + 0.2 s spacing) — same entry point a real click takes
+                 * (rtscene_click), at the same device-pixel transform main.c
+                 * applies to real clicks */
+                while (fc_next < fc_n && t >= fc_t[fc_next]) {
                         for (int i = 0; i < nmon; i++)
                                 rtscene_click(sf.sc, i,
                                               fc_x[fc_next] * (f64)fbs[i].w,

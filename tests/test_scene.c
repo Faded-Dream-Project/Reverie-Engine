@@ -621,6 +621,82 @@ int main(void)
 					      "repeated clicks land identically (d=%.1f,%.1f)",
 					      fabs(cx[0] - cx[1]), fabs(cy[0] - cy[1]));
 				}
+				/* ripple-lake regression #2 (2026-10, the "expanding glitch
+				 * + dead clicks" field report): the wave update was
+				 * ANTI-damped - the recurrence's smooth-mode pole sat at
+				 * 1 + sqrt(damping*0.05) ~ 1.06, so every click's energy
+				 * grew ~x38/s until the field hit inf/NaN (f32 ~27 s,
+				 * RGBA16F ~3 s). A NaN field refracts garbage and later
+				 * clicks do nothing (adding -2.4 to NaN stays NaN). The
+				 * corrected solver must (a) show live waves right after
+				 * the click, (b) return to an EXACT flat pass-through
+				 * once the water calms - a NaN field never recovers -
+				 * and (c) still splash when clicked again afterwards. */
+				{
+					const char *ctxt2 =
+						"scene {"
+						"  layer lake { type = gradient  shape = linear  angle = 0"
+						"                stops = [#101820, #f0e0c0] }"
+						"  layer water { type = ripple  strength = 3"
+						"                 radius = 0.06 }"
+						"}";
+					RTScene *scq = compile(ctxt2, err, sizeof err);
+					CHECK(scq != NULL, "recompile calm: %s", err);
+					if (scq) {
+						RFb fb = { calloc((size_t)W * H, 4), W, H };
+						rtscene_render(scq, &fb, 0, 0.0, 1.0 / 30.0);
+						u32 *base = malloc((size_t)W * H * 4);
+						memcpy(base, fb.px, (size_t)W * H * 4);
+						rtscene_pointer(scq, 0, W * 0.5, H * 0.5, 0, 0, false);
+						rtscene_click(scq, 0, W * 0.5, H * 0.5);
+						/* (a) waves alive 0.3 s after the click */
+						for (int i = 0; i < 10; i++)
+							rtscene_render(scq, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+						long live = 0;
+						for (size_t i = 0; i < (size_t)W * H; i++)
+							if (fb.px[i] != base[i])
+								live++;
+						CHECK(live > 60, "waves visible 0.3 s after click (%ld px)", live);
+						/* (b) ...then the water calms back to the
+						 * EXACT flat frame (measured: quiescent by
+						 * render ~114 on this 64x48 grid; 300 gives
+						 * 2.6x margin) */
+						for (int i = 10; i < 300; i++)
+							rtscene_render(scq, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+						long diff = 0;
+						for (size_t i = 0; i < (size_t)W * H; i++)
+							if (fb.px[i] != base[i])
+								diff++;
+						CHECK(diff == 0,
+							      "calm lake is an exact pass-through (%ld px differ)",
+							      diff);
+						/* (c) a click AFTER the field fully calms
+						 * must still splash, on target */
+						rtscene_click(scq, 0, W * 0.4, H * 0.6);
+						for (int i = 0; i < 6; i++)
+							rtscene_render(scq, &fb, 0,
+								       10.0 + (i + 1) / 30.0, 1.0 / 30.0);
+						long n2 = 0;
+						double sx = 0, sy = 0;
+						for (u32 y = 0; y < H; y++)
+							for (u32 x = 0; x < W; x++) {
+								size_t i = (size_t)y * W + x;
+								if (fb.px[i] != base[i]) {
+									n2++;
+									sx += x;
+									sy += y;
+								}
+							}
+						CHECK(n2 > 60, "click after calm still splashes (%ld px)", n2);
+						CHECK(n2 && fabs(sx / n2 - W * 0.4) <= W * 0.15 &&
+							      fabs(sy / n2 - H * 0.6) <= H * 0.15,
+							      "post-calm splash lands on target (%.1f,%.1f)",
+							      n2 ? sx / n2 : -1, n2 ? sy / n2 : -1);
+						free(base);
+						free(fb.px);
+						rtscene_free(scq);
+					}
+				}
 			}
 		}
 	}

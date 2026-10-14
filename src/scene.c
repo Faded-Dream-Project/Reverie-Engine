@@ -1063,18 +1063,30 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         ripple_click(in->ripple, click_x[c], click_y[c]);
                                 f64 ms = rev_monotonic();
                                 ripple_step(in->ripple, dt);
-                                if (!below_snap)
-                                        below_snap = (u32 *)malloc((size_t)fb->w * fb->h * 4);
-                                if (below_snap) {
-                                        memcpy(below_snap, fb->px, (size_t)fb->w * fb->h * 4);
-                                        if (!scratch.px || scratch.w != fb->w || scratch.h != fb->h) {
-                                                free(scratch.px);
-                                                scratch.px = (u32 *)malloc((size_t)fb->w * fb->h * 4);
-                                                scratch.w = fb->w;
-                                                scratch.h = fb->h;
+                                /* Calm water is an EXACT pass-through (a
+                                 * fully quiescent field returns the below
+                                 * composite unchanged), so the snapshot +
+                                 * full-screen refraction can be skipped —
+                                 * the CPU/Vulkan tiers' idle cost drops
+                                 * from ~13 ms to ~0 at 1080p. Non-normal
+                                 * blend modes still alter flat water
+                                 * (screen(X, X) != X), so they keep the
+                                 * full path. */
+                                if (ripple_active(in->ripple) ||
+                                    L->blend != REV_BLEND_NORMAL) {
+                                        if (!below_snap)
+                                                below_snap = (u32 *)malloc((size_t)fb->w * fb->h * 4);
+                                        if (below_snap) {
+                                                memcpy(below_snap, fb->px, (size_t)fb->w * fb->h * 4);
+                                                if (!scratch.px || scratch.w != fb->w || scratch.h != fb->h) {
+                                                        free(scratch.px);
+                                                        scratch.px = (u32 *)malloc((size_t)fb->w * fb->h * 4);
+                                                        scratch.w = fb->w;
+                                                        scratch.h = fb->h;
+                                                }
+                                                ripple_apply(in->ripple, below_snap, scratch.px);
+                                                srcfb = &scratch;
                                         }
-                                        ripple_apply(in->ripple, below_snap, scratch.px);
-                                        srcfb = &scratch;
                                 }
                                 sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
                         }

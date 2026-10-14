@@ -188,6 +188,39 @@ else
     echo "    ripple(click,corner): SKIP (no libEGL / GL vendor on this system)"
     SKIP=$((SKIP+1))
 fi
+# click AFTER the water fully calms (the 2026-10 "dead clicks" report): the
+# old wave update was anti-damped — one click grew until the field hit
+# inf/NaN, the screen glitched, and every later click was swallowed. Fire a
+# center click, let the lake fully calm (~19 s at this 640x400 grid), then
+# click again at a different spot: the second splash must land on target.
+# REV_FAKE_CLICK's @t syntax fires each click at its own timestamp.
+for TIER in cpu opengl; do
+    if [ "$TIER" = opengl ]; then
+        TIENV="$GPU_ENV REV_GL_FLUID_SW=1"
+    else
+        TIENV="$GPU_ENV"
+    fi
+    DISPLAY="$XDISPLAY" env $TIENV REV_FAKE_CLICK="0.5,0.5@0.5;0.3,0.7@19" timeout 45 \
+        ./build/reverie -R $TIER --shot 19.5 "$OUT/rc-late-$TIER" themes/ripple-lake \
+        > "$OUT/rc-late-$TIER.log" 2>&1 || true
+    OK=1
+    [ -f "$OUT/rc-base.png" ] && [ -f "$OUT/rc-late-$TIER.png" ] || OK=0
+    if [ "$TIER" = opengl ] && ! grep -q "simulations: GPU" "$OUT/rc-late-$TIER.log" 2>/dev/null; then
+        OK=0
+    fi
+    if [ $OK -eq 1 ]; then
+        if python3 scripts/click_cmp.py "$OUT/rc-base.png" "$OUT/rc-late-$TIER.png" 0.3 0.7 2>/dev/null; then
+            echo "    ripple(click-after-calm,$TIER): PASS (second splash lands on target)"
+            PASS=$((PASS+1))
+        else
+            echo "    ripple(click-after-calm,$TIER): FAIL (second click dead or misplaced)"
+            FAIL=$((FAIL+1))
+        fi
+    else
+        echo "    ripple(click-after-calm,$TIER): SKIP (no screenshots / no GL vendor)"
+        SKIP=$((SKIP+1))
+    fi
+done
 stop_xvfb
 
 # ---- Themes: folder + packed + hostile rejection -----------------------------

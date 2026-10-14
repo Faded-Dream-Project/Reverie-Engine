@@ -578,14 +578,19 @@ static const char *FS_RIPPLE_SPLAT =
         "    fragColor = vec4(h, f.g, 0.0, 1.0);\n"
         "}\n";
 
-/* Pure wave-equation update pass. Border texels stay untouched, matching
- * the CPU's 1..gw-2 loop bounds. */
+/* Pure wave-equation update pass — mirrors ripple_step()'s STABLE
+ * damped form (see ripple.c's header for the full story: the old
+ * -(1-d)*prev formulation was ANTI-damped — pole at 1+sqrt(d) — and
+ * blew the field up to inf/NaN ~3 s after any click on RGBA16F).
+ * Border texels stay untouched, matching the CPU's 1..gw-2 loop bounds.
+ * Every constant matches ripple.c exactly (C2, dv, ga, band, edge, fade,
+ * snap) so CPU and GPU fields stay in parity. */
 static const char *FS_RIPPLE_STEP =
         "#version 300 es\n"
         "precision highp float;\n"
         "uniform sampler2D u_field;\n"
         "uniform vec2 u_grid;\n"           /* gw, gh                      */
-        "uniform float u_damp;\n"          /* (1 - damping * 0.05)       */
+        "uniform float u_damp;\n"          /* dv = damping * 0.05        */
         "in vec2 v_uvsrc;\n"
         "in vec2 v_screen;\n"
         "out vec4 fragColor;\n"
@@ -604,7 +609,21 @@ static const char *FS_RIPPLE_STEP =
         "    float hu = texture(u_field, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).r;\n"
         "    float hd = texture(u_field, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).r;\n"
         "    float lap = hl + hr + hu + hd - 4.0 * h;\n"
-        "    float nh = 2.0 * h + 0.24 * lap - f.g * u_damp;\n"
+        /* stable damped wave: nh = 2h - prev + c2*lap - dv*(h - prev)
+ *      * - ga*h (ga drains the DC/level mode velocity damping leaves) */
+        "    float nh = 2.0 * h - f.g + 0.24 * lap - u_damp * (h - f.g)\n"
+        "              - 0.0025 * h;\n"
+        /* absorbing border band: attx/atty tapers (band 24 cells, edge
+ *      * 0.30) — wave energy dies at the screen edges */
+        "    vec2 idx = floor(texel);\n"
+        "    vec2 dist = min(idx, u_grid - 1.0 - idx);\n"
+        "    vec2 band = clamp(dist / 24.0, 0.0, 1.0);\n"
+        "    vec2 att = 1.0 - 0.30 * (1.0 - band);\n"
+        "    nh *= att.x * att.y;\n"
+        /* sub-visible fade + momentum-gated snap (mirrors ripple.c) */
+        "    if (abs(nh) < 0.08) nh *= 0.94;\n"
+        "    if (abs(nh) < 2.0e-4 && abs(h) < 2.0e-4 && abs(f.g) < 2.0e-4)\n"
+        "        nh = 0.0;\n"
         "    fragColor = vec4(nh, h, 0.0, 1.0);\n"   /* new cur; old cur = prev */
         "}\n";
 
@@ -1561,7 +1580,7 @@ static GLuint_ gl_ripple_step(RenderGL *r, GLRipple *rp, const RSimRipple *sd)
                 g->glUseProgram(r->prog[pi]);
                 g->glUniform2f(r->ru[pi].grid, (float)rp->gw, (float)rp->gh);
                 g->glUniform1f(r->ru[pi].damp,
-                               (float)(1.0 - damping * 0.05));
+                               (float)(damping * 0.05));
                 g->glActiveTexture(GL_TEXTURE0);
                 g->glBindTexture(GL_TEXTURE_2D, rp->field[rp->cur]);
                 RTarget t = { rp->field[rp->cur ^ 1], rp->fbo[rp->cur ^ 1],

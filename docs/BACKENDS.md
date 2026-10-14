@@ -116,6 +116,22 @@ selects.
   renderer on lavapipe. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or
   present is reported explicitly and stops presenting; OUT_OF_DATE at
   present recreates the swapchain.
+* **CPU cost, stated honestly (2026-10):** because this tier composites on
+  the CPU, one core does the frame work — that is the tier's design, not a
+  bug. What WAS a bug: on `themes/ripple-lake` the anti-damped wave solver
+  (see the second ripple postmortem below) kept the whole height field
+  energized forever, so after the first click the refraction pass never
+  returned to its flat-water fast path — the reporter measured sim time
+  climbing 13.3 → 36.0 ms/frame and a permanently pegged core. With the
+  corrected solver the lake calms to an exact zero field (~15–20 s after a
+  click at 1080p), the ripple layer becomes a true pass-through, and the
+  idle tier costs only composite + upload (measured: sim 0.0 ms, frame
+  p50 = refresh interval). While waves are actively rolling the CPU tier
+  still pays full-screen refraction (~16–28 ms at 1080p for the ~20 s the
+  waves are visible) — that is physics, not a leak; users who want zero
+  per-pixel CPU work should run `-R opengl` (GPU sims + compositing).
+  Making the Vulkan tier itself render on the GPU (compute pipelines) is
+  documented future work.
 
 ### tier 2 — opengl (GPU compositing)
 
@@ -183,12 +199,60 @@ selects.
 | `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |
 | `REV_FAKE_POINTER`  | TEST/BENCH: `<speed>` = synthesize a pressed pointer on a Lissajous path (circuits/s) so interactive scenes benchmark headlessly. Never set by users |
-| `REV_FAKE_CLICK`    | TEST: `"x,y[;x,y ...]"` = synthesize clicks at normalized positions (0.3 s + 0.2 s spacing) so click-driven interaction (ripple splashes) is regression-testable headlessly. Never set by users |
+| `REV_FAKE_CLICK`    | TEST: `"x,y[@t][;x,y@t ...]"` = synthesize clicks at normalized positions, each at its own @t seconds (default 0.3 s + 0.2 s spacing) so click-driven interaction (ripple splashes, click-after-calm) is regression-testable headlessly. Never set by users |
 | `REV_GL_FLUID_SW`   | TEST: force the GPU sim/point/gradient paths on software GL for regression coverage |
 | `REV_RIPPLE_DUMP`   | TEST: `"call,call,..."` = read the GPU ripple height field back at those step-call indices and log statistics (placement debugging) |
 
 ## Troubleshooting
 
+* **Ripple lake: the splash expands, glitches once it reaches the screen
+  edges, and later clicks do nothing (2026-10 postmortem, the sequel)** —
+  field report: "the ripple effect works but after clicking it expands
+  until it reaches the sides of the screen and starts glitching, and
+  clicking again after it fully expanded does nothing" (GTX 1050 Ti, GL
+  tier; the Vulkan tier showed the same physics plus a climbing sim time,
+  13.3 → 36.0 ms/frame, pinning one core). Root cause — the wave update
+  itself was ANTI-damped. Both solvers computed
+  `nh = 2h + 0.24·lap − prev·(1 − damping·0.05)`; for smooth modes that
+  recurrence, `z² − 2z + (1−δ)`, has a pole at `z = 1 + √δ ≈ 1.063`
+  (δ = 0.08·0.05 for this theme): every click's broad displacement
+  component grew ~×38/second. Proven numerically with the engine's own
+  solver in isolation (512² grid, one click): peak 2.39 → inf at t = 27 s
+  on f32; on the GL tier's RGBA16F targets the 65504 overflow arrives
+  ~3 s in — matching the report's timeline. After overflow the field is
+  NaN: the refraction composite samples garbage ("glitching") and every
+  later click adds −2.4 to NaN ("nothing happens"). The same runaway kept
+  every grid cell above the flat-water fast path forever, which is the
+  Vulkan/CPU core-pinning measurement above. Fix — the stable damped form
+  `nh = 2h − prev + 0.24·lap − dv·(h − prev) − ga·h` (all poles on/inside
+  the unit circle; `ga` drains the DC/level mode velocity damping alone
+  leaves), an absorbing border band (24 cells, taper to 0.70 — waves die
+  at the screen edges instead of sloshing), a sub-visible fade (×0.94
+  under height 0.08), a momentum-gated snap-to-zero, and a quiescence
+  tracker so a calm lake is skipped entirely. Three sub-bugs found while
+  tuning, all now pinned by tests: (1) a large snap deadzone (1e-2)
+  deleted the small radiated halo around decaying clusters and the
+  truncated cores sustained themselves as wandering ~0.04 limit cycles;
+  (2) even a tiny deadzone catapulted — zeroing a trough while `prev`
+  still carried momentum regenerated (0, −5.6e-4) → +5.2e-4 → +7.5e-4 —
+  a self-recharging ~780-cell micro-ecology at 7e-4 amplitude (fixed by
+  gating the snap on BOTH buffers being at the floor); (3)
+  velocity-only damping leaves a permanent invisible ~0.05 "water level"
+  offset (the DC pole sits at exactly z = 1). Measured after the fix: one
+  click peaks at 2.4× its amplitude, stays visibly alive ~10–14 s, and the
+  field is EXACTLY zero everywhere by ~17 s (no NaN is ever reachable);
+  the idle CPU tier reports sim = 0.0 ms. Verified by: a standalone
+  reproduction harness (before: ×38/s growth to inf; after: bounded,
+  quiescent), new unit checks (waves visible → exact pass-through when
+  calm → click-after-calm still splashes on target), new e2e tests
+  `ripple(click-after-calm,cpu/opengl)` firing a click at t = 19 s after
+  the first (both PASS, GPU/CPU centroids within 1 px), all existing
+  click-placement/parity tests, and ASan/UBSan daemon smokes on the CPU
+  and Vulkan tiers. The GL shader mirrors the CPU constants exactly
+  (dv, ga, band, edge, fade, snap) so parity holds.
+  Found along the way: the explicit-renderer failure path (e.g.
+  `-R vulkan` with no ICD) leaked the framebuffers + scene/theme (4 MB
+  per attempt, ASan) — now a full cleanup like the no-window path.
 * **Ripple-lake clicks made a weak displaced smear instead of a wave
   (2026-10 postmortem)** — field report: after one click on
   `themes/ripple-lake` (Wayland, GTX 1050 Ti, GL tier with GPU sims), the
