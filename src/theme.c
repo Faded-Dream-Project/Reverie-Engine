@@ -369,6 +369,10 @@ u8 *theme_asset(RTheme *th, const char *rel, size_t *len)
         th->cache[th->ncache].data = data;
         th->cache[th->ncache].len = flen;
         th->cache_bytes += flen;
+        th->ncache++;    /* 2026-10: the entry was written but the count never
+                          * moved — the cache could never hit (every lookup
+                          * re-read the file and overwrote slot 0, leaking the
+                          * previous entry) and theme_free freed nothing */
         if (len)
                 *len = flen;
         return data;

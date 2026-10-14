@@ -1,0 +1,32 @@
+/* Reverie Engine — "Animated Gradients"
+   A pure animated-gradient showcase: no images, no sims — the layers
+   exercise exactly the code paths that differ most between the CPU
+   rasterization (per-frame LUT rebuild) and the GPU shader evaluation
+   (fullscreen pass, cached upload). */
+
+scene "Animated Gradients" {
+    fps = 60
+
+    layer aurora {
+        type = gradient
+        shape = linear
+        angle = 20
+        stops = [#06121f, (#0e3a53 0.4), (#276b6e 0.7), (#66c7a4 1.0)]
+        anim angle { from = 0; to = 360; dur = 30s; ease = sine; mode = loop }
+    }
+
+    layer glow {
+        type = gradient
+        shape = radial
+        stops = [(#ff9e64 0.0), (#c2586e 0.5), (#00000000 1.0)]
+        anim opacity { from = 0.75; to = 0.45; dur = 8s; mode = pingpong }
+    }
+
+    layer veil {
+        type = gradient
+        shape = linear
+        angle = 90
+        stops = [#00000000, (#00000030 0.6), (#00000060 1.0)]
+        anim angle { from = 70; to = 110; dur = 12s; mode = pingpong }
+    }
+}

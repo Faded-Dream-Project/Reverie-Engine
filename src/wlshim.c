@@ -200,6 +200,8 @@ static struct {
         bool pvalid, ppressed, plasted;
         bool press_edge, release_edge, click, click_pending;
         f64 click_x, click_y;
+        f64 click_q[4][2];   /* latched clicks between reads (oldest first) */
+        u32 click_qn;
         u32 clicks;
         int ptr_win;
         u32 seat_caps;
@@ -375,6 +377,21 @@ static void on_ptr_button(void *data, wl_proxy_ *ptr, u32 serial, u32 time, u32 
                 if (S.click_pending) {
                         S.click = true;
                         S.clicks++;
+                        /* latch position into the queue: each completed
+                         * press+release keeps its own spot (a same-poll
+                         * double-click used to collapse onto the last one) */
+                        if (S.click_qn < 4) {
+                                S.click_q[S.click_qn][0] = S.click_x;
+                                S.click_q[S.click_qn][1] = S.click_y;
+                                S.click_qn++;
+                        } else {
+                                for (u32 c = 0; c < 3; c++) {
+                                        S.click_q[c][0] = S.click_q[c + 1][0];
+                                        S.click_q[c][1] = S.click_q[c + 1][1];
+                                }
+                                S.click_q[3][0] = S.click_x;
+                                S.click_q[3][1] = S.click_y;
+                        }
                 }
                 S.click_pending = false;
         }
@@ -1136,6 +1153,11 @@ bool wlshim_pointer(RPointerState *out)
         out->click = S.click;
         out->click_x = S.click_x;
         out->click_y = S.click_y;
+        out->click_qn = S.click_qn;
+        for (u32 c = 0; c < S.click_qn && c < 4; c++) {
+                out->click_q[c][0] = S.click_q[c][0];
+                out->click_q[c][1] = S.click_q[c][1];
+        }
         out->clicks = S.clicks;
         /* consume-on-read — deltas/edges are delivered exactly once */
         S.pdx = 0;
@@ -1143,6 +1165,7 @@ bool wlshim_pointer(RPointerState *out)
         S.press_edge = false;
         S.release_edge = false;
         S.click = false;
+        S.click_qn = 0;
         return true;
 }
 

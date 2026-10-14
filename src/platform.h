@@ -32,7 +32,15 @@ typedef struct {
         bool click;          /* full press+release since last read    */
         f64 x, y;       /* global coordinates                        */
         f64 dx, dy;      /* accumulated delta since last read         */
-        f64 click_x, click_y;  /* position where the click started      */
+        f64 click_x, click_y;  /* position of the FIRST latched click */
+        /* Latched click QUEUE (2026-10): two full press+release pairs can
+         * land between two polls (fast double-click on a slow frame); a
+         * single (click_x, click_y) collapsed them into N splashes at the
+         * LAST position. Each latched click keeps its own position here;
+         * consumers should walk click_q[0..click_qn). click/click_x/click_y
+         * stay as the "first click" compat view. */
+        f64 click_q[4][2];   /* up to 4 latched clicks, oldest first   */
+        u32 click_qn;        /* 0..4 latched since last read            */
         u32 clicks;     /* total click count (monotonic, for stats)  */
 } RPointerState;
 

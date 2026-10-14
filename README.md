@@ -24,30 +24,50 @@ loaded without extraction — byte-identical renders either way.
  ~ $ reverie scenes/mountain-dusk.rev
  [info] reverie 0.2.0-dev — backend=auto renderer=auto
  [info] backend: x11
- [info] renderer: vulkan (tier 3, CPU compositing)
- [info] vulkan: GPU present capable (queue family 0); presenting via platform SHM path
+ [info] opengl: hardware renderer NVIDIA GeForce GTX 1050 Ti/PCIe/SSE2 (vendor: NVIDIA)
+ [info] opengl: fluid + ripple solvers on GPU (RGBA16F render targets)
+ [info] renderer: opengl (tier 2, GPU compositing) — NVIDIA GeForce GTX 1050 Ti/PCIe/SSE2 [hardware]
         ... and your desktop is alive.
 ```
 
 ---
 
-## The renderer chain
+## The renderer policy
 
-Reverie probes, in order, and takes the first that works:
+**Explicit requests are honored exactly** — `--renderer vulkan|opengl|cpu`
+initializes that tier and nothing else; failure exits with the reason
+instead of silently substituting a different renderer. Software devices
+(lavapipe Vulkan, llvmpipe GL) are used when explicitly requested and
+reported as `SOFTWARE` in every log line.
+
+**Auto is deterministic** (2026-10 redesign — the old
+`vulkan → opengl → llvmpipe → cpu` cascade initialized a present-only
+Vulkan tier ahead of the actually-accelerated GL tier and, on fallback
+machines, booted an entire software GL stack to avoid the native CPU
+renderer):
 
 ```
- vulkan ──► opengl ──► opengl-on-llvmpipe ──► reverie's own CPU engine
+ hardware opengl ──► reverie's own CPU engine
+        (llvmpipe and the present-only vulkan tier are opt-in:
+         REV_AUTO_GL_SW=1 / REV_AUTO_VK=1 — measured rationale in
+         docs/BACKENDS.md: neither software path is uniformly faster)
 ```
 
-* **vulkan** — the engine composites on CPU and presents via the GPU: the
-  frame is uploaded once to a host-visible staging buffer and copied into
-  the swapchain image with image barriers. Driven by `dlopen("libvulkan.so.1")`
-  plus a hand-vendored set of declarations verified against the official
-  Khronos headers. No Vulkan SDK is needed to build or run.
+* **vulkan** — PRESENT-ONLY today: the engine composites on CPU and the GPU
+  receives finished frames — uploaded to a host-visible staging buffer and
+  copied into the swapchain image with image barriers. Driven by
+  `dlopen("libvulkan.so.1")` plus a hand-vendored set of declarations
+  verified against the official Khronos headers. No Vulkan SDK is needed
+  to build or run. Device selection enumerates every physical device and
+  picks by hardware class (discrete > integrated > virtual > CPU), logging
+  the selected device name/type/driver and an honest hardware/software
+  verdict — initialization success is never conflated with acceleration.
   Since 0.1.1 the swapchain present is opt-in (`REV_VK_PRESENT=wsi`): the
   default presents through the platform's proven path (MIT-SHM / wl_shm)
   after field reports of driver-specific XWayland black screens with no
-  error output. Both paths are E2E-tested and pixel-exact.
+  error output. Both paths are E2E-tested and pixel-exact. Because this
+  tier does no GPU rendering, `auto` does not select it (opt in with
+  `REV_AUTO_VK=1`).
 * **opengl** — full GPU compositing **and GPU simulation**: layers are
   uploaded as textures (static rasters only re-upload when their content
   actually changes), blurred with a downsample + separable gaussian
@@ -183,6 +203,27 @@ folders + packed themes), and docs/VIDEO.md (video architecture).
 No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
+
+* **Renderer selection repaired (2026-10).** Auto no longer probes the
+  present-only Vulkan tier ahead of the actually-accelerated GL tier (on
+  the reporter's NVIDIA machine, plain `reverie <scene>` used to pick
+  Vulkan and composite on the CPU at ~6 fps until `--renderer opengl`
+  was forced by hand). Explicit requests never fall back silently;
+  hardware vs software is detected and reported per device (Vulkan
+  physical-device properties: name, type, driver — discrete preferred
+  over lavapipe), and software GL/Vulkan initialize only when explicitly
+  requested (or opted into for auto) with measured justification in
+  docs/BACKENDS.md.
+* **The ripple-lake click bug fixed (2026-10).** Clicks on the GPU ripple
+  solver launched at ~1/5 strength and never propagated — the shader's
+  Laplacian mixed injected and un-injected heights, cancelling the wave
+  launch. Now a splat pass injects before the wave passes (matching the
+  CPU solver's order); clicks produce expanding rings centered on the
+  pointer with e2e click-placement tests pinning it. Same investigation
+  fixed a same-frame double-click collapsing onto one position, a
+  black-screen path when a ripple scene fell back to CPU compositing on
+  the GL tier, and honest GPU timer-query detection (a functional probe
+  must pass before "available" is logged).
 
 * **GPU-first rendering, everywhere it belongs.** The maintainer's
   direction after the 1050 Ti field report (fluid-aurora at 57-59 fps —

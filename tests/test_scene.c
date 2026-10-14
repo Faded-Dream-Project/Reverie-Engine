@@ -477,6 +477,151 @@ int main(void)
 				free(fb.px);
 				rtscene_free(sc2);
 			}
+
+			/* ripple-lake regression (2026-10): the GPU ripple solver computed its
+			 * Laplacian from UN-injected neighbors while subtracting 4x the
+			 * INJECTED center height, cancelling the wave launch (nh ~= 1.04h
+			 * instead of 2h) — clicks produced a weak static smear instead of an
+			 * expanding ring. These checks pin the CPU solver's click PLACEMENT
+			 * (the GPU path is verified against this by scripts/e2e.sh's click
+			 * tests): center, all four corners, multiple simultaneous clicks,
+			 * and repeated interactions without cumulative drift. */
+			{
+				/* a NON-uniform background (linear gradient) — on a flat color a
+				 * click is only visible through the upper-left specular glint,
+				 * whose centroid is intentionally biased toward the light; with
+				 * texture the centered refraction dominates, like the real theme */
+				const char *ctxt =
+					"scene {"
+					"  layer lake { type = gradient  shape = linear  angle = 0"
+					"                stops = [#101820, #f0e0c0] }"
+					"  layer water { type = ripple  strength = 3"
+					"                 radius = 0.06 }"
+					"}";
+				struct ClickProbe {
+					double x, y;      /* click position, normalized */
+					const char *name;
+				} probes[] = {
+					{ 0.50, 0.50, "center" },
+					{ 0.15, 0.15, "top-left corner" },
+					{ 0.85, 0.15, "top-right corner" },
+					{ 0.15, 0.85, "bottom-left corner" },
+					{ 0.85, 0.85, "bottom-right corner" },
+				};
+				for (unsigned pi = 0; pi < sizeof probes / sizeof probes[0]; pi++) {
+					RTScene *scp = compile(ctxt, err, sizeof err);
+					CHECK(scp != NULL, "recompile %s: %s", probes[pi].name, err);
+					if (!scp)
+						continue;
+					RFb fb = { calloc((size_t)W * H, 4), W, H };
+					rtscene_render(scp, &fb, 0, 0.0, 1.0 / 30.0);   /* flat water */
+					u32 *base = malloc((size_t)W * H * 4);
+					memcpy(base, fb.px, (size_t)W * H * 4);
+					/* clicks are consumed only when pointer state exists (render_core
+					 * gates on ptr[mon].seen — main.c provides it every frame) */
+					rtscene_pointer(scp, 0, W * 0.5, H * 0.5, 0, 0, false);
+					rtscene_click(scp, 0, probes[pi].x * W, probes[pi].y * H);
+					for (int i = 0; i < 6; i++)
+						rtscene_render(scp, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+					long n = 0;
+					double sx = 0, sy = 0;
+					for (u32 y = 0; y < H; y++)
+						for (u32 x = 0; x < W; x++) {
+							size_t i = (size_t)y * W + x;
+							if (fb.px[i] != base[i]) {
+								n++;
+								sx += x;
+								sy += y;
+							}
+						}
+					double cx = n ? sx / n : -1, cy = n ? sy / n : -1;
+					CHECK(n > 60, "%s click changes >=60 px (got %ld)",
+					      probes[pi].name, n);
+					CHECK(fabs(cx - probes[pi].x * W) <= W * 0.15 &&
+					      fabs(cy - probes[pi].y * H) <= H * 0.15,
+					      "%s click centroid on target (got %.1f,%.1f want %.1f,%.1f)",
+					      probes[pi].name, cx, cy,
+					      probes[pi].x * W, probes[pi].y * H);
+					free(base);
+					free(fb.px);
+					rtscene_free(scp);
+				}
+
+				/* multiple clicks in one frame: two splashes, each side of the
+				 * frame keeps its own energy */
+				{
+					RTScene *scm = compile(ctxt, err, sizeof err);
+					CHECK(scm != NULL, "recompile multi-click: %s", err);
+					if (scm) {
+						RFb fb = { calloc((size_t)W * H, 4), W, H };
+						rtscene_render(scm, &fb, 0, 0.0, 1.0 / 30.0);
+						u32 *base = malloc((size_t)W * H * 4);
+						memcpy(base, fb.px, (size_t)W * H * 4);
+						rtscene_pointer(scm, 0, W * 0.5, H * 0.5, 0, 0, false);
+						rtscene_click(scm, 0, W * 0.25, H * 0.5);
+						rtscene_click(scm, 0, W * 0.75, H * 0.5);
+						for (int i = 0; i < 6; i++)
+							rtscene_render(scm, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+						long left = 0, right = 0;
+						for (size_t i = 0; i < (size_t)W * H; i++)
+							if (fb.px[i] != base[i]) {
+								if (i % W < W / 2)
+									left++;
+								else
+									right++;
+							}
+						CHECK(left > 40 && right > 40,
+						      "two clicks splash on both sides (L=%ld R=%ld)",
+						      left, right);
+						free(base);
+						free(fb.px);
+						rtscene_free(scm);
+					}
+				}
+
+				/* repeated interactions must not drift: render the SAME click
+				 * twice on fresh scenes and require the two disturbance
+				 * centroids to agree closely */
+				{
+					double cx[2], cy[2];
+					for (int rep = 0; rep < 2; rep++) {
+						RTScene *scd = compile(ctxt, err, sizeof err);
+						CHECK(scd != NULL, "recompile drift %d: %s", rep, err);
+						cx[rep] = cy[rep] = -1;
+						if (scd) {
+							RFb fb = { calloc((size_t)W * H, 4), W, H };
+							rtscene_render(scd, &fb, 0, 0.0, 1.0 / 30.0);
+							u32 *base = malloc((size_t)W * H * 4);
+							memcpy(base, fb.px, (size_t)W * H * 4);
+							rtscene_pointer(scd, 0, W * 0.5, H * 0.5, 0, 0, false);
+							rtscene_click(scd, 0, W * 0.6, H * 0.4);
+							for (int i = 0; i < 6; i++)
+								rtscene_render(scd, &fb, 0, (i + 1) / 30.0, 1.0 / 30.0);
+							long n = 0;
+							double sx = 0, sy = 0;
+							for (u32 y = 0; y < H; y++)
+								for (u32 x = 0; x < W; x++) {
+									size_t i = (size_t)y * W + x;
+									if (fb.px[i] != base[i]) {
+										n++;
+										sx += x;
+										sy += y;
+									}
+								}
+							if (n) {
+								cx[rep] = sx / n;
+								cy[rep] = sy / n;
+							}
+							free(base);
+							free(fb.px);
+							rtscene_free(scd);
+						}
+					}
+					CHECK(fabs(cx[0] - cx[1]) <= 3.0 && fabs(cy[0] - cy[1]) <= 3.0,
+					      "repeated clicks land identically (d=%.1f,%.1f)",
+					      fabs(cx[0] - cx[1]), fabs(cy[0] - cy[1]));
+				}
+			}
 		}
 	}
 

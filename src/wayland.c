@@ -131,6 +131,8 @@ struct WLDisplay {
         bool pvalid, ppressed, plasted;
         bool press_edge, release_edge, click, click_pending;
         f64 click_x, click_y;
+        f64 click_q[4][2];   /* latched clicks between reads (oldest first) */
+        u32 click_qn;
         u32 clicks;
         int ptr_win;
 
@@ -544,6 +546,18 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                                 if (w->click_pending) {
                                         w->click = true;
                                         w->clicks++;
+                                        if (w->click_qn < 4) {
+                                                w->click_q[w->click_qn][0] = w->click_x;
+                                                w->click_q[w->click_qn][1] = w->click_y;
+                                                w->click_qn++;
+                                        } else {
+                                                for (u32 c = 0; c < 3; c++) {
+                                                        w->click_q[c][0] = w->click_q[c + 1][0];
+                                                        w->click_q[c][1] = w->click_q[c + 1][1];
+                                                }
+                                                w->click_q[3][0] = w->click_x;
+                                                w->click_q[3][1] = w->click_y;
+                                        }
                                 }
                                 w->click_pending = false;
                         }
@@ -1229,6 +1243,11 @@ bool wl_pointer(WLDisplay *w, RPointerState *out)
         out->click = w->click;
         out->click_x = w->click_x;
         out->click_y = w->click_y;
+        out->click_qn = w->click_qn;
+        for (u32 c = 0; c < w->click_qn && c < 4; c++) {
+                out->click_q[c][0] = w->click_q[c][0];
+                out->click_q[c][1] = w->click_q[c][1];
+        }
         out->clicks = w->clicks;
         if (!w->pvalid)
                 return false;
@@ -1239,6 +1258,7 @@ bool wl_pointer(WLDisplay *w, RPointerState *out)
         w->press_edge = false;
         w->release_edge = false;
         w->click = false;
+        w->click_qn = 0;
         return true;
 }
 

@@ -130,6 +130,7 @@ typedef unsigned long long GLuint64_;
 #define GL_TIME_ELAPSED_Q 0x88BF
 #define GL_QUERY_RESULT_Q 0x8866
 #define GL_QUERY_RESULT_AVAILABLE_Q 0x8867
+#define GL_EXTENSIONS_Q 0x1F03
 
 /* ---- GL function table --------------------------------------------------- */
 typedef struct {
@@ -187,6 +188,8 @@ typedef struct {
         void (*glBeginQueryQ)(GLenum_, GLuint_);
         void (*glEndQueryQ)(GLenum_);
         void (*glGetQueryObjectu64vQ)(GLuint_, GLenum_, GLuint64_ *);
+        void (*glDeleteQueriesQ)(GLsizei_, const GLuint_ *);
+        void (*glFinishQ)(void);
 } GL;
 
 #define LOADGL(fn, name) \
@@ -521,17 +524,26 @@ static const char *FS_FLUID_TONEMAP =
 
 /* ---- GPU ripple solver (GLSL ES 3.00) ------------------------------------
  * Mirrors ripple.c's wave equation: the height field lives in an RGBA16F
- * ping-pong pair (.r = current height, .g = previous height), one pass =
- * one CPU update step (new = 2h + c2*lap - prev*(1 - damping*0.05), with
- * the pointer drip and queued click impacts folded into the same pass —
- * exactly the order ripple_step() applies them). Border texels stay
- * untouched, matching the CPU's 1..gw-2 loop bounds. */
-static const char *FS_RIPPLE_STEP =
+ * ping-pong pair (.r = current height, .g = previous height). The pointer
+ * drip and queued click impacts are applied by a SEPARATE SPLAT PASS that
+ * writes them into the field FIRST — exactly the order ripple_step()
+ * applies them (ripple_click()/drip mutate cur, THEN the update loop runs).
+ *
+ * RIPPLE-LAKE BUG (2026-10): the old single-pass version folded the
+ * injections into the update pass as LOCAL variables while sampling the
+ * neighbors from the UN-injected texture, so the Laplacian mixed
+ * post-injection (center) with pre-injection (neighbors) values:
+ * for a click of depth d, lap = 0 - 4d = -4d, and
+ * nh = 2d + 0.24*(-4d) = 1.04d — the 2x launch cancelled, the wave never
+ * propagated, and the visible effect was a weak static blob (a diffusion
+ *-like smear with a displaced specular) instead of an expanding ring.
+ * Verified: probe measured nh = -2.484 for a -2.4 click; the fixed
+ * pipeline produces the CPU's -4.8. */
+static const char *FS_RIPPLE_SPLAT =
         "#version 300 es\n"
         "precision highp float;\n"
         "uniform sampler2D u_field;\n"
         "uniform vec2 u_grid;\n"           /* gw, gh                      */
-        "uniform float u_damp;\n"          /* (1 - damping * 0.05)       */
         "uniform vec2 u_ptr;\n"            /* pointer uv                 */
         "uniform float u_ptrRad;\n"        /* radius * gw, grid texels   */
         "uniform float u_ptrAmp;\n"        /* -strength                  */
@@ -548,14 +560,7 @@ static const char *FS_RIPPLE_STEP =
         "    return d2 <= 1.0 ? (1.0 - d2) : 0.0;\n"
         "}\n"
         "void main() {\n"
-        "    vec2 texel = v_uvsrc * u_grid;\n"
         "    vec4 f = texture(u_field, v_uvsrc);\n"
-        "    /* border: the CPU loops y/x in 1..gw-2 - edge cells never change */\n"
-        "    if (texel.x < 1.0 || texel.y < 1.0 ||\n"
-        "        texel.x > u_grid.x - 2.0 || texel.y > u_grid.y - 2.0) {\n"
-        "        fragColor = f;\n"
-        "        return;\n"
-        "    }\n"
         "    float h = f.r;\n"
         "    if (u_ptrOn == 1)\n"
         "        h += u_ptrAmp * splat(v_uvsrc, u_ptr, u_ptrRad);\n"
@@ -569,6 +574,31 @@ static const char *FS_RIPPLE_STEP =
         "            h += u_clickParam[i].y * t * t;\n"
         "        }\n"
         "    }\n"
+        "    /* .g (previous height) passes through untouched */\n"
+        "    fragColor = vec4(h, f.g, 0.0, 1.0);\n"
+        "}\n";
+
+/* Pure wave-equation update pass. Border texels stay untouched, matching
+ * the CPU's 1..gw-2 loop bounds. */
+static const char *FS_RIPPLE_STEP =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_field;\n"
+        "uniform vec2 u_grid;\n"           /* gw, gh                      */
+        "uniform float u_damp;\n"          /* (1 - damping * 0.05)       */
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 texel = v_uvsrc * u_grid;\n"
+        "    vec4 f = texture(u_field, v_uvsrc);\n"
+        "    /* border: the CPU loops y/x in 1..gw-2 - edge cells never change */\n"
+        "    if (texel.x < 1.0 || texel.y < 1.0 ||\n"
+        "        texel.x > u_grid.x - 2.0 || texel.y > u_grid.y - 2.0) {\n"
+        "        fragColor = f;\n"
+        "        return;\n"
+        "    }\n"
+        "    float h = f.r;\n"
         "    float hl = texture(u_field, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).r;\n"
         "    float hr = texture(u_field, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).r;\n"
         "    float hu = texture(u_field, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).r;\n"
@@ -774,8 +804,8 @@ static const char *FS_VIDEO =
 enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
        PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
        PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
-       PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_PARTICLES,
-       PROG_GRADIENT, PROG_VIDEO, PROG_COUNT };
+       PROG_F_TONEMAP, PROG_R_SPLAT, PROG_R_STEP, PROG_R_COMPOSITE,
+       PROG_PARTICLES, PROG_GRADIENT, PROG_VIDEO, PROG_COUNT };
 #define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
@@ -823,6 +853,8 @@ typedef struct {
         GLuint_ tex;
         u32 w, h;
 } TexSlot;
+
+#define TQ_RING 4
 
 typedef struct {
         void *lib;
@@ -954,9 +986,23 @@ typedef struct {
         f64 perf_upload_ms;
         f64 perf_gpu_ms_sum;
         u32 perf_gpu_samples;
+        /* GPU timer query state. tq_have: entry points AND a functional
+         * probe passed at init (a real begin/end/result cycle). tq[win]:
+         * a ring of TQ_RING query objects so each has several frames to
+         * land — re-arming a query whose result was never retrieved is a
+         * GL INVALID_OPERATION and (observed in the field) permanently
+         * stalls sample collection after a single missed poll. tq_pending:
+         * per-ring-slot "result not yet collected" flags; tq_misses counts
+         * consecutive frames where armed queries produced no result while
+         * symbols exist — after 600 such frames the diagnostics say so and
+         * timing is disabled instead of silently reporting 0. */
         bool tq_have;
-        GLuint_ tq[REV_PLATFORM_MAX_OUTPUTS];
-        bool tq_active[REV_PLATFORM_MAX_OUTPUTS];
+        bool tq_probe_fail;     /* symbols resolved, functional probe failed */
+        u32 tq_misses;
+        GLuint_ tq[REV_PLATFORM_MAX_OUTPUTS][4];
+        bool tq_pending[REV_PLATFORM_MAX_OUTPUTS][4];
+        int tq_next[REV_PLATFORM_MAX_OUTPUTS];
+        bool tq_armed_now[REV_PLATFORM_MAX_OUTPUTS];
 } RenderGL;
 
 /* ---- small helpers -------------------------------------------------------- */
@@ -1470,21 +1516,22 @@ static GLuint_ gl_ripple_step(RenderGL *r, GLRipple *rp, const RSimRipple *sd)
         const double radius = sd->radius < 0.002 ? 0.002 :
                               sd->radius > 0.1 ? 0.1 : sd->radius;
         /* ripple_step() runs (int)clamp(dt*60, 0.5, 2.0) iterations, with
-         * the pointer drip and click impacts applied once, before them */
+         * the pointer drip and click impacts applied once, before them.
+         * The splat pass mirrors that order: injections are written into
+         * the field FIRST (like ripple_click()/drip mutate cur in place),
+         * so every wave step sees a fully post-injection Laplacian. */
         int steps = (int)rev_clampf(dt * 60.0, 0.5, 2.0);
 
-        for (int s = 0; s < steps; s++) {
-                int pi = PROG_R_STEP;
+        if (sd->pressed || sd->nclicks > 0) {
+                int pi = PROG_R_SPLAT;
                 g->glUseProgram(r->prog[pi]);
                 g->glUniform2f(r->ru[pi].grid, (float)rp->gw, (float)rp->gh);
-                g->glUniform1f(r->ru[pi].damp,
-                               (float)(1.0 - damping * 0.05));
                 g->glUniform2f(r->ru[pi].ptr, (float)sd->px, (float)sd->py);
                 g->glUniform1f(r->ru[pi].ptrRad, (float)(radius * rp->gw));
                 g->glUniform1f(r->ru[pi].ptrAmp, (float)(-strength));
-                g->glUniform1i(r->ru[pi].ptrOn, (s == 0 && sd->pressed) ? 1 : 0);
-                g->glUniform1i(r->ru[pi].nclicks, s == 0 ? (int)sd->nclicks : 0);
-                if (s == 0 && sd->nclicks > 0) {
+                g->glUniform1i(r->ru[pi].ptrOn, sd->pressed ? 1 : 0);
+                g->glUniform1i(r->ru[pi].nclicks, (int)sd->nclicks);
+                if (sd->nclicks > 0) {
                         float cpos[8], cpar[8];
                         const double crad = rev_clampf(radius * 2.5, 0.004, 0.12) * rp->gw;
                         const double camp = -strength * 1.5;
@@ -1507,6 +1554,129 @@ static GLuint_ gl_ripple_step(RenderGL *r, GLRipple *rp, const RSimRipple *sd)
                               rp->gw, rp->gh };
                 pass_full(r, pi, &t);
                 rp->cur ^= 1;
+        }
+
+        for (int s = 0; s < steps; s++) {
+                int pi = PROG_R_STEP;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->ru[pi].grid, (float)rp->gw, (float)rp->gh);
+                g->glUniform1f(r->ru[pi].damp,
+                               (float)(1.0 - damping * 0.05));
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, rp->field[rp->cur]);
+                RTarget t = { rp->field[rp->cur ^ 1], rp->fbo[rp->cur ^ 1],
+                              rp->gw, rp->gh };
+                pass_full(r, pi, &t);
+                rp->cur ^= 1;
+        }
+
+        /* REV_RIPPLE_DUMP=<f1,f2,...>: debug hook — read the height field
+         * back (glReadPixels GL_HALF_FLOAT on the RGBA16F FBO) after the
+         * listed step-CALL numbers (comma list, counts from 1) and log
+         * statistics + a raw /tmp/ripple-field-<call>.f16 dump. The log line
+         * also reports the total step iterations executed so far. */
+        {
+                static int want[16];
+                static int nwant;
+                static int calls;
+                static u64 total_steps;
+                static bool parsed;
+                if (!parsed) {
+                        parsed = true;
+                        total_steps += (u64)steps;
+                        const char *spec = getenv("REV_RIPPLE_DUMP");
+                        if (spec && *spec) {
+                                const char *p = spec;
+                                while (nwant < 16) {
+                                        int v = atoi(p);
+                                        if (v <= 0)
+                                                break;
+                                        want[nwant++] = v;
+                                        const char *c = strchr(p, ',');
+                                        if (!c)
+                                                break;
+                                        p = c + 1;
+                                }
+                        }
+                } else {
+                        total_steps += (u64)steps;
+                }
+                calls++;
+                for (int k = 0; k < nwant; k++) {
+                        if (want[k] != calls)
+                                continue;
+                        u16 *buf = (u16 *)malloc((size_t)rp->gw * rp->gh * 4 * 2);
+                        if (!buf)
+                                break;
+#define F16_EXP(v) (((v) >> 10) & 0x1f)
+#define F16_MAN(v) ((v) & 0x3ff)
+                        g->glBindFramebuffer(GL_FRAMEBUFFER, rp->fbo[rp->cur]);
+                        g->glReadPixels(0, 0, (int)rp->gw, (int)rp->gh,
+                                        0x1908 /* GL_RGBA */, 0x140B /* GL_HALF_FLOAT */,
+                                        buf);
+                        long nz = 0;
+                        double sum = 0, sx = 0, sy = 0, vmin = 1e9, vmax = -1e9;
+                        double gmin = 1e9, gmax = -1e9, amin = 1e9, amax = -1e9;
+                        for (u32 y = 0; y < rp->gh; y++)
+                                for (u32 x = 0; x < rp->gw; x++) {
+                                        double h, gv, av;
+                                        {
+                                                u16 raw = buf[(size_t)(y * rp->gw + x) * 4];
+                                                int e = F16_EXP(raw), m = F16_MAN(raw);
+                                                h = (raw & 0x8000) ? -1.0 : 1.0;
+                                                if (e == 0) h *= m * 5.9604644775390625e-08;
+                                                else if (e == 31) h = m ? (0.0 / 0.0) : h * 1e9;
+                                                else h *= ldexp(1024.0 + m, e - 25);
+                                        }
+                                        {
+                                                u16 raw = buf[(size_t)(y * rp->gw + x) * 4 + 1];
+                                                int e = F16_EXP(raw), m = F16_MAN(raw);
+                                                gv = (raw & 0x8000) ? -1.0 : 1.0;
+                                                if (e == 0) gv *= m * 5.9604644775390625e-08;
+                                                else if (e == 31) gv = m ? (0.0 / 0.0) : gv * 1e9;
+                                                else gv *= ldexp(1024.0 + m, e - 25);
+                                        }
+                                        {
+                                                u16 raw = buf[(size_t)(y * rp->gw + x) * 4 + 3];
+                                                int e = F16_EXP(raw), m = F16_MAN(raw);
+                                                av = (raw & 0x8000) ? -1.0 : 1.0;
+                                                if (e == 0) av *= m * 5.9604644775390625e-08;
+                                                else if (e == 31) av = m ? (0.0 / 0.0) : av * 1e9;
+                                                else av *= ldexp(1024.0 + m, e - 25);
+                                        }
+                                        if (gv < gmin) gmin = gv;
+                                        if (gv > gmax) gmax = gv;
+                                        if (av < amin) amin = av;
+                                        if (av > amax) amax = av;
+                                        if (h < vmin) vmin = h;
+                                        if (h > vmax) vmax = h;
+                                        if (fabs(h) > 1e-4) {
+                                                nz++;
+                                                sum += h;
+                                                sx += x;
+                                                sy += y;
+                                        }
+                                }
+#undef F16_EXP
+#undef F16_MAN
+                        LOGI("ripple-dump[call %d, steps %llu]: %ux%d nz=%ld sum=%.3f "
+                             "min=%.3f max=%.3f gmin=%.3f gmax=%.3f amin=%.3f amax=%.3f%s",
+                             calls, (unsigned long long)total_steps,
+                             rp->gw, rp->gh, nz, sum, vmin, vmax, gmin, gmax,
+                             amin, amax, nz ? "" : " (flat)");
+                        if (nz)
+                                LOGI("ripple-dump: centroid=(%.1f, %.1f) texels",
+                                     sx / nz, sy / nz);
+                        char path[256];
+                        snprintf(path, sizeof path, "/tmp/ripple-field-%d.f16", calls);
+                        FILE *f = fopen(path, "wb");
+                        if (f) {
+                                fwrite(buf, 2, (size_t)rp->gw * rp->gh * 4, f);
+                                fclose(f);
+                        }
+                        free(buf);
+                        break;
+                }
         }
         return rp->field[rp->cur];
 }
@@ -1968,9 +2138,19 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         g->glDisable(0x0BE2 /* GL_BLEND */);
         r->gl_loaded = true;
 
-        /* GPU timer queries (EXT_disjoint_timer_query): EXT names first —
-         * they are the spec spellings on ES contexts — then the desktop
-         * plain names. Missing any -> GPU timings honestly unavailable. */
+        /* GPU timer queries (EXT_disjoint_timer_query). Detection order
+         * (all three must agree before timing is claimed):
+         *   1. the EXTENSION STRING on this context — symbols alone lie
+         *      (desktop drivers happily resolve core-GL spellings on ES
+         *      contexts that never produce results);
+         *   2. entry points: the ES spec name glGetQueryObjectui64vEXT
+         *      FIRST (the historical lookup used the desktop-flavored
+         *      glGetQueryObjectu64vEXT spelling, which resolved on some
+         *      drivers without ever yielding results), then the other
+         *      spellings in order;
+         *   3. a functional probe: begin/end a TIME_ELAPSED query, finish,
+         *      and actually retrieve a result. Only a passing probe earns
+         *      the "timer queries available" log line. */
         *(void **)&g->glGenQueriesQ = g->eglGetProcAddress("glGenQueriesEXT");
         if (!g->glGenQueriesQ)
                 *(void **)&g->glGenQueriesQ = g->eglGetProcAddress("glGenQueries");
@@ -1980,18 +2160,82 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         *(void **)&g->glEndQueryQ = g->eglGetProcAddress("glEndQueryEXT");
         if (!g->glEndQueryQ)
                 *(void **)&g->glEndQueryQ = g->eglGetProcAddress("glEndQuery");
-        *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64vEXT");
+        *(void **)&g->glDeleteQueriesQ = g->eglGetProcAddress("glDeleteQueriesEXT");
+        if (!g->glDeleteQueriesQ)
+                *(void **)&g->glDeleteQueriesQ = g->eglGetProcAddress("glDeleteQueries");
+        *(void **)&g->glFinishQ = g->eglGetProcAddress("glFinish");
+        *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectui64vEXT");
+        if (!g->glGetQueryObjectu64vQ)
+                *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64vEXT");
         if (!g->glGetQueryObjectu64vQ)
                 *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64v");
-        r->tq_have = g->glGenQueriesQ && g->glBeginQueryQ && g->glEndQueryQ &&
-                     g->glGetQueryObjectu64vQ;
+        if (!g->glGetQueryObjectu64vQ)
+                *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectui64v");
+        {
+                bool ext_ok = false;
+                const char *exts = (const char *)g->glGetString(GL_EXTENSIONS_Q);
+                if (exts && strstr(exts, "GL_EXT_disjoint_timer_query"))
+                        ext_ok = true;
+                r->tq_have = ext_ok && g->glGenQueriesQ && g->glBeginQueryQ &&
+                             g->glEndQueryQ && g->glGetQueryObjectu64vQ;
+                /* ES 3.0 contexts may also expose the desktop ARB_timer_query
+                 * lineage where the extension string differs — allow the
+                 * functional probe to decide when symbols all resolved. */
+                r->tq_probe_fail = false;
+                if (!r->tq_have && g->glGenQueriesQ && g->glBeginQueryQ &&
+                    g->glEndQueryQ && g->glGetQueryObjectu64vQ) {
+                        r->tq_have = true;    /* probe below decides for real */
+                        r->tq_probe_fail = true;
+                }
+        }
+        /* functional probe: a complete query lifecycle must return a result */
+        if (r->tq_have) {
+                GLuint_ q = 0;
+                g->glGenQueriesQ(1, &q);
+                bool ok = false;
+                if (q) {
+                        g->glBeginQueryQ(GL_TIME_ELAPSED_Q, q);
+                        g->glEndQueryQ(GL_TIME_ELAPSED_Q);
+                        if (g->glFinishQ)
+                                g->glFinishQ();
+                        GLuint64_ avail = 0, res = 0;
+                        /* bounded wait: a healthy driver answers immediately
+                         * after Finish; a broken one never does */
+                        for (int tries = 0; tries < 100 && !avail; tries++)
+                                g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_AVAILABLE_Q, &avail);
+                        if (avail) {
+                                g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_Q, &res);
+                                ok = true;    /* any value, even 0, is a result */
+                        }
+                        g->glDeleteQueriesQ(1, &q);
+                }
+                if (ok) {
+                        r->tq_probe_fail = false;
+                } else {
+                        r->tq_have = false;
+                }
+        }
 
         const char *rend = (const char *)g->glGetString(GL_RENDERER);
-        if (rend && (strstr(rend, "llvmpipe") || strstr(rend, "softpipe") || strstr(rend, "swrast"))) {
+        const char *vend = (const char *)g->glGetString(GL_VENDOR);
+        if (rend && (strstr(rend, "llvmpipe") || strstr(rend, "softpipe") ||
+                     strstr(rend, "swrast") || strstr(rend, "SwiftShader") ||
+                     strstr(rend, "Software Rasterizer"))) {
                 r->software = true;
-                LOGI("opengl: software rasterizer active (%s) — llvmpipe tier", rend);
+                rr->software = true;
+                LOGI("opengl: SOFTWARE rasterizer active (%s) — llvmpipe-tier; "
+                     "rendering will NOT be hardware accelerated", rend);
         } else {
-                LOGI("opengl: renderer %s", rend ? rend : "?");
+                LOGI("opengl: hardware renderer %s (vendor: %s)",
+                     rend ? rend : "?", (vend && vend[0]) ? vend : "unknown");
+        }
+        /* expose identity through the renderer API (selection + daemon log) */
+        {
+                const char *id = rend ? rend : "unknown GL renderer";
+                size_t n = (size_t)snprintf(rr->device_desc, sizeof rr->device_desc,
+                                            "%s", id);
+                if (n >= sizeof rr->device_desc)
+                        rr->device_desc[sizeof rr->device_desc - 1] = 0;
         }
         /* Timer queries are a hardware-GPU instrument. On software GL they
          * would merely duplicate the CPU wall clock — worse, polling
@@ -2001,8 +2245,13 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         if (r->software)
                 r->tq_have = false;
         if (r->tq_have)
-                LOGI("opengl: GPU timer queries available (REV_PROFILE reports "
-                     "async GPU timings)");
+                LOGI("opengl: GPU timer queries available (extension + entry "
+                     "points + functional probe) — REV_PROFILE reports async "
+                     "GPU timings");
+        else if (r->tq_probe_fail)
+                LOGW("opengl: GPU timer queries NOT available (entry points "
+                     "resolved but a begin/end/result probe produced no "
+                     "result — reporting honestly instead of claiming them)");
 
         /* Point-sprite particle layers: hardware only. llvmpipe's wide-point
          * rasterization is pathologically slow (measured: 1080p snowfall
@@ -2066,8 +2315,10 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                     !gl_make_program(r, PROG_F_ADV_VEL, FS_FLUID_ADVECT_VEL, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_F_ADV_DYE, FS_FLUID_ADVECT_DYE, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_F_TONEMAP, FS_FLUID_TONEMAP, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_R_SPLAT, FS_RIPPLE_SPLAT, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_R_STEP, FS_RIPPLE_STEP, ferr, sizeof ferr) ||
-                    !gl_make_program(r, PROG_R_COMPOSITE, FS_RIPPLE_COMPOSITE, ferr, sizeof ferr)) {
+                    !gl_make_program(r, PROG_R_COMPOSITE, FS_RIPPLE_COMPOSITE,
+                                     ferr, sizeof ferr)) {
                         LOGW("opengl: sim shaders failed (%s) — sims stay on CPU", ferr);
                         r->sims_ok = false;
                 }
@@ -2275,26 +2526,60 @@ static bool gl_begin(RRenderer *rr, int win, u32 w, u32 h)
         g->glClearColor(0, 0, 0, 0);
         g->glClear(GL_COLOR_BUFFER_BIT);
 
-        /* GPU frame timing: poll LAST frame's query (non-blocking; results
-         * lag one frame — asynchronous execution, reported as such), then
-         * arm this frame's. One query object per window. */
+        /* GPU frame timing: poll the query RING (non-blocking; results lag
+         * several frames — asynchronous execution, reported as such), then
+         * arm this frame's slot. Each ring slot is only re-armed after its
+         * previous result was COLLECTED: re-arming a query with an
+         * un-retrieved result is a GL INVALID_OPERATION and, observed in
+         * the field, permanently stalls sample collection. */
         if (r->tq_have) {
-                GLuint_ q = r->tq[win];
-                if (q && r->tq_active[win]) {
-                        GLuint64_ avail = 0, res = 0;
-                        g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_AVAILABLE_Q, &avail);
-                        if (avail) {
-                                g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_Q, &res);
-                                r->perf_gpu_ms_sum += (f64)res / 1000000.0;
-                                r->perf_gpu_samples++;
+                bool any_collected = false;
+                for (int k = 0; k < TQ_RING; k++) {
+                        GLuint_ q = r->tq[win][k];
+                        if (q && r->tq_pending[win][k]) {
+                                GLuint64_ avail = 0, res = 0;
+                                g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_AVAILABLE_Q, &avail);
+                                if (avail) {
+                                        g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_Q, &res);
+                                        r->perf_gpu_ms_sum += (f64)res / 1000000.0;
+                                        r->perf_gpu_samples++;
+                                        r->tq_pending[win][k] = false;
+                                        any_collected = true;
+                                }
                         }
-                        r->tq_active[win] = false;
                 }
-                if (!q)
-                        g->glGenQueriesQ(1, &r->tq[win]);
-                if (r->tq[win]) {
-                        g->glBeginQueryQ(GL_TIME_ELAPSED_Q, r->tq[win]);
-                        r->tq_active[win] = true;
+                if (r->tq_next[win] >= TQ_RING)
+                        r->tq_next[win] = 0;
+                int slot = r->tq_next[win];
+                if (r->tq_pending[win][slot]) {
+                        /* this slot's result has not landed yet — rotate to
+                         * a free one instead of forcing the INVALID_OPERATION */
+                        for (int k = 0; k < TQ_RING && r->tq_pending[win][slot]; k++) {
+                                slot = (slot + 1) % TQ_RING;
+                        }
+                        r->tq_next[win] = slot;
+                }
+                r->tq_armed_now[win] = false;
+                if (!r->tq_pending[win][slot]) {
+                        if (!r->tq[win][slot])
+                                g->glGenQueriesQ(1, &r->tq[win][slot]);
+                        if (r->tq[win][slot]) {
+                                g->glBeginQueryQ(GL_TIME_ELAPSED_Q, r->tq[win][slot]);
+                                r->tq_pending[win][slot] = true;
+                                r->tq_armed_now[win] = true;
+                        }
+                        r->tq_next[win] = (slot + 1) % TQ_RING;
+                }
+                /* consecutive-miss watchdog: symbols exist, queries are
+                 * armed, but no result ever arrives — say so and stop
+                 * claiming GPU timing instead of printing 0.0ms forever */
+                if (any_collected)
+                        r->tq_misses = 0;
+                else if (r->perf_gpu_samples == 0 && ++r->tq_misses == 600) {
+                        r->tq_have = false;
+                        LOGW("opengl: GPU timer queries produced no results "
+                             "after 600 frames (driver issue) — GPU timing "
+                             "disabled; REV_PROFILE will not report it");
                 }
         }
         return true;
@@ -2647,6 +2932,22 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
         int win = r->cur_win;
 
         if (cpu_frame) {
+                /* CPU-composited mode (scene needs CPU compositing — e.g.
+                 * ripple layers when the renderer declined GPU sims): begin()
+                 * never ran, so THIS path must make itself current, ensure
+                 * the window surface exists, and set the present viewport
+                 * from the frame. The old code read win[win].w/h — which
+                 * only begin() sets — presenting into a 0x0 viewport, i.e.
+                 * a BLACK SCREEN, whenever a ripple scene fell back to CPU
+                 * compositing on the GL tier (found by the 2026-10 parity
+                 * sweep; every other scene type composites in GPU mode and
+                 * masked it). */
+                if (!gl_window_surface(r, win))
+                        return false;
+                if (!r->eglMakeCurrent(r->dpy, r->win[win].surf, r->win[win].surf, r->ctx))
+                        return false;
+                r->win[win].w = cpu_frame->w;
+                r->win[win].h = cpu_frame->h;
                 /* upload the CPU-composited straight frame and present it
                  * directly (the accum/present chain is straight-alpha) */
                 if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cpu_frame->w, cpu_frame->h, false))
@@ -2684,7 +2985,7 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
         }
         r->frame_no++;
         bool swapped = r->eglSwapBuffers(r->dpy, r->win[win].surf) != 0;
-        if (r->tq_have && r->tq_active[win])
+        if (r->tq_have && r->tq_armed_now[win])
                 g->glEndQueryQ(GL_TIME_ELAPSED_Q);
         return swapped;
 }

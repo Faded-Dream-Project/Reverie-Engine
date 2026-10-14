@@ -235,6 +235,12 @@ struct RevVideo {
         AVCodecContext *cdc;
         int vstream;
         AVPacket *pkt;
+        /* custom AVIO (memory source): fmt->pb is OURS to free —
+         * avformat_close_input leaves custom-IO contexts alone, and the
+         * 2026-10 leak audit showed the 64KB buffer + box + context
+         * leaked on every memory-source open (packed themes) */
+        AVIOContext *avio;
+        void *avio_box;
 
         /* shared (lock-guarded) */
         AVFrame *q[VQ_MAX];
@@ -429,6 +435,9 @@ RevVideo *rev_video_open(const RVideoSource *src, bool loop,
                         goto out;
                 }
                 v->fmt->pb = avio;
+                v->avio = avio;
+                v->avio_box = box;
+                box = NULL;    /* ownership moved to RevVideo */
                 if (g_ff.avformat_open_input(&v->fmt, "packed.mp4", NULL, NULL) < 0) {
                         snprintf(err, errcap, "video: cannot open packed video");
                         goto out;
@@ -494,6 +503,14 @@ out:
         if (!ok) {
                 if (v->fmt)
                         g_ff.avformat_close_input(&v->fmt);
+                if (v->avio) {
+                        if (v->avio->buffer)
+                                g_ff.av_free(v->avio->buffer);
+                        g_ff.av_free(v->avio);
+                        v->avio = NULL;
+                }
+                free(v->avio_box);
+                v->avio_box = NULL;
                 if (v->cdc)
                         g_ff.avcodec_free_context(&v->cdc);
                 if (v->pkt)
@@ -530,6 +547,15 @@ void rev_video_close(RevVideo *v)
                 g_ff.avcodec_free_context(&v->cdc);
         if (v->fmt)
                 g_ff.avformat_close_input(&v->fmt);
+        if (v->avio) {
+                /* custom IO: the format context never owned fmt->pb */
+                if (v->avio->buffer)
+                        g_ff.av_free(v->avio->buffer);
+                g_ff.av_free(v->avio);
+                v->avio = NULL;
+        }
+        free(v->avio_box);
+        v->avio_box = NULL;
         pthread_cond_destroy(&v->cv);
         pthread_mutex_destroy(&v->mu);
         free(v);

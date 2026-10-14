@@ -1,0 +1,9 @@
+{
+  "id": "animated-gradients",
+  "name": "Animated Gradients",
+  "description": "A pure animated-gradient showcase: no images, no sims — the gradient engine paths, exercised.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0"
+}

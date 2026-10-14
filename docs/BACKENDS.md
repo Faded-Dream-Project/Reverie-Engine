@@ -39,13 +39,49 @@ wallpaper engines cannot exist there without compositor extensions. When
 the global is missing, Reverie exits with an explicit message saying
 exactly that.
 
-## The renderer chain
+## The renderer policy (2026-10 redesign)
 
-`--renderer` / `REV_RENDERER` accept `auto | vulkan | opengl | cpu`. Auto
-order: **vulkan → opengl → cpu**, each fully initialized in turn; the first
-success wins and every failure is logged with its reason. (llvmpipe is not
-a separate probe — it *is* the opengl tier, detected by GL_RENDERER string
-and logged as such.)
+`--renderer` / `REV_RENDERER` accept `auto | vulkan | opengl | cpu`.
+
+**Explicit requests are honored exactly and never fall back silently.**
+`--renderer vulkan` initializes Vulkan and only Vulkan; if that fails the
+daemon EXITS with the init error (the log names the failing call). Software
+devices are not substituted silently either — when an explicit request lands
+on software (lavapipe Vulkan, llvmpipe GL), it RUNS, and the log says
+`SOFTWARE` in every renderer line plus a dedicated warning. "Initialized" is
+never confused with "hardware accelerated": every tier reports its device
+name, device type, and hardware/software classification at init.
+
+**Automatic selection is deterministic** (render.c, documented + measured):
+
+1. **OpenGL with a hardware context** — the only tier that actually renders
+   and simulates on the GPU today, so it is the first and only GPU probe.
+2. **The native CPU renderer** when GL initializes as software — llvmpipe
+   would boot an entire software GL stack to do what the CPU renderer does
+   natively (and on llvmpipe the GL tier itself keeps sims, point sprites
+   and gradients on the CPU for speed). Override with `REV_AUTO_GL_SW=1`.
+3. **The Vulkan tier is excluded from auto** while it is present-only (see
+   below) — auto-selecting it initializes a Vulkan device that then does no
+   rendering. Override with `REV_AUTO_VK=1`.
+
+### why auto does not probe software stacks — the measurements
+
+llvmpipe-GL vs the native CPU renderer, 1080p, this repository's E2E stack,
+best-of-two 5 s windows (interactive scenes driven by `REV_FAKE_POINTER`):
+
+| scene               | native CPU | llvmpipe GL | verdict              |
+|---------------------|-----------:|------------:|----------------------|
+| ripple-lake (drag)  |     53.3   |       51.4  | CPU, ~4%             |
+| snowfall            |      4.7   |        5.8  | llvmpipe, ~23%       |
+| ember-drift (drag)  |     22.4   |       14.5  | CPU, ~54%            |
+| fluid-aurora (drag) |      6.8   |        7.7  | llvmpipe, ~13%       |
+| animated-gradients  |     14.8   |       14.1  | parity               |
+
+Neither is uniformly faster — which is exactly why the *default* picks the
+zero-dependency, consistent native CPU path and the *override* is one env
+var away. The numbers above are from a 2-core sandbox; both paths are
+irrelevant on machines with working hardware GL, which is what auto actually
+selects.
 
 ### tier 3 — vulkan (present path)
 
@@ -57,15 +93,29 @@ and logged as such.)
   runtime-dlopen'd `libxcb.so.1`. The window XID comes from our own raw X11
   client — server-side objects are global, so this is legal without Xlib.
   Wayland WSI: the shim's `wl_display*`/`wl_surface*` (experimental).
-* **Present path (0.1.1):** the engine composites on the CPU and then either
+* **Device selection (2026-10):** every physical device is enumerated and
+  reported (name + type); the tier picks by hardware class —
+  discrete > integrated > virtual > other > CPU — among devices that can
+  present with a TRANSFER_DST swapchain. Loader enumeration order no longer
+  decides anything (with a software ICD listed first, the old first-match
+  loop used to pick lavapipe while a real GPU sat behind it). The selected
+  device, its type, Vulkan version, driver version, and the honest
+  hardware/software verdict are logged.
+* **Capability, stated honestly:** this tier is PRESENT-ONLY. The engine
+  composites every frame on the CPU; the GPU receives finished frames —
+  either
   - *platform present (default)* — hands the frame to the backend's proven
     presenter (MIT-SHM on X11, wl_shm on Wayland), or
   - *WSI present (`REV_VK_PRESENT=wsi`)* — memcpy into a host-visible
     staging buffer → `vkCmdCopyBufferToImage` with layout barriers → FIFO
     present.
-  The default flipped in 0.1.1 after a field report of a **black screen on
-  XWayland with a real GPU driver** (see Troubleshooting); both paths are
-  E2E-tested and pixel-exact vs the CPU renderer on lavapipe.
+  No GPU rendering or compositing exists in this tier yet; that is why auto
+  does not select it. The default present path flipped in 0.1.1 after a
+  field report of a **black screen on XWayland with a real GPU driver** (see
+  Troubleshooting); both paths are E2E-tested and pixel-exact vs the CPU
+  renderer on lavapipe. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or
+  present is reported explicitly and stops presenting; OUT_OF_DATE at
+  present recreates the swapchain.
 
 ### tier 2 — opengl (GPU compositing)
 
@@ -99,8 +149,16 @@ and logged as such.)
   and CPU output stay comparable; the blur is a gaussian approximation
   where the CPU tier uses a 3-pass box filter — small visual differences
   under large blur radii are expected and documented.
-* Ripple scenes composite on the CPU (the ripple filter needs the
-  below-content as feedback); every other layer type runs on the GPU.
+* GPU ripple simulation (hardware GL, or llvmpipe with
+  `REV_GL_FLUID_SW=1`): the height-field wave equation runs in a shader
+  pair — a splat pass writes the pointer drip and click impacts into the
+  field first, then pure wave-update passes step it (mirroring the CPU
+  solver's exact order; see the ripple-lake postmortem below). The
+  refraction composite reads the accumulation target as its below-content
+  and offsets samples by the surface-normal gradient, with the same
+  specular glint the CPU applies. On software GL without the test hook the
+  scene falls back to full CPU compositing — and that fallback path now
+  presents correctly (black-screen postmortem below).
 * Verified E2E on llvmpipe: structurally identical output to the CPU tier.
 
 ### tier 1 — cpu (the floor)
@@ -122,11 +180,84 @@ and logged as such.)
 | `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
+| `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
+| `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |
 | `REV_FAKE_POINTER`  | TEST/BENCH: `<speed>` = synthesize a pressed pointer on a Lissajous path (circuits/s) so interactive scenes benchmark headlessly. Never set by users |
+| `REV_FAKE_CLICK`    | TEST: `"x,y[;x,y ...]"` = synthesize clicks at normalized positions (0.3 s + 0.2 s spacing) so click-driven interaction (ripple splashes) is regression-testable headlessly. Never set by users |
 | `REV_GL_FLUID_SW`   | TEST: force the GPU sim/point/gradient paths on software GL for regression coverage |
+| `REV_RIPPLE_DUMP`   | TEST: `"call,call,..."` = read the GPU ripple height field back at those step-call indices and log statistics (placement debugging) |
 
 ## Troubleshooting
 
+* **Ripple-lake clicks made a weak displaced smear instead of a wave
+  (2026-10 postmortem)** — field report: after one click on
+  `themes/ripple-lake` (Wayland, GTX 1050 Ti, GL tier with GPU sims), the
+  effect "shifted toward the side of the screen and began glitching".
+  Root cause, found by field-readback (`REV_RIPPLE_DUMP`) on llvmpipe and
+  reproduced in isolation: the GPU ripple update shader folded the pointer
+  drip and click impacts into the wave-update pass as LOCAL variables while
+  sampling the Laplacian's neighbors from the UN-injected texture — the
+  center term used the post-injection height and the neighbors did not. For
+  a click of depth d the Laplacian gained a spurious −4d, so
+  `nh = 2d + 0.24·(−4d) ≈ 1.04d`: the wave launch cancelled and the field
+  decayed like a diffusion blob (probe: nh = −2.484 for a −2.4 click; the
+  correct value is −4.8). The visible artifact was that blob's displaced
+  specular glint — x tracked the click, y sat ~20–40 px high and the ring
+  never expanded. Fix: a separate SPLAT pass writes injections into the
+  field BEFORE the wave passes (exactly the CPU solver's order), and the
+  wave pass is now a pure update. Verified: GPU splash 7,548 changed px
+  centered on the click (was 420 px, displaced), CPU-vs-GPU parity 0.9 %,
+  and e2e now has dedicated click-placement tests (`ripple(click,cpu)`,
+  `ripple(click,gl)`, `ripple(click,corner)` in `scripts/e2e.sh`, comparator
+  `scripts/click_cmp.py`). Found along the way, same investigation: a
+  same-frame double click collapsed onto the LAST click's position (the
+  pending-click slot was a single pair, not a queue) — the platform layer
+  now latches up to 4 clicks with their own positions and the scene drains
+  them individually.
+* **"GPU timer queries available" at init, then `gpu=0.0ms*` forever
+  (2026-10 postmortem)** — field report: on the GTX 1050 Ti the GL tier
+  logged timer queries as available, yet `REV_PROFILE` reported
+  `gpu=0.0ms*` with "timing unavailable". Three stacked defects: (1) the
+  64-bit result entry point was looked up under the desktop-flavored name
+  `glGetQueryObjectu64vEXT` — the ES extension spec name is
+  `glGetQueryObjectui64vEXT` — so on ES contexts the lookup depended on
+  drivers exporting a name that does not exist in that spelling;
+  (2) detection trusted symbol resolution alone — no extension-string
+  check, no functional probe — so "available" could be claimed by a context
+  that would never yield results; (3) the frame loop re-armed a single
+  query object before its previous result was retrieved, which is a GL
+  INVALID_OPERATION and, once it happened, permanently stalled collection
+  (the observed 0.0ms*). Fix: extension string + all four spec spellings +
+  a real begin/end/finish/result probe at init (only a passing probe logs
+  "available"; a failing one logs the honest reason), a 4-deep query ring
+  whose slots are only re-armed after their results are collected, and a
+  600-frame miss watchdog that disables timing with the driver-issue
+  explanation instead of printing 0.0 forever. Also clarified in the perf
+  note: `frame=` includes the pacing wait — when fps is capped to the
+  display refresh, frame ≈ refresh interval and the remainder is vsync
+  idle, not render cost.
+* **Ripple scene + GL tier without GPU sims = black screen (2026-10
+  postmortem)** — found by the scene-parity sweep: `-R opengl` on a ripple
+  scene under llvmpipe (GPU sims declined) rendered nothing. In
+  CPU-compositing mode main.c never calls `begin()`, and the GL tier's
+  present path sized its viewport from window state that only `begin()`
+  sets — a 0×0 viewport. Every other scene type composites in GPU mode, so
+  nothing had ever exercised the combination. Fix: main.c now calls
+  `begin()` in CPU-compositing mode too (which also fixes multi-monitor
+  window targeting for that path), and the GL `end(cpu_frame)` path makes
+  itself current and sizes itself from the frame independently. Parity
+  sweep after the fix: ripple-lake GL vs CPU 0.00 % differing.
+* **Theme asset cache never cached + leaked (2026-10 postmortem)** — the
+  sanitizer audit caught a folder-theme asset leak: `theme_asset()` wrote
+  its cache entry but never incremented the entry count — the cache could
+  never hit (every lookup re-read the file from disk and overwrote slot 0,
+  leaking the previous entry), and `theme_free()` freed nothing. One-line
+  fix plus `ncache++`. Same audit: the packed-theme video path leaked its
+  custom AVIO context + 64 KB buffer per open (avformat_close_input leaves
+  custom-IO contexts alone), and the X11 screenshot hook never freed its
+  persistent GetImage reply buffer at teardown — both now owned and freed
+  by their teardown paths. Full suite re-verified under ASan+UBSan with
+  leaks on.
 * **GPU renderer active but the scene is slow / one CPU core is pinned
   (dev-cycle postmortem)** — field report: `--renderer opengl` on a GTX
   1050 Ti showed the real NVIDIA renderer string (GL was finally doing

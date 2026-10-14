@@ -142,7 +142,15 @@ struct RTScene {
                 f64 x, y, dx, dy;
                 bool pressed;
                 bool seen;
-                f64 click_x, click_y;   /* last click position (device px) */
+                f64 click_qx[4], click_qy[4]; /* pending clicks (device px),
+                                               * oldest first — a queue, NOT a
+                                               * single slot: multiple clicks
+                                               * between renders each keep their
+                                               * own position (2026-10 fix: the
+                                               * old single click_x/click_y
+                                               * collapsed a same-frame double
+                                               * click onto the last position,
+                                               * splashing N times in ONE spot) */
                 u32 clicks;             /* pending clicks since last render  */
         } ptr[RT_MAX_MONITORS];
         char *base_dir;
@@ -588,10 +596,22 @@ void rtscene_click(RTScene *sc, int mon, f64 x, f64 y)
         if (!sc || mon < 0 || mon >= RT_MAX_MONITORS)
                 return;
         /* latched click edge -> pending splash/burst, consumed by the next
-         * render (works even when it lands before the sims exist) */
-        sc->ptr[mon].click_x = x;
-        sc->ptr[mon].click_y = y;
-        sc->ptr[mon].clicks++;
+         * render (works even when it lands before the sims exist). Up to 4
+         * pending clicks keep their own positions; a 5th inside one frame
+         * replaces the oldest (4 between two renders is already extreme —
+         * and better than dropping the newest). */
+        if (sc->ptr[mon].clicks < 4) {
+                sc->ptr[mon].click_qx[sc->ptr[mon].clicks] = x;
+                sc->ptr[mon].click_qy[sc->ptr[mon].clicks] = y;
+                sc->ptr[mon].clicks++;
+        } else {
+                for (u32 c = 0; c < 3; c++) {
+                        sc->ptr[mon].click_qx[c] = sc->ptr[mon].click_qx[c + 1];
+                        sc->ptr[mon].click_qy[c] = sc->ptr[mon].click_qy[c + 1];
+                }
+                sc->ptr[mon].click_qx[3] = x;
+                sc->ptr[mon].click_qy[3] = y;
+        }
 }
 
 void rtscene_flush_caches(RTScene *sc)
@@ -926,7 +946,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
         /* normalized pointer for this monitor (default center) */
         f64 px = 0.5, py = 0.5, pdx = 0, pdy = 0;
         bool pressed = false;
-        f64 click_x = 0.5, click_y = 0.5;
+        f64 click_x[4], click_y[4];   /* pending clicks, normalized */
         u32 clicks = 0;
         if (sc->ptr[mon].seen) {
                 px = sc->ptr[mon].x / W;
@@ -934,9 +954,11 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                 pdx = sc->ptr[mon].dx / W;
                 pdy = sc->ptr[mon].dy / H;
                 pressed = sc->ptr[mon].pressed;
-                click_x = sc->ptr[mon].click_x / W;
-                click_y = sc->ptr[mon].click_y / H;
-                clicks = sc->ptr[mon].clicks;
+                clicks = sc->ptr[mon].clicks > 4 ? 4 : sc->ptr[mon].clicks;
+                for (u32 c = 0; c < clicks; c++) {
+                        click_x[c] = sc->ptr[mon].click_qx[c] / W;
+                        click_y[c] = sc->ptr[mon].click_qy[c] / H;
+                }
                 sc->ptr[mon].clicks = 0;    /* consume */
         }
 
@@ -986,10 +1008,10 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 rd->strength = e.strength;
                                 rd->damping = L->r_damping;
                                 rd->radius = L->r_radius;
-                                rd->nclicks = clicks > 4 ? 4 : clicks;
+                                rd->nclicks = clicks;
                                 for (u32 c = 0; c < rd->nclicks; c++) {
-                                        rd->click_x[c] = click_x;
-                                        rd->click_y[c] = click_y;
+                                        rd->click_x[c] = click_x[c];
+                                        rd->click_y[c] = click_y[c];
                                 }
                                 rd->frame_w = (u32)W;
                                 rd->frame_h = (u32)H;
@@ -1034,10 +1056,11 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         if (in->ripple) {
                                 ripple_configure(in->ripple, e.strength, L->r_damping, L->r_radius);
                                 ripple_pointer(in->ripple, px, py, pressed);
-                                /* latched clicks: a full press+release between two
-                                 * polls still makes a splash */
+                                /* latched clicks: each queued press+release
+                                 * between two renders makes its own splash
+                                 * at its own position */
                                 for (u32 c = 0; c < clicks; c++)
-                                        ripple_click(in->ripple, click_x, click_y);
+                                        ripple_click(in->ripple, click_x[c], click_y[c]);
                                 f64 ms = rev_monotonic();
                                 ripple_step(in->ripple, dt);
                                 if (!below_snap)
@@ -1155,9 +1178,12 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         }
                         if (in->parts) {
                                 particles_pointer(in->parts, px, py, pressed);
-                                if (clicks)
-                                        particles_burst(in->parts, click_x, click_y,
-                                                        (int)(clicks > 4 ? 4 : clicks) * 24);
+                                if (clicks) {
+                                        /* bursts fire at each queued click
+                                         * position (24 sparks per click) */
+                                        for (u32 c = 0; c < clicks; c++)
+                                                particles_burst(in->parts, click_x[c], click_y[c], 24);
+                                }
                                 f64 ms = rev_monotonic();
                                 particles_step(in->parts, dt);
                                 sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;

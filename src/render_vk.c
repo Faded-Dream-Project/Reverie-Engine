@@ -50,7 +50,15 @@ enum {
         VK_INCOMPLETE_ = 5,
         VK_SUBOPTIMAL_KHR_ = 1000001003,
         VK_ERROR_OUT_OF_DATE_KHR_ = -1000001004,
+        VK_ERROR_DEVICE_LOST_ = -4,
 };
+
+/* VkPhysicalDeviceType (vendored values, cross-checked against the header) */
+#define VK_PHYSICAL_DEVICE_TYPE_OTHER_ 0
+#define VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_ 1
+#define VK_PHYSICAL_DEVICE_TYPE_DISCRETE_ 2
+#define VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_ 3
+#define VK_PHYSICAL_DEVICE_TYPE_CPU_ 4
 
 enum {
         ST_APPLICATION_INFO = 0,
@@ -325,6 +333,22 @@ typedef struct {
         void *surface;      /* struct wl_surface* */
 } VkWaylandSurfaceCreateInfoKHR_;
 
+/* VkPhysicalDeviceProperties head. The real structure continues with
+ * VkPhysicalDeviceLimits (several hundred bytes); we only read the head,
+ * but the driver writes the FULL struct, so the buffer must be sized for
+ * it — 1024 bytes covers the 1.x ABI layout with margin. */
+#define VKPDPROPS_SIZE_ 1024
+typedef struct {
+        u32 apiVersion;
+        u32 driverVersion;
+        u32 vendorID;
+        u32 deviceID;
+        u32 deviceType;
+        char deviceName[256];
+        u8 pipelineCacheUUID[16];
+        u8 tail[VKPDPROPS_SIZE_ - 288];    /* limits + sparseProperties */
+} VkPhysicalDeviceProperties_;
+
 /* ---- function pointer types ---------------------------------------------- */
 typedef void *(*PFN_vkGetInstanceProcAddr_)(void *, const char *);
 typedef void *(*PFN_vkGetDeviceProcAddr_)(void *, const char *);
@@ -335,6 +359,7 @@ typedef u32 (*PFN_getSurfSupport_)(VkPhysicalDevice_, u32, VkSurfaceKHR_, u32 *)
 typedef u32 (*PFN_getSurfCaps_)(VkPhysicalDevice_, VkSurfaceKHR_, VkSurfaceCapabilitiesKHR_ *);
 typedef u32 (*PFN_getSurfFormats_)(VkPhysicalDevice_, VkSurfaceKHR_, u32 *, VkSurfaceFormatKHR_ *);
 typedef void (*PFN_getQueueFamProps_)(VkPhysicalDevice_, u32 *, VkQueueFamilyProperties_ *);
+typedef void (*PFN_getPhysDevProps_)(VkPhysicalDevice_, VkPhysicalDeviceProperties_ *);
 typedef u32 (*PFN_createDevice_)(VkPhysicalDevice_, const VkDeviceCreateInfo_ *, const void *, VkDevice_ *);
 typedef void (*PFN_getDeviceQueue_)(VkDevice_, u32, u32, VkQueue_ *);
 typedef u32 (*PFN_createXcbSurface_)(VkInstance_, const VkXcbSurfaceCreateInfoKHR_ *, const void *, VkSurfaceKHR_ *);
@@ -420,6 +445,12 @@ typedef struct {
         VkQueue_ queue;
         u32 queue_family;
         int present_mode;        /* VK_PRESENT_PLATFORM | VK_PRESENT_WSI */
+        char dev_name[256];      /* selected physical device name       */
+        int dev_type;            /* VK_PHYSICAL_DEVICE_TYPE_*           */
+        bool dev_is_software;    /* CPU-type device (lavapipe-class)    */
+        u32 api_version;         /* device apiVersion                   */
+        u32 driver_version;      /* device driverVersion (raw)          */
+        bool device_lost;        /* VK_ERROR_DEVICE_LOST seen at runtime */
         VkWin_ win[REV_PLATFORM_MAX_OUTPUTS];
         int cur_win;
 
@@ -432,6 +463,7 @@ typedef struct {
         PFN_getSurfCaps_ vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
         PFN_getSurfFormats_ vkGetPhysicalDeviceSurfaceFormatsKHR;
         PFN_getQueueFamProps_ vkGetPhysicalDeviceQueueFamilyProperties;
+        PFN_getPhysDevProps_ vkGetPhysicalDeviceProperties;
         PFN_createDevice_ vkCreateDevice;
         PFN_getDeviceQueue_ vkGetDeviceQueue;
         PFN_createXcbSurface_ vkCreateXcbSurfaceKHR;
@@ -819,10 +851,21 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         app.engineVersion = 1;
         app.apiVersion = VK_API_VERSION_1_0_;
         const char *exts[2] = { "VK_KHR_surface", surface_ext };
+        /* REV_VK_VALIDATE=1: opt-in validation layer (debugging aid — the
+         * layer must be installed; its diagnostics go to stderr/stdout via
+         * the loader). Off by default: layers change timing and can spew
+         * on the hand-vendored minimal structs. */
+        const char *layers[1] = { "VK_LAYER_KHRONOS_validation" };
         VkInstanceCreateInfo_ ici;
         memset(&ici, 0, sizeof ici);
         ici.sType_ = ST_INSTANCE_CREATE_INFO;
         ici.pAppInfo = &app;
+        if (getenv("REV_VK_VALIDATE") && getenv("REV_VK_VALIDATE")[0] != '0') {
+                ici.enabledLayerCount = 1;
+                ici.ppEnabledLayerNames = layers;
+                LOGI("vulkan: validation layer requested (REV_VK_VALIDATE=1) "
+                     "— createInstance failure means it is not installed");
+        }
         ici.enabledExtensionCount = 2;
         ici.ppEnabledExtensionNames = exts;
         u32 r = v->vkCreateInstance(&ici, NULL, &v->inst);
@@ -840,6 +883,7 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         IPSYM(vkGetPhysicalDeviceSurfaceCapabilitiesKHR, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
         IPSYM(vkGetPhysicalDeviceSurfaceFormatsKHR, "vkGetPhysicalDeviceSurfaceFormatsKHR");
         IPSYM(vkGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties");
+        IPSYM(vkGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
         IPSYM(vkCreateXcbSurfaceKHR, "vkCreateXcbSurfaceKHR");
         IPSYM(vkCreateXlibSurfaceKHR, "vkCreateXlibSurfaceKHR");
         IPSYM(vkCreateWaylandSurfaceKHR, "vkCreateWaylandSurfaceKHR");
@@ -896,16 +940,56 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         }
 
         u32 ndev = 0;
-        v->vkEnumeratePhysicalDevices(v->inst, &ndev, NULL);
-        if (ndev == 0 || ndev > 16) {
-                snprintf(err, errcap, "no physical devices");
+        u32 enumrc = v->vkEnumeratePhysicalDevices(v->inst, &ndev, NULL);
+        if (enumrc != VK_SUCCESS_ || ndev == 0) {
+                snprintf(err, errcap, "no physical devices (vkEnumeratePhysicalDevices 0x%x)",
+                         enumrc);
                 return false;
         }
+        if (ndev > 16)
+                ndev = 16;
         VkPhysicalDevice_ devs[16];
-        v->vkEnumeratePhysicalDevices(v->inst, &ndev, devs);
+        if (v->vkEnumeratePhysicalDevices(v->inst, &ndev, devs) != VK_SUCCESS_) {
+                snprintf(err, errcap, "physical device enumeration failed");
+                return false;
+        }
 
+        /* Deterministic device selection: enumerate EVERY device, keep the
+         * ones that can present to this surface with TRANSFER_DST swapchains,
+         * and pick by hardware class (discrete > integrated > virtual >
+         * other > CPU). The old loop took the FIRST presentable device —
+         * with a software ICD (lavapipe) enumerated first it would select a
+         * CPU device while a real GPU sat behind it, and nothing in the
+         * diagnostics said so. Enumeration order across ICDs is loader
+         * dependent and must never decide the outcome. */
         bool found = false;
-        for (u32 d = 0; d < ndev && !found; d++) {
+        int best_score = -1;
+        u32 best_dev = 0, best_fam = 0;
+        char best_name[256] = { 0 };
+        u32 best_type = 0, best_api = 0, best_drv = 0;
+        char logbuf[512];
+        size_t lo = 0;
+        lo += (size_t)snprintf(logbuf + lo, sizeof logbuf - lo,
+                               "vulkan: %u device(s):", ndev);
+        for (u32 d = 0; d < ndev; d++) {
+                VkPhysicalDeviceProperties_ props;
+                memset(&props, 0, sizeof props);
+                if (v->vkGetPhysicalDeviceProperties)
+                        v->vkGetPhysicalDeviceProperties(devs[d], &props);
+                const char *tname =
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_ ? "discrete" :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_ ? "integrated" :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_ ? "virtual" :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU_ ? "CPU (software)" :
+                        "other";
+                int score =
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_ ? 4 :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_ ? 3 :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_ ? 2 :
+                        props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU_ ? 0 : 1;
+                lo += (size_t)snprintf(logbuf + lo, sizeof logbuf - lo,
+                                       "\n  [%u] %s (%s)", d, props.deviceName, tname);
+
                 u32 nfam = 0;
                 v->vkGetPhysicalDeviceQueueFamilyProperties(devs[d], &nfam, NULL);
                 if (nfam == 0 || nfam > 64)
@@ -924,35 +1008,97 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                                 continue;
                         if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT_))
                                 continue;
-                        /* this device can present and accept transfer writes */
-                        VkDeviceQueueCreateInfo_ qci;
-                        memset(&qci, 0, sizeof qci);
-                        qci.sType_ = ST_DEVICE_QUEUE_CREATE_INFO;
-                        qci.queueFamilyIndex = f;
-                        qci.queueCount = 1;
-                        f32 prio = 1.0f;
-                        qci.pQueuePriorities = &prio;
-                        const char *devexts[1] = { "VK_KHR_swapchain" };
-                        VkDeviceCreateInfo_ dci;
-                        memset(&dci, 0, sizeof dci);
-                        dci.sType_ = ST_DEVICE_CREATE_INFO;
-                        dci.queueCreateInfoCount = 1;
-                        dci.pQueueCreateInfos = &qci;
-                        dci.enabledExtensionCount = 1;
-                        dci.ppEnabledExtensionNames = devexts;
-                        static u32 zerofeatures[55];    /* VkPhysicalDeviceFeatures, all-off */
-                        dci.pEnabledFeatures = zerofeatures;
-                        if (v->vkCreateDevice(devs[d], &dci, NULL, &v->dev) != VK_SUCCESS_)
-                                continue;
-                        v->phys = devs[d];
-                        v->queue_family = f;
-                        found = true;
-                        break;
+                        /* presentable AND transfer-writable: eligible */
+                        if (score > best_score) {
+                                best_score = score;
+                                best_dev = d;
+                                best_fam = f;
+                                snprintf(best_name, sizeof best_name, "%s", props.deviceName);
+                                best_type = props.deviceType;
+                                best_api = props.apiVersion;
+                                best_drv = props.driverVersion;
+                        }
+                        break;    /* one qualifying family per device is enough */
                 }
         }
+        LOGI("%s", logbuf);
+        if (best_score >= 0) {
+                v->phys = devs[best_dev];
+                v->queue_family = best_fam;
+                /* honest hardware/software classification + driver report */
+                v->dev_is_software = (best_type == VK_PHYSICAL_DEVICE_TYPE_CPU_);
+                v->dev_type = (int)best_type;
+                snprintf(v->dev_name, sizeof v->dev_name, "%s", best_name);
+                v->api_version = best_api;
+                v->driver_version = best_drv;
+                found = true;
+        }
+        if (found) {
+                rr->software = v->dev_is_software;
+                {
+                        const char *cls =
+                                v->dev_is_software ? "software" :
+                                v->dev_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_ ? "discrete" :
+                                v->dev_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_ ? "integrated" :
+                                v->dev_type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_ ? "virtual" :
+                                "other";
+                        /* bounded name copy: %.*s keeps the format-truncation
+                         * analysis happy and long device names simply clip */
+                        int prec = (int)sizeof rr->device_desc - 48;
+                        if (prec < 8)
+                                prec = 8;
+                        snprintf(rr->device_desc, sizeof rr->device_desc,
+                                 "%.*s (%s, Vulkan %u.%u)", prec, v->dev_name, cls,
+                                 v->api_version >> 22,
+                                 (v->api_version >> 12) & 0x3ff);
+                }
+                const char *tname =
+                        best_type == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_ ? "discrete GPU" :
+                        best_type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_ ? "integrated GPU" :
+                        best_type == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_ ? "virtual GPU" :
+                        best_type == VK_PHYSICAL_DEVICE_TYPE_CPU_ ? "CPU device (SOFTWARE)" :
+                        "GPU";
+                LOGI("vulkan: selected device \"%s\" (%s, Vulkan %u.%u.%u, driver %u.%u.%u)",
+                     best_name, tname,
+                     best_api >> 22, (best_api >> 12) & 0x3ff, best_api & 0xfff,
+                     best_drv >> 22, (best_drv >> 12) & 0x3ff, best_drv & 0xfff);
+                if (v->dev_is_software)
+                        LOGW("vulkan: SOFTWARE device selected — rendering will NOT be "
+                             "hardware accelerated (CPU-type Vulkan device, e.g. lavapipe)");
+        }
+
         if (!found) {
                 snprintf(err, errcap, "no device with presentable TRANSFER_DST swapchain");
                 return false;
+        }
+
+        /* create the logical device on the SELECTED device (single place —
+         * the old code created it mid-loop, which also meant a candidate
+         * whose device creation failed left a half-initialized state) */
+        {
+                VkDeviceQueueCreateInfo_ qci;
+                memset(&qci, 0, sizeof qci);
+                qci.sType_ = ST_DEVICE_QUEUE_CREATE_INFO;
+                qci.queueFamilyIndex = v->queue_family;
+                qci.queueCount = 1;
+                f32 prio = 1.0f;
+                qci.pQueuePriorities = &prio;
+                const char *devexts[1] = { "VK_KHR_swapchain" };
+                VkDeviceCreateInfo_ dci;
+                memset(&dci, 0, sizeof dci);
+                dci.sType_ = ST_DEVICE_CREATE_INFO;
+                dci.queueCreateInfoCount = 1;
+                dci.pQueueCreateInfos = &qci;
+                dci.enabledExtensionCount = 1;
+                dci.ppEnabledExtensionNames = devexts;
+                static u32 zerofeatures[55];    /* VkPhysicalDeviceFeatures, all-off */
+                dci.pEnabledFeatures = zerofeatures;
+                u32 drc = v->vkCreateDevice(v->phys, &dci, NULL, &v->dev);
+                if (drc != VK_SUCCESS_) {
+                        snprintf(err, errcap, "vkCreateDevice 0x%x on '%s'",
+                                 drc, v->dev_name);
+                        return false;
+                }
         }
 
 #define DSYM(field, name) *(void **)(&v->field) = (void *)v->gdpa((void *)v->dev, name)
@@ -1006,9 +1152,13 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 if (probe) {
                         v->vkDestroySurfaceKHR(v->inst, probe, NULL);
                 }
-                LOGI("vulkan: GPU present capable (queue family %u); presenting via "
-                     "platform SHM path — set REV_VK_PRESENT=wsi for swapchain present",
-                     v->queue_family);
+                LOGI("vulkan: device present-capable (queue family %u); frames "
+                     "present via the platform SHM path — set REV_VK_PRESENT=wsi "
+                     "for swapchain present", v->queue_family);
+                LOGI("vulkan tier capability: PRESENT-ONLY — the engine "
+                     "composites every frame on the CPU; this tier uploads "
+                     "finished frames (no GPU rendering, no GPU compositing "
+                     "in the 0.1.x/0.2.x scope; see docs/BACKENDS.md)");
                 return true;
         }
 
@@ -1105,7 +1255,16 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
 
         VkSync_ *s = &w->sync[w->slot];
 
-        if (v->vkWaitForFences(v->dev, 1, &s->fence, 1, 1000000000ull) != VK_SUCCESS_)
+        u32 wr = v->vkWaitForFences(v->dev, 1, &s->fence, 1, 1000000000ull);
+        if (wr == (u32)VK_ERROR_DEVICE_LOST_) {
+                if (!v->device_lost) {
+                        v->device_lost = true;
+                        LOGE("vulkan: DEVICE LOST — the driver/GPU reset or "
+                             "died; the Vulkan tier can no longer present");
+                }
+                return false;
+        }
+        if (wr != VK_SUCCESS_)
                 return false;
         v->vkResetFences(v->dev, 1, &s->fence);
 
@@ -1195,7 +1354,16 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
         si.pCommandBuffers = &w->cmd;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s->rend;
-        if (v->vkQueueSubmit(v->queue, 1, &si, s->fence) != VK_SUCCESS_)
+        u32 sr = v->vkQueueSubmit(v->queue, 1, &si, s->fence);
+        if (sr == (u32)VK_ERROR_DEVICE_LOST_) {
+                if (!v->device_lost) {
+                        v->device_lost = true;
+                        LOGE("vulkan: DEVICE LOST during submit — presenting "
+                             "disabled for this session");
+                }
+                return false;
+        }
+        if (sr != VK_SUCCESS_)
                 return false;
 
         VkPresentInfoKHR_ pi;
@@ -1207,6 +1375,27 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
         pi.pSwapchains = &w->swapchain;
         pi.pImageIndices = &img;
         r = v->vkQueuePresentKHR(v->queue, &pi);
+        if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
+                /* the surface resized between acquire and present: recreate
+                 * and treat the frame as consumed (next frame re-presents) */
+                vkwin_destroy(v, w);
+                char rerr[128] = { 0 };
+                if (vkwin_create(v, v->cur_win, rerr, sizeof rerr))
+                        LOGI("vulkan: swapchain recreated after OUT_OF_DATE present");
+                else
+                        LOGW("vulkan: swapchain recreate failed: %s", rerr);
+                w->slot ^= 1;
+                return true;
+        }
+        if (r == (u32)VK_ERROR_DEVICE_LOST_) {
+                if (!v->device_lost) {
+                        v->device_lost = true;
+                        LOGE("vulkan: DEVICE LOST during present — presenting "
+                             "disabled for this session");
+                }
+                w->slot ^= 1;
+                return false;
+        }
 
         w->slot ^= 1;
         return vkres_ok(r);

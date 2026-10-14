@@ -60,6 +60,8 @@ struct X11 {
         /* latched button edges (consume-on-read via x11_pointer) */
         bool ppressed, press_edge, release_edge, click, click_pending;
         f64 click_x, click_y;
+        f64 click_q[4][2];   /* latched clicks between reads (oldest first) */
+        u32 click_qn;
         u32 clicks;
 };
 
@@ -541,6 +543,9 @@ void x11_disconnect(X11 *x)
                 }
                 free(w->fallback);
         }
+        free(x->reply);    /* 2026-10 leak audit: the persistent lockstep
+                           * reply buffer (grows to frame size for the
+                           * GetImage screenshot path) was never freed */
         close(x->fd);
         free(x);
 }
@@ -973,9 +978,15 @@ bool x11_pointer(X11 *x, RPointerState *out)
                 out->click = x->click;
                 out->click_x = x->click_x;
                 out->click_y = x->click_y;
+                out->click_qn = x->click_qn;
+                for (u32 c = 0; c < x->click_qn && c < 4; c++) {
+                        out->click_q[c][0] = x->click_q[c][0];
+                        out->click_q[c][1] = x->click_q[c][1];
+                }
                 out->clicks = x->clicks;
                 out->pressed = x->ppressed;
                 x->press_edge = x->release_edge = x->click = false;
+                x->click_qn = 0;
                 return false;
         }
         out->valid = true;
@@ -987,11 +998,17 @@ bool x11_pointer(X11 *x, RPointerState *out)
         out->click = x->click;
         out->click_x = x->click_x;
         out->click_y = x->click_y;
+        out->click_qn = x->click_qn;
+        for (u32 c = 0; c < x->click_qn && c < 4; c++) {
+                out->click_q[c][0] = x->click_q[c][0];
+                out->click_q[c][1] = x->click_q[c][1];
+        }
         out->clicks = x->clicks;
         /* consume-on-read */
         x->press_edge = false;
         x->release_edge = false;
         x->click = false;
+        x->click_qn = 0;
         return true;
 }
 
@@ -1085,6 +1102,18 @@ void x11_pump_events(X11 *x)
                                 if (x->click_pending) {
                                         x->click = true;
                                         x->clicks++;
+                                        if (x->click_qn < 4) {
+                                                x->click_q[x->click_qn][0] = x->click_x;
+                                                x->click_q[x->click_qn][1] = x->click_y;
+                                                x->click_qn++;
+                                        } else {
+                                                for (u32 c = 0; c < 3; c++) {
+                                                        x->click_q[c][0] = x->click_q[c + 1][0];
+                                                        x->click_q[c][1] = x->click_q[c + 1][1];
+                                                }
+                                                x->click_q[3][0] = x->click_x;
+                                                x->click_q[3][1] = x->click_y;
+                                        }
                                 }
                                 x->click_pending = false;
                         }

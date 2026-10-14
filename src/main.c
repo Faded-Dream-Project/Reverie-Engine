@@ -95,8 +95,16 @@ static void usage(void)
 "                  (llvmpipe test hook — normally software keeps the CPU\n"
 "                  solver, which is faster there)\n"
 "  REV_WL_TRACE    1 = dump raw Wayland wire traffic to stderr\n"
+"  REV_AUTO_VK     1 = let auto also consider the present-only Vulkan\n"
+"                  tier (off by default: that tier composites on CPU)\n"
+"  REV_AUTO_GL_SW  1 = let auto keep software GL (llvmpipe) instead of\n"
+"                  falling back to the native CPU renderer\n"
 "\n"
-"renderer chain (auto): vulkan -> opengl -> opengl-on-llvmpipe -> cpu.\n");
+"renderer policy: explicit requests are honored exactly and never fall\n"
+"back silently (init failure exits with the reason). auto = hardware\n"
+"OpenGL, else native CPU (software GL/Vulkan initialize a whole software\n"
+"stack to do what the CPU renderer does natively — opt in via the env\n"
+"vars above; see docs/BACKENDS.md for the measured rationale).\n");
 }
 
 typedef struct {
@@ -483,8 +491,6 @@ int main(int argc, char **argv)
                 platform_destroy(plat);
                 return 1;
         }
-        LOGI("renderer: %s (tier %d, %s)", rend->name, rend->tier,
-             rend->wants_layers ? "GPU compositing" : "CPU compositing");
         if (!rend->wants_layers && strcmp(rend->name, "vulkan") == 0)
                 LOGI("vulkan tier: present path follows REV_VK_PRESENT (default: platform SHM)");
 
@@ -557,6 +563,44 @@ int main(int argc, char **argv)
         if (fake_ptr_speed > 0)
                 LOGI("fake pointer active (test hook): %.2f circuit/s", fake_ptr_speed);
 
+        /* REV_FAKE_CLICK="x,y[;x,y ...]": TEST hook — synthesizes full clicks
+         * (press+release) at normalized [0..1] positions, one every 0.2 s
+         * starting at t=0.3 s, so CLICK-driven interaction (ripple splash
+         * placement, particle bursts) is regression-testable headlessly —
+         * the drag path had REV_FAKE_POINTER, the click path had nothing.
+         * The real pointer stays untouched; only the click events are
+         * injected. Never active unless the env var is set. */
+        enum { FAKE_CLICK_MAX = 8 };
+        f64 fc_x[FAKE_CLICK_MAX], fc_y[FAKE_CLICK_MAX];
+        int fc_n = 0, fc_next = 0;
+        {
+                const char *spec = getenv("REV_FAKE_CLICK");
+                if (spec && *spec) {
+                        const char *p = spec;
+                        while (fc_n < FAKE_CLICK_MAX) {
+                                char *end = NULL;
+                                double x = strtod(p, &end);
+                                if (end == p)
+                                        break;
+                                p = end;
+                                while (*p == ' ' || *p == ',')
+                                        p++;
+                                double y = strtod(p, &end);
+                                if (end == p)
+                                        break;
+                                p = end;
+                                fc_x[fc_n] = x;
+                                fc_y[fc_n] = y;
+                                fc_n++;
+                                if (*p != ';')
+                                        break;
+                                p++;
+                        }
+                        if (fc_n > 0)
+                                LOGI("fake click active (test hook): %d click(s)", fc_n);
+                }
+        }
+
         while (g_run) {
                 f64 now = rev_monotonic();
                 f64 dt = now - last_frame;
@@ -603,14 +647,26 @@ int main(int argc, char **argv)
                                 f64 dx = ptr.dx * fb_scale[i];
                                 f64 dy = ptr.dy * fb_scale[i];
                                 rtscene_pointer(sf.sc, i, lx, ly, dx, dy, ptr.pressed);
-                                /* a click whose press AND release both landed
-                                 * between two polls is still a click — splash
-                                 * it at the latched press position */
-                                if (ptr.click)
+                                /* every latched press+release between two
+                                 * polls is a click — each splashes at its own
+                                 * latched press position (a same-poll double
+                                 * click used to collapse onto the last spot) */
+                                for (u32 c = 0; c < ptr.click_qn && c < 4; c++)
                                         rtscene_click(sf.sc, i,
-                                                      (ptr.click_x - mons[i].x) * fb_scale[i],
-                                                      (ptr.click_y - mons[i].y) * fb_scale[i]);
+                                                      (ptr.click_q[c][0] - mons[i].x) * fb_scale[i],
+                                                      (ptr.click_q[c][1] - mons[i].y) * fb_scale[i]);
                         }
+                }
+
+                /* synthetic clicks (test hook): fire at 0.3 s + 0.2 s spacing —
+                 * same entry point a real click takes (rtscene_click), at the
+                 * same device-pixel transform main.c applies to real clicks */
+                while (fc_next < fc_n && t >= 0.3 + 0.2 * (f64)fc_next) {
+                        for (int i = 0; i < nmon; i++)
+                                rtscene_click(sf.sc, i,
+                                              fc_x[fc_next] * (f64)fbs[i].w,
+                                              fc_y[fc_next] * (f64)fbs[i].h);
+                        fc_next++;
                 }
 
                 /* synthetic pointer (test hook): overrides the real one —
@@ -670,6 +726,14 @@ int main(int argc, char **argv)
                                 }
                                 rend->end(rend, NULL);
                         } else {
+                                /* CPU-composited mode still needs begin():
+                                 * renderers target their PRESENT path per
+                                 * window (cur_win) and size their viewports
+                                 * there — without it, GL presents into a
+                                 * 0x0 viewport (black screen) and multi-
+                                 * monitor presents everything to window 0 */
+                                if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
+                                        continue;
                                 memset(fbs[i].px, 0, (size_t)fbs[i].w * fbs[i].h * 4);
                                 rtscene_render(sf.sc, &fbs[i], i, t, dt);
                                 f64 s_ms, ra_ms;
@@ -758,10 +822,19 @@ int main(int argc, char **argv)
                                         gpu_note_shown = true;
                                         if (prof_gpu_n == 0)
                                                 LOGI("perf: *gpu timing unavailable "
-                                                     "(renderer/driver lacks timer queries)");
+                                                     "(renderer/driver lacks usable "
+                                                     "timer queries — see the "
+                                                     "renderer's init log)");
                                         else
                                                 LOGI("perf: *gpu = async driver timer, "
-                                                     "one frame behind — not CPU wall time");
+                                                     "several frames behind — not "
+                                                     "CPU wall time");
+                                        LOGI("perf: frame= is CPU wall time per "
+                                             "frame INCLUDING the pacing wait; "
+                                             "when fps is capped to the display "
+                                             "refresh, frame ~= refresh interval "
+                                             "and the remainder is vsync idle, "
+                                             "not render cost");
                                 }
                                 /* frame-time distribution: the avg hides
                                  * multi-hundred-ms stalls; p95/max expose

@@ -1,12 +1,27 @@
 /* ============================================================================
  * Reverie Engine — render.h
- * Renderer abstraction with an automatic capability chain:
+ * Renderer abstraction with a DETERMINISTIC, documented selection policy.
  *
- *     vulkan -> opengl -> opengl-on-llvmpipe (software GL) -> cpu
+ * Explicit requests never fall back silently:
+ *     --renderer vulkan   Vulkan only (best hardware device; a software
+ *                         Vulkan device is USED and REPORTED as software —
+ *                         explicit requests are honored, never substituted)
+ *     --renderer opengl   OpenGL only (llvmpipe likewise used + reported)
+ *     --renderer cpu      the native CPU compositor
+ *     failure             the engine EXITS with the init error — the log
+ *                         shows exactly which tier failed and why
+ *
+ * Automatic selection (documented, measured, no software layers without
+ * benefit — see docs/BACKENDS.md for the rationale and benchmarks):
+ *     1. OpenGL with a HARDWARE context — the only tier that actually
+ *        renders and simulates on the GPU today
+ *     2. the native CPU renderer when no hardware GL exists (a software
+ *        GL stack would initialize llvmpipe to do what the CPU renderer
+ *        does natively; REV_AUTO_GL_SW=1 opts into llvmpipe anyway)
+ *     3. the Vulkan tier is EXCLUDED from auto while it is present-only
+ *        (CPU compositing + a frame upload); REV_AUTO_VK=1 opts in
  *
  * All GPU backends are loaded with dlopen() at runtime and never linked.
- * Every renderer degrades cleanly: init() failure falls through to the next
- * tier; the CPU renderer always works (it is the engine's own compositor).
  *
  * Frame protocol (per window):
  *   begin(win, w, h)                       start a frame
@@ -150,6 +165,15 @@ struct RRenderer {
         const char *name;   /* "vulkan" | "opengl" | "cpu" */
         int tier;           /* 3 = vulkan, 2 = opengl, 1 = cpu */
         bool wants_layers;  /* GPU compositing of RLayerCmd streams */
+
+        /* honest hardware/software classification, set during init():
+         * software=true means the API is running on a CPU implementation
+         * (llvmpipe GL, lavapipe Vulkan, or the native CPU renderer).
+         * device_desc names the actual device/driver in use. Selection and
+         * the daemon log use these so "initialized" is never confused with
+         * "hardware accelerated". */
+        bool software;
+        char device_desc[96];
         bool wants_sims;    /* GPU-owned layer simulations (fluid, ripple) —
                                settled during init(), never after */
         bool wants_points;  /* GPU point-sprite rasterization of particle
@@ -190,11 +214,13 @@ struct RRenderer {
 
 /* Includes composite.h's RFb. */
 
-/* Probes the chain. pref: "auto" | "vulkan" | "opengl" | "cpu".
- * With "auto": vulkan -> opengl -> cpu (Mesa's llvmpipe is simply an
- * OpenGL renderer whose GL_RENDERER string contains "llvmpipe").
- * Explicit preferences still fall through to CPU as a last resort,
- * logging why. Returns NULL only if even the CPU renderer fails. */
+/* Creates a renderer under the documented selection policy (see above).
+ * pref: "auto" | "vulkan" | "opengl" | "gl" | "cpu".
+ * Explicit requests never fall back silently — init failure returns NULL
+ * with the reason in err. "auto" is deterministic and never retries a
+ * backend that already failed under the same conditions.
+ * Returns NULL only for explicit-request failures or if even the CPU
+ * renderer cannot initialize. */
 RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t errcap);
 void renderer_destroy(RRenderer *r);
 

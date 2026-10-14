@@ -132,6 +132,64 @@ else
 fi
 stop_xvfb
 
+# ---- Ripple CLICK placement regression (2026-10) ------------------------------
+# The GPU ripple solver computed its Laplacian from UN-injected neighbors
+# while subtracting 4x the injected center height: clicks launched at
+# nh ~= 1.04h instead of 2h — a weak displaced smear, not a wave. These
+# tests fire synthetic clicks (REV_FAKE_CLICK) on the GL tier and verify
+# the disturbance lands ON the click, plus a CPU-tier cross-check.
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R cpu --shot 1 "$OUT/rc-base" \
+    themes/ripple-lake > "$OUT/rc-base.log" 2>&1 || true
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_FAKE_CLICK=0.5,0.5 timeout 8 ./build/reverie -R cpu \
+    --shot 1 "$OUT/rc-cpu" themes/ripple-lake > "$OUT/rc-cpu.log" 2>&1 || true
+if [ -f "$OUT/rc-base.png" ] && [ -f "$OUT/rc-cpu.png" ]; then
+    if python3 scripts/click_cmp.py "$OUT/rc-base.png" "$OUT/rc-cpu.png" 0.5 0.5 2>/dev/null; then
+        echo "    ripple(click,cpu):  PASS (splash lands on the click)"
+        PASS=$((PASS+1))
+    else
+        echo "    ripple(click,cpu):  FAIL (CPU splash misplaced)"
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    ripple(click,cpu):  SKIP (no CPU screenshots)"
+    SKIP=$((SKIP+1))
+fi
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 REV_FAKE_CLICK=0.5,0.5 timeout 10 \
+    ./build/reverie -R opengl --shot 1 "$OUT/rc-gl" themes/ripple-lake \
+    > "$OUT/rc-gl.log" 2>&1 || true
+if grep -q "simulations: GPU" "$OUT/rc-gl.log" 2>/dev/null \
+   && [ -f "$OUT/rc-base.png" ] && [ -f "$OUT/rc-gl.png" ]; then
+    if python3 scripts/click_cmp.py "$OUT/rc-base.png" "$OUT/rc-gl.png" 0.5 0.5 2>/dev/null; then
+        echo "    ripple(click,gl):   PASS (GPU splash lands on the click)"
+        PASS=$((PASS+1))
+    else
+        echo "    ripple(click,gl):   FAIL (GPU splash misplaced — solver regression)"
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    ripple(click,gl):   SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
+fi
+# corner click on the GL tier: placement near the frame corner, no crash
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 REV_FAKE_CLICK=0.15,0.85 timeout 10 \
+    ./build/reverie -R opengl --shot 1 "$OUT/rc-corner" themes/ripple-lake \
+    > "$OUT/rc-corner.log" 2>&1 || true
+if grep -q "simulations: GPU" "$OUT/rc-corner.log" 2>/dev/null \
+   && [ -f "$OUT/rc-base.png" ] && [ -f "$OUT/rc-corner.png" ]; then
+    if python3 scripts/click_cmp.py "$OUT/rc-base.png" "$OUT/rc-corner.png" 0.15 0.85 2>/dev/null; then
+        echo "    ripple(click,corner): PASS (corner splash lands correctly)"
+        PASS=$((PASS+1))
+    else
+        echo "    ripple(click,corner): FAIL (corner splash misplaced)"
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    ripple(click,corner): SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
+fi
+stop_xvfb
+
 # ---- Themes: folder + packed + hostile rejection -----------------------------
 start_xvfb
 DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/theme" themes/ripple-lake \
@@ -219,7 +277,7 @@ start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \
     > "$OUT/vk.log" 2>&1 || true
 if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null; then
-    if grep -q "presenting via platform SHM path" "$OUT/vk.log" 2>/dev/null; then
+    if grep -q "frames present via the platform SHM path" "$OUT/vk.log" 2>/dev/null; then
         echo "    vulkan(shm):  PASS (renderer active$( [ -f "$OUT/vk.png" ] && echo ', screenshot' ))"
         PASS=$((PASS+1))
     else
