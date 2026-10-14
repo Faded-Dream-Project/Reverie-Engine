@@ -94,6 +94,8 @@ struct RTLayerInst {
         /* GPU fluid offload descriptor (address-stable: the GL renderer
          * keys its per-layer GPU sim state on &simdesc) */
         RSimFluid simdesc;
+        /* GPU ripple offload descriptor (same identity contract) */
+        RSimRipple rdesc;
         /* raster content serial — bumped on every (re)build; renderers
          * cache textures against it and skip redundant re-uploads */
         u64 content_id;
@@ -804,13 +806,20 @@ static bool ensure_sim_fb(RTLayerInst *in, u32 w, u32 h)
         return in->sim_fb.px != NULL;
 }
 
-bool rtscene_gpu_capable(const RTScene *sc)
+bool rtscene_gpu_capable(const RTScene *sc, bool sim_offload)
 {
         if (!sc)
                 return false;
-        for (int i = 0; i < sc->n; i++)
-                if (sc->layers[i].type == LT_RIPPLE)
-                        return false;
+        for (int i = 0; i < sc->n; i++) {
+                if (sc->layers[i].type == LT_RIPPLE) {
+                        /* ripple refraction needs the below-composite AND a
+                         * GPU height field: without sim offload the whole
+                         * scene must composite on the CPU (the old behavior
+                         * for every ripple scene, now only the fallback). */
+                        if (!sim_offload)
+                                return false;
+                }
+        }
         return true;
 }
 
@@ -872,12 +881,64 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                 bool emit_stretch = false; /* sim texture stretches over frame */
 
                 if (L->type == LT_RIPPLE) {
+                        if (fl && fl->sim_offload) {
+                                /* The renderer owns the simulation: emit a
+                         * descriptor instead of stepping the CPU wave
+                         * equation — the height field lives in an RGBA16F
+                         * ping-pong pair on the GPU and the refraction
+                         * happens in the composite shader reading the
+                         * accumulation target (the below-composite).
+                         * Grid sizing mirrors ripple_new() exactly. */
+                                u32 gw = (u32)W / 2, gh = (u32)H / 2;
+                                if (gw < 32) gw = 32;
+                                if (gh < 32) gh = 32;
+                                if (gw > 512) gw = 512;
+                                if (gh > 512) gh = 512;
+                                RSimRipple *rd = &in->rdesc;
+                                rd->dt = dt;
+                                rd->px = px;
+                                rd->py = py;
+                                rd->pressed = pressed;
+                                rd->strength = e.strength;
+                                rd->damping = L->r_damping;
+                                rd->radius = L->r_radius;
+                                rd->nclicks = clicks > 4 ? 4 : clicks;
+                                for (u32 c = 0; c < rd->nclicks; c++) {
+                                        rd->click_x[c] = click_x;
+                                        rd->click_y[c] = click_y;
+                                }
+                                rd->frame_w = (u32)W;
+                                rd->frame_h = (u32)H;
+                                rd->gw = gw;
+                                rd->gh = gh;
+                                sc->ptr[mon].clicks = 0;    /* consumed */
+                                if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                        break;
+                                RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                memset(cmd, 0, sizeof *cmd);
+                                cmd->rsim = rd;
+                                cmd->w = gw;
+                                cmd->h = gh;
+                                cmd->place_w = (u32)W;
+                                cmd->place_h = (u32)H;
+                                cmd->dx = 0;
+                                cmd->dy = 0;
+                                cmd->blend = L->blend;
+                                cmd->opacity = e.opacity;
+                                cmd->blur = 0.0;
+                                cmd->linear = true;
+                                continue;
+                        }
                         if (fl) {
-                                /* ripple needs the below-composite: CPU-only */
+                                /* GPU layers without sim offload cannot do
+                                 * refraction (no below-composite exists in
+                                 * emission mode) — main.c never asks for this
+                                 * combination; guard regardless. */
                                 static bool warned_ripple;
                                 if (!warned_ripple) {
                                         warned_ripple = true;
-                                        LOGW("layer '%s': ripple requires CPU compositing", L->name);
+                                        LOGW("layer '%s': ripple requires CPU compositing",
+                                             L->name);
                                 }
                                 continue;
                         }

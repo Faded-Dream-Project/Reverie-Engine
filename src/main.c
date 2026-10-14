@@ -405,15 +405,16 @@ int main(int argc, char **argv)
         if (!rend->wants_layers && strcmp(rend->name, "vulkan") == 0)
                 LOGI("vulkan tier: present path follows REV_VK_PRESENT (default: platform SHM)");
 
-        const bool gpu_layers = rend->wants_layers && rtscene_gpu_capable(sf.sc);
-        if (rend->wants_layers && !gpu_layers)
-                LOGI("scene needs CPU compositing (ripple layers present)");
         /* sim offload: only when the renderer owns simulations (GL tier with
-         * float render targets) — the scene then skips the CPU fluid solver
-         * entirely and emits GPU descriptors instead */
+         * float render targets) — the scene then skips the CPU fluid/ripple
+         * solvers entirely and emits GPU descriptors instead */
         const bool sim_offload = rend->wants_sims;
+        const bool gpu_layers = rend->wants_layers && rtscene_gpu_capable(sf.sc, sim_offload);
+        if (rend->wants_layers && !gpu_layers)
+                LOGI("scene needs CPU compositing (ripple layers need GPU sims "
+                     "this renderer declined)");
         if (gpu_layers)
-                LOGI("fluid simulation: %s",
+                LOGI("simulations: %s",
                      sim_offload ? "GPU (no per-pixel CPU work)"
                                  : "CPU (renderer declined GPU sims)");
 
@@ -560,6 +561,7 @@ int main(int argc, char **argv)
                                         cmd.linear = fl.cmds[k].linear;
                                         cmd.content_id = fl.cmds[k].content_id;
                                         cmd.sim = fl.cmds[k].sim;
+                                        cmd.rsim = fl.cmds[k].rsim;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);

@@ -250,6 +250,63 @@ int main(void)
 			}
 		}
 
+	/* 4b-3. GPU ripple offload: sim_offload=true emits an RSimRipple
+	 *     descriptor (grid mirrors ripple_new: half res, clamped 32..512),
+	 *     no CPU wave equation runs, no pixels; clicks consume-on-read. */
+	{
+		const char *txt =
+			"scene {"
+			"  layer w { type = ripple  strength = 1.6 }"
+			"}";
+		RTScene *sc = compile(txt, err, sizeof err);
+		CHECK(sc != NULL, "compile: %s", err);
+		if (sc) {
+			CHECK(rtscene_gpu_capable(sc, true),
+			      "ripple scene is GPU-compositable with sim offload");
+			CHECK(!rtscene_gpu_capable(sc, false),
+			      "ripple scene needs CPU compositing without sim offload");
+			RTFrameList fl;
+			memset(&fl, 0, sizeof fl);
+			fl.w = 1000;
+			fl.h = 400;
+			fl.sim_offload = true;
+			rtscene_pointer(sc, 0, 300, 100, 2, 1, true);
+			rtscene_click(sc, 0, 500, 200);
+			rtscene_render_layers(sc, &fl, 0, 0.5, 1.0 / 60.0);
+			CHECK(fl.n == 1, "one layer emitted (n=%d)", fl.n);
+			if (fl.n == 1) {
+				RTLayerCmd *c = &fl.cmds[0];
+				CHECK(c->rsim != NULL, "ripple descriptor present");
+				CHECK(c->px == NULL && c->sim == NULL,
+				      "no pixels, no fluid sim");
+				CHECK(c->w == 500 && c->h == 200,
+				      "heightfield at half res 500x200 (got %ux%u)",
+				      c->w, c->h);
+				CHECK(c->place_w == 1000 && c->place_h == 400,
+				      "stretched over the frame");
+				if (c->rsim) {
+					CHECK(c->rsim->gw == 500 && c->rsim->gh == 200,
+					      "grid mirrors ripple_new");
+					CHECK(c->rsim->pressed, "pointer state relayed");
+					CHECK(c->rsim->nclicks == 1,
+					      "click queued (got %u)", c->rsim->nclicks);
+					CHECK(c->rsim->strength > 1.5 && c->rsim->strength < 1.7,
+					      "strength passthrough");
+				}
+			}
+			/* clicks are consume-on-read */
+			RTFrameList fl2;
+			memset(&fl2, 0, sizeof fl2);
+			fl2.w = 1000;
+			fl2.h = 400;
+			fl2.sim_offload = true;
+			rtscene_render_layers(sc, &fl2, 0, 0.6, 1.0 / 60.0);
+			CHECK(fl2.n == 1 && fl2.cmds[0].rsim && fl2.cmds[0].rsim->nclicks == 0,
+			      "clicks consumed by the first render");
+			rtscene_free(sc);
+		}
+	}
+
 	/* 4c. animated gradient rebuilds WRITE cleanly â the old path
 	 *     re-rasterized into the same buffer every frame and blended
 	 *     over the previous frame's raster, so once a region had been

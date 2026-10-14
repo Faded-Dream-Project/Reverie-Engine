@@ -51,6 +51,22 @@ typedef struct {
         u32 dye_w, dye_h;      /* dye grid (matches the CPU solver)     */
 } RSimFluid;
 
+/* Per-frame ripple simulation descriptor (GPU offload). Same identity
+ * contract as RSimFluid: address-stable, owned by the scene's layer
+ * instance; the renderer runs the height-field wave equation and the
+ * refraction composite entirely on the GPU — the CPU never touches a
+ * per-pixel loop. Grid sizing mirrors ripple_new() exactly. */
+typedef struct {
+        f64 dt;                /* step seconds (already clamped)        */
+        f64 px, py;            /* pointer position, [0..1]              */
+        bool pressed;          /* button held (continuous drip)         */
+        f64 strength, damping, radius;
+        f64 click_x[4], click_y[4];  /* queued one-shot impacts, [0..1] */
+        u32 nclicks;           /* 0..4, consume-on-read                 */
+        u32 frame_w, frame_h;  /* device-pixel size of the layer        */
+        u32 gw, gh;            /* height field grid (matches ripple_new)*/
+} RSimRipple;
+
 /* One layer emission (GPU compositing). Pixels are straight-alpha RGBA8
  * packed u32 — identical to RFb contents — UNLESS sim != NULL, in which case
  * px is NULL and the renderer owns that layer's simulation. */
@@ -72,6 +88,8 @@ typedef struct {
                                   0: pixels change every frame        */
         const RSimFluid *sim;  /* fluid layer handed to the GPU; NULL
                                   for plain pixel layers              */
+        const RSimRipple *rsim;/* ripple layer handed to the GPU; NULL
+                                  unless this is a GPU ripple layer   */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;
@@ -80,7 +98,7 @@ struct RRenderer {
         const char *name;   /* "vulkan" | "opengl" | "cpu" */
         int tier;           /* 3 = vulkan, 2 = opengl, 1 = cpu */
         bool wants_layers;  /* GPU compositing of RLayerCmd streams */
-        bool wants_sims;    /* GPU-owned layer simulations (fluid) —
+        bool wants_sims;    /* GPU-owned layer simulations (fluid, ripple) —
                                settled during init(), never after */
 
         bool (*init)(RRenderer *r, RPlatform *p, char *err, size_t errcap);

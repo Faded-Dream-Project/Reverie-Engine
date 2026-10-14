@@ -157,6 +157,7 @@ typedef struct {
         void (*glUniform2f)(GLint_, GLfloat_, GLfloat_);
         void (*glUniform3f)(GLint_, GLfloat_, GLfloat_, GLfloat_);
         void (*glUniform1fv)(GLint_, GLsizei_, const GLfloat_ *);
+        void (*glUniform2fv)(GLint_, GLsizei_, const GLfloat_ *);
         void (*glDrawArrays)(GLenum_, GLint_, GLsizei_);
         void (*glClearColor)(GLfloat_, GLfloat_, GLfloat_, GLfloat_);
         void (*glClear)(GLenum_);
@@ -503,11 +504,118 @@ static const char *FS_FLUID_TONEMAP =
         "    fragColor = vec4(clamp(d * k, 0.0, 1.0), a);\n"
         "}\n";
 
+/* ---- GPU ripple solver (GLSL ES 3.00) ------------------------------------
+ * Mirrors ripple.c's wave equation: the height field lives in an RGBA16F
+ * ping-pong pair (.r = current height, .g = previous height), one pass =
+ * one CPU update step (new = 2h + c2*lap - prev*(1 - damping*0.05), with
+ * the pointer drip and queued click impacts folded into the same pass —
+ * exactly the order ripple_step() applies them). Border texels stay
+ * untouched, matching the CPU's 1..gw-2 loop bounds. */
+static const char *FS_RIPPLE_STEP =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_field;\n"
+        "uniform vec2 u_grid;\n"           /* gw, gh                      */
+        "uniform float u_damp;\n"          /* (1 - damping * 0.05)       */
+        "uniform vec2 u_ptr;\n"            /* pointer uv                 */
+        "uniform float u_ptrRad;\n"        /* radius * gw, grid texels   */
+        "uniform float u_ptrAmp;\n"        /* -strength                  */
+        "uniform int u_ptrOn;\n"
+        "uniform vec2 u_clickPos[4];\n"    /* impact centers, uv         */
+        "uniform vec2 u_clickParam[4];\n"  /* x: radius (texels), y: amp */
+        "uniform int u_nclicks;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "float splat(vec2 uv, vec2 pos, float rad) {\n"
+        "    vec2 d = (uv - pos) * u_grid;\n"
+        "    float d2 = dot(d, d) / (rad * rad + 1e-9);\n"
+        "    return d2 <= 1.0 ? (1.0 - d2) : 0.0;\n"
+        "}\n"
+        "void main() {\n"
+        "    vec2 texel = v_uvsrc * u_grid;\n"
+        "    vec4 f = texture(u_field, v_uvsrc);\n"
+        "    /* border: the CPU loops y/x in 1..gw-2 - edge cells never change */\n"
+        "    if (texel.x < 1.0 || texel.y < 1.0 ||\n"
+        "        texel.x > u_grid.x - 2.0 || texel.y > u_grid.y - 2.0) {\n"
+        "        fragColor = f;\n"
+        "        return;\n"
+        "    }\n"
+        "    float h = f.r;\n"
+        "    if (u_ptrOn == 1)\n"
+        "        h += u_ptrAmp * splat(v_uvsrc, u_ptr, u_ptrRad);\n"
+        "    for (int i = 0; i < 4; i++) {\n"
+        "        if (i >= u_nclicks) break;\n"
+        "        /* dropped stone: (1 - d^2)^2 falloff, amp -strength*1.5 */\n"
+        "        vec2 d = (v_uvsrc - u_clickPos[i]) * u_grid;\n"
+        "        float r2 = dot(d, d) / (u_clickParam[i].x * u_clickParam[i].x + 1e-9);\n"
+        "        if (r2 <= 1.0) {\n"
+        "            float t = 1.0 - r2;\n"
+        "            h += u_clickParam[i].y * t * t;\n"
+        "        }\n"
+        "    }\n"
+        "    float hl = texture(u_field, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).r;\n"
+        "    float hr = texture(u_field, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).r;\n"
+        "    float hu = texture(u_field, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).r;\n"
+        "    float hd = texture(u_field, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).r;\n"
+        "    float lap = hl + hr + hu + hd - 4.0 * h;\n"
+        "    float nh = 2.0 * h + 0.24 * lap - f.g * u_damp;\n"
+        "    fragColor = vec4(nh, h, 0.0, 1.0);\n"   /* new cur; old cur = prev */
+        "}\n";
+
+/* Ripple refraction composite — mirrors ripple_apply(): sample the
+ * below-composite (accum) offset by the surface-normal gradient, add the
+ * upper-left specular glint, then source-over the result onto the accum
+ * with the layer opacity. The CPU rounds offsets to whole pixels and
+ * samples the height field nearest; the shader uses continuous offsets
+ * with linear sampling — smoother, visually equivalent. */
+static const char *FS_RIPPLE_COMPOSITE =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_dst;\n"        /* accumulation (below)        */
+        "uniform sampler2D u_field;\n"      /* height field                */
+        "uniform vec2 u_grid;\n"
+        "uniform vec2 u_amp;\n"             /* strength*26 / (w, h)        */
+        "uniform float u_opacity;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 texel = v_screen * u_grid;\n"
+        "    /* CPU clamps gradient samples to 1..gw-2 */\n"
+        "    vec2 c = clamp(texel, vec2(1.0), u_grid - vec2(2.0));\n"
+        "    vec2 base = c / u_grid;\n"
+        "    float hl = texture(u_field, base - vec2(1.0 / u_grid.x, 0.0)).r;\n"
+        "    float hr = texture(u_field, base + vec2(1.0 / u_grid.x, 0.0)).r;\n"
+        "    float hu = texture(u_field, base + vec2(0.0, 1.0 / u_grid.y)).r;\n"
+        "    float hd = texture(u_field, base - vec2(0.0, 1.0 / u_grid.y)).r;\n"
+        "    float dxn = (hr - hl) * 0.5;\n"
+        "    float dyn = (hu - hd) * 0.5;\n"
+        "    vec4 dst = texture(u_dst, v_screen);\n"
+        "    /* refraction: offset sample of the below-composite */\n"
+        "    vec2 suv = clamp(v_screen + vec2(dxn, dyn) * u_amp, vec2(0.0), vec2(1.0));\n"
+        "    vec4 p = texture(u_dst, suv);\n"
+        "    /* specular highlight: light from the upper-left (ripple_apply) */\n"
+        "    float len = sqrt(dxn * dxn + dyn * dyn + 0.25);\n"
+        "    float dt = (dyn * -0.7 + 0.5 * 0.7) / len;\n"
+        "    float spec = dt > 0.0 ? pow(dt, 24.0) : 0.0;\n"
+        "    vec3 rgb = clamp(p.rgb + vec3(spec * (110.0 / 255.0),\n"
+        "                                  spec * (112.0 / 255.0),\n"
+        "                                  spec * (120.0 / 255.0)), 0.0, 1.0);\n"
+        "    /* source-over onto the accum with layer opacity (straight alpha) */\n"
+        "    float as = p.a * u_opacity;\n"
+        "    float ad = dst.a;\n"
+        "    float ao = as + ad * (1.0 - as);\n"
+        "    vec3 co = ao > 0.0 ? (as * rgb + (1.0 - as) * ad * dst.rgb) / ao\n"
+        "                       : vec3(0.0);\n"
+        "    fragColor = vec4(co, ao);\n"
+        "}\n";
+
 /* ---- renderer state ------------------------------------------------------- */
 enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
        PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
        PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
-       PROG_F_TONEMAP, PROG_COUNT };
+       PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_COUNT };
 #define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
@@ -530,6 +638,18 @@ typedef struct {
         u64 last_seen;           /* GC stamp (frame counter)             */
         bool ok;                 /* resources valid                      */
 } GLFluid;
+
+        /* ---- GPU ripple state (one per live ripple layer per window) ------ */
+#define GL_MAX_RIPPLES 8
+
+typedef struct {
+        const RSimRipple *key;   /* scene descriptor address (identity)  */
+        GLuint_ field[2], fbo[2];
+        u32 gw, gh;              /* height field grid                    */
+        int cur;                 /* ping-pong current index              */
+        u64 last_seen;           /* GC stamp (frame counter)             */
+        bool ok;                 /* resources valid                      */
+} GLRipple;
 
 /* ---- content-addressed upload cache ---------------------------------------
  * Static layer rasters carry a monotonic content serial (scene.c); a cache
@@ -596,12 +716,13 @@ typedef struct {
         GLuint_ scratch_fbo[4];
         bool fbo_made;
 
-        /* GPU fluid solver: enabled when RGBA16F render targets probe OK
-         * AND the rasterizer is hardware (llvmpipe sims would be slower
-         * than the CPU solver — fragment dispatch overhead beats tight C
-         * loops there, so software GL keeps the CPU sim). */
-        bool fluid_ok;
+        /* GPU fluid + ripple solvers: enabled when RGBA16F render targets
+         * probe OK AND the rasterizer is hardware (llvmpipe sims would be
+         * slower than the CPU solvers — fragment dispatch overhead beats
+         * tight C loops there, so software GL keeps the CPU sims). */
+        bool sims_ok;
         GLFluid fluids[REV_PLATFORM_MAX_OUTPUTS][GL_MAX_FLUIDS];
+        GLRipple ripples[REV_PLATFORM_MAX_OUTPUTS][GL_MAX_RIPPLES];
         u64 frame_no;
 
         /* content-addressed upload cache (context-global: content serials
@@ -622,6 +743,12 @@ typedef struct {
                 int posA, posB, impA, impB, radA, radB;
                 int colA, colB, ambient;
         } fu[PROG_COUNT];
+        /* ripple program uniforms (indexed like prog[]) */
+        struct {
+                int field, grid, damp, ptr, ptrRad, ptrAmp, ptrOn;
+                int clickPos, clickParam, nclicks;
+                int amp, opacity;
+        } ru[PROG_COUNT];
 
         RPlatform *plat;
         int cur_win;
@@ -1082,6 +1209,114 @@ static GLuint_ gl_fluid_step(RenderGL *r, GLFluid *f, const RSimFluid *sd)
         return f->out8;
 }
 
+/* ---- GPU ripple solver ------------------------------------------------------ */
+
+/* find/create the ripple slot for a scene descriptor (same identity contract
+ * as fluid_slot); NULL when the table is full. */
+static GLRipple *ripple_slot(RenderGL *r, int win, const RSimRipple *sd)
+{
+        GLRipple *tab = r->ripples[win];
+        for (int i = 0; i < GL_MAX_RIPPLES; i++)
+                if (tab[i].key == sd && tab[i].ok) {
+                        tab[i].last_seen = r->frame_no;
+                        return &tab[i];
+                }
+
+        GLRipple *best = NULL;
+        for (int i = 0; i < GL_MAX_RIPPLES; i++) {
+                if (!tab[i].key) {
+                        best = &tab[i];
+                        break;
+                }
+                if (r->frame_no - tab[i].last_seen > 300 &&
+                    (!best || tab[i].last_seen < best->last_seen))
+                        best = &tab[i];
+        }
+        if (!best) {
+                static bool warned;
+                if (!warned) {
+                        warned = true;
+                        LOGW("opengl: too many ripple layers, dropping sims");
+                }
+                return NULL;
+        }
+
+        GL *g = &r->g;
+        fluid_free_pair(g, best->field, best->fbo);
+        best->gw = sd->gw;
+        best->gh = sd->gh;
+        best->cur = 0;
+        best->ok = false;
+        best->key = sd;
+        best->last_seen = r->frame_no;
+
+        if (best->gw < 8 || best->gh < 8)
+                return NULL;
+        if (!fluid_make_pair(r, best->field, best->fbo, best->gw, best->gh))
+                return NULL;
+        best->ok = true;
+        return best;
+}
+
+/* Advance the height field; returns the current field texture. */
+static GLuint_ gl_ripple_step(RenderGL *r, GLRipple *rp, const RSimRipple *sd)
+{
+        GL *g = &r->g;
+        f64 dt = sd->dt;
+        if (dt <= 0)
+                dt = 1.0 / 60.0;
+        if (dt > 0.1)
+                dt = 0.1;
+        /* ripple_configure()'s clamps — keep the GPU field inside the same
+         * ranges the CPU solver enforces */
+        const double strength = sd->strength < 0.1 ? 0.1 :
+                                sd->strength > 8.0 ? 8.0 : sd->strength;
+        const double damping = sd->damping < 0.001 ? 0.001 :
+                                sd->damping > 0.9 ? 0.9 : sd->damping;
+        const double radius = sd->radius < 0.002 ? 0.002 :
+                              sd->radius > 0.1 ? 0.1 : sd->radius;
+        /* ripple_step() runs (int)clamp(dt*60, 0.5, 2.0) iterations, with
+         * the pointer drip and click impacts applied once, before them */
+        int steps = (int)rev_clampf(dt * 60.0, 0.5, 2.0);
+
+        for (int s = 0; s < steps; s++) {
+                int pi = PROG_R_STEP;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->ru[pi].grid, (float)rp->gw, (float)rp->gh);
+                g->glUniform1f(r->ru[pi].damp,
+                               (float)(1.0 - damping * 0.05));
+                g->glUniform2f(r->ru[pi].ptr, (float)sd->px, (float)sd->py);
+                g->glUniform1f(r->ru[pi].ptrRad, (float)(radius * rp->gw));
+                g->glUniform1f(r->ru[pi].ptrAmp, (float)(-strength));
+                g->glUniform1i(r->ru[pi].ptrOn, (s == 0 && sd->pressed) ? 1 : 0);
+                g->glUniform1i(r->ru[pi].nclicks, s == 0 ? (int)sd->nclicks : 0);
+                if (s == 0 && sd->nclicks > 0) {
+                        float cpos[8], cpar[8];
+                        const double crad = rev_clampf(radius * 2.5, 0.004, 0.12) * rp->gw;
+                        const double camp = -strength * 1.5;
+                        for (u32 c = 0; c < sd->nclicks && c < 4; c++) {
+                                cpos[c * 2]     = (float)sd->click_x[c];
+                                cpos[c * 2 + 1] = (float)sd->click_y[c];
+                                cpar[c * 2]     = (float)crad;
+                                cpar[c * 2 + 1] = (float)camp;
+                        }
+                        for (u32 c = sd->nclicks; c < 4; c++) {
+                                cpos[c * 2] = cpos[c * 2 + 1] = 0.0f;
+                                cpar[c * 2] = cpar[c * 2 + 1] = 0.0f;
+                        }
+                        g->glUniform2fv(r->ru[pi].clickPos, 4, cpos);
+                        g->glUniform2fv(r->ru[pi].clickParam, 4, cpar);
+                }
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, rp->field[rp->cur]);
+                RTarget t = { rp->field[rp->cur ^ 1], rp->fbo[rp->cur ^ 1],
+                              rp->gw, rp->gh };
+                pass_full(r, pi, &t);
+                rp->cur ^= 1;
+        }
+        return rp->field[rp->cur];
+}
+
 /* ---- content-addressed upload ---------------------------------------------- */
 static GLuint_ upload_layer_tex(RenderGL *r, const RLayerCmd *cmd)
 {
@@ -1374,6 +1609,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         LOADGL(glUniform2f, "glUniform2f");
         LOADGL(glUniform3f, "glUniform3f");
         LOADGL(glUniform1fv, "glUniform1fv");
+        LOADGL(glUniform2fv, "glUniform2fv");
         LOADGL(glDrawArrays, "glDrawArrays");
         LOADGL(glClearColor, "glClearColor");
         LOADGL(glClear, "glClear");
@@ -1423,11 +1659,12 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
             !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap))
                 return false;
 
-        /* GPU fluid solver: probe RGBA16F renderability by actually building
-         * one (extension strings lie less often than FBO status). Hardware
-         * GL + float targets -> the sim moves off the CPU entirely; software
-         * GL keeps the CPU solver (fragment dispatch overhead loses to tight
-         * C loops on llvmpipe) unless REV_GL_FLUID_SW=1 opts in for testing. */
+        /* GPU fluid + ripple solvers: probe RGBA16F renderability by actually
+         * building one (extension strings lie less often than FBO status).
+         * Hardware GL + float targets -> sims move off the CPU entirely;
+         * software GL keeps the CPU solvers (fragment dispatch overhead
+         * loses to tight C loops on llvmpipe) unless REV_GL_FLUID_SW=1 opts
+         * in for testing. */
         {
                 GLuint_ ft = 0, ff = 0;
                 g->glGenTextures(1, &ft);
@@ -1439,14 +1676,14 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 g->glBindFramebuffer(GL_FRAMEBUFFER, ff);
                 g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                           GL_TEXTURE_2D, ft, 0);
-                r->fluid_ok = g->glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                r->sims_ok = g->glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
                               GL_FRAMEBUFFER_COMPLETE;
                 g->glDeleteTextures(1, &ft);
                 g->glDeleteFramebuffers(1, &ff);
-                if (r->fluid_ok && r->software && !getenv("REV_GL_FLUID_SW"))
-                        r->fluid_ok = false;
+                if (r->sims_ok && r->software && !getenv("REV_GL_FLUID_SW"))
+                        r->sims_ok = false;
         }
-        if (r->fluid_ok) {
+        if (r->sims_ok) {
                 char ferr[256] = { 0 };
                 if (!gl_make_program(r, PROG_F_VELF, FS_FLUID_VELF, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_F_DYEF, FS_FLUID_DYEF, ferr, sizeof ferr) ||
@@ -1457,16 +1694,18 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                     !gl_make_program(r, PROG_F_GRADSUB, FS_FLUID_GRADSUB, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_F_ADV_VEL, FS_FLUID_ADVECT_VEL, ferr, sizeof ferr) ||
                     !gl_make_program(r, PROG_F_ADV_DYE, FS_FLUID_ADVECT_DYE, ferr, sizeof ferr) ||
-                    !gl_make_program(r, PROG_F_TONEMAP, FS_FLUID_TONEMAP, ferr, sizeof ferr)) {
-                        LOGW("opengl: fluid shaders failed (%s) — sims stay on CPU", ferr);
-                        r->fluid_ok = false;
+                    !gl_make_program(r, PROG_F_TONEMAP, FS_FLUID_TONEMAP, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_R_STEP, FS_RIPPLE_STEP, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_R_COMPOSITE, FS_RIPPLE_COMPOSITE, ferr, sizeof ferr)) {
+                        LOGW("opengl: sim shaders failed (%s) — sims stay on CPU", ferr);
+                        r->sims_ok = false;
                 }
         }
-        rr->wants_sims = r->fluid_ok;
-        if (r->fluid_ok)
-                LOGI("opengl: fluid solver on GPU (RGBA16F render targets)");
+        rr->wants_sims = r->sims_ok;
+        if (r->sims_ok)
+                LOGI("opengl: fluid + ripple solvers on GPU (RGBA16F render targets)");
         else if (!r->software)
-                LOGI("opengl: no float render target — fluid stays on CPU");
+                LOGI("opengl: no float render target — sims stay on CPU");
 
         /* uniform locations + static sampler bindings */
         for (int i = 0; i < PROG_COUNT; i++) {
@@ -1496,6 +1735,10 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 int lc = g->glGetUniformLocation(pg, "u_curl");
                 if (lc >= 0)
                         g->glUniform1i(lc, 1);
+                /* ripple: height field on unit 0 (u_dst is already unit 1) */
+                int lfi = g->glGetUniformLocation(pg, "u_field");
+                if (lfi >= 0)
+                        g->glUniform1i(lfi, 0);
                 r->u[i].off = g->glGetUniformLocation(pg, "u_off");
                 r->u[i].scale = g->glGetUniformLocation(pg, "u_scale");
                 r->u[i].dir = g->glGetUniformLocation(pg, "u_dir");
@@ -1518,6 +1761,18 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 r->fu[i].colA = g->glGetUniformLocation(pg, "u_colA");
                 r->fu[i].colB = g->glGetUniformLocation(pg, "u_colB");
                 r->fu[i].ambient = g->glGetUniformLocation(pg, "u_ambient");
+                r->ru[i].field = g->glGetUniformLocation(pg, "u_field");
+                r->ru[i].grid = g->glGetUniformLocation(pg, "u_grid");
+                r->ru[i].damp = g->glGetUniformLocation(pg, "u_damp");
+                r->ru[i].ptr = g->glGetUniformLocation(pg, "u_ptr");
+                r->ru[i].ptrRad = g->glGetUniformLocation(pg, "u_ptrRad");
+                r->ru[i].ptrAmp = g->glGetUniformLocation(pg, "u_ptrAmp");
+                r->ru[i].ptrOn = g->glGetUniformLocation(pg, "u_ptrOn");
+                r->ru[i].clickPos = g->glGetUniformLocation(pg, "u_clickPos[0]");
+                r->ru[i].clickParam = g->glGetUniformLocation(pg, "u_clickParam[0]");
+                r->ru[i].nclicks = g->glGetUniformLocation(pg, "u_nclicks");
+                r->ru[i].amp = g->glGetUniformLocation(pg, "u_amp");
+                r->ru[i].opacity = g->glGetUniformLocation(pg, "u_opacity");
         }
         /* PROG_F_ADV_DYE samples BOTH u_dye and u_vel — the generic loop
          * above bound both to unit 0, so the dye advection read the DYE
@@ -1661,6 +1916,49 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
         if (!cmd || !cmd->w || !cmd->h)
                 return false;
 
+        /* 0. GPU ripple layers: height-field step + refraction composite in
+         *    ONE specialized pass — the refraction reads the accumulation
+         *    target (the below-composite, exactly what ripple_apply() gets
+         *    handed on the CPU) and writes the flipped accum, so the normal
+         *    blur/composite machinery below never touches it. */
+        if (cmd->rsim) {
+                if (!r->sims_ok)
+                        return false;    /* scene should not have offloaded */
+                GLRipple *rp = ripple_slot(r, r->cur_win, cmd->rsim);
+                if (!rp)
+                        return false;
+                GLuint_ field = gl_ripple_step(r, rp, cmd->rsim);
+                if (!field)
+                        return false;
+                int wi = r->cur_win;
+                RTarget *accum_rd = &r->accum[wi][r->accum_cur[wi]];
+                RTarget *accum_wr = &r->accum[wi][r->accum_cur[wi] ^ 1];
+                g->glBindFramebuffer(GL_FRAMEBUFFER, accum_wr->fbo);
+                g->glViewport(0, 0, (int)accum_wr->w, (int)accum_wr->h);
+                g->glUseProgram(r->prog[PROG_R_COMPOSITE]);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, field);
+                g->glActiveTexture(GL_TEXTURE1);
+                g->glBindTexture(GL_TEXTURE_2D, accum_rd->tex);
+                g->glActiveTexture(GL_TEXTURE0);
+                {
+                        int pi = PROG_R_COMPOSITE;
+                        const double strength = cmd->rsim->strength < 0.1 ? 0.1 :
+                                                cmd->rsim->strength > 8.0 ? 8.0 :
+                                                cmd->rsim->strength;
+                        g->glUniform2f(r->ru[pi].grid, (float)rp->gw, (float)rp->gh);
+                        g->glUniform2f(r->ru[pi].amp,
+                                       (float)(strength * 26.0 / (double)accum_wr->w),
+                                       (float)(strength * 26.0 / (double)accum_wr->h));
+                        g->glUniform1f(r->ru[pi].opacity,
+                                       (float)(cmd->opacity < 0 ? 0 :
+                                               cmd->opacity > 1 ? 1 : cmd->opacity));
+                }
+                draw_full(g);
+                r->accum_cur[wi] ^= 1;
+                return true;
+        }
+
         /* 1. obtain the layer's source texture:
          *    - GPU-owned fluid layers are simulated here (no CPU pixels,
          *      no upload — the whole per-pixel pipeline stays on the GPU)
@@ -1669,7 +1967,7 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
          *      (the old path pushed every cached raster every frame). */
         GLuint_ src_tex;
         if (cmd->sim) {
-                if (!r->fluid_ok)
+                if (!r->sims_ok)
                         return false;    /* scene should not have offloaded */
                 GLFluid *f = fluid_slot(r, r->cur_win, cmd->sim);
                 if (!f)
@@ -1947,7 +2245,7 @@ static void gl_fini(RRenderer *rr)
                         g->glDeleteTextures(1, &r->accum[i][1].tex);
                         g->glDeleteFramebuffers(1, &r->accum[i][1].fbo);
                 }
-                /* fluid solver state + upload cache */
+                /* fluid + ripple solver state + upload cache */
                 for (int i = 0; i < REV_PLATFORM_MAX_OUTPUTS; i++) {
                         for (int j = 0; j < GL_MAX_FLUIDS; j++) {
                                 GLFluid *f = &r->fluids[i][j];
@@ -1966,6 +2264,14 @@ static void gl_fini(RRenderer *rr)
                                 }
                                 f->key = NULL;
                                 f->ok = false;
+                        }
+                        for (int j = 0; j < GL_MAX_RIPPLES; j++) {
+                                GLRipple *rp = &r->ripples[i][j];
+                                if (!rp->key)
+                                        continue;
+                                fluid_free_pair(g, rp->field, rp->fbo);
+                                rp->key = NULL;
+                                rp->ok = false;
                         }
                 }
                 for (int i = 0; i < GL_TEX_CACHE; i++) {

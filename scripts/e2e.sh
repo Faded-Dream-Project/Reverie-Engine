@@ -90,16 +90,16 @@ else
 fi
 stop_xvfb
 
-# ---- OpenGL tier: GPU fluid solver (forced via the llvmpipe test hook) ------
-# REV_GL_FLUID_SW=1 runs the shader-based fluid sim even on software GL so
-# the whole GPU sim path (splat/vorticity/Jacobi/advection/tonemap) stays
-# regression-tested without hardware.
+# ---- OpenGL tier: GPU fluid + ripple solvers (forced via the llvmpipe hook) --
+# REV_GL_FLUID_SW=1 runs the shader-based sims even on software GL so the
+# whole GPU sim path (fluid splats/Jacobi/advection/tonemap + ripple wave
+# equation/refraction composite) stays regression-tested without hardware.
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 timeout 10 \
     ./build/reverie -R opengl --shot 5 "$OUT/glf" scenes/fluid-aurora.rev \
     > "$OUT/glf.log" 2>&1 || true
-if grep -q "fluid solver on GPU" "$OUT/glf.log" 2>/dev/null \
-   && grep -q "fluid simulation: GPU" "$OUT/glf.log" 2>/dev/null; then
+if grep -q "fluid + ripple solvers on GPU" "$OUT/glf.log" 2>/dev/null \
+   && grep -q "simulations: GPU" "$OUT/glf.log" 2>/dev/null; then
     echo "    opengl(fluid): PASS (GPU sim active$( [ -f "$OUT/glf.png" ] && echo ', screenshot' ))"
     PASS=$((PASS+1))
 elif grep -q "renderer: opengl" "$OUT/glf.log" 2>/dev/null; then
@@ -108,6 +108,26 @@ elif grep -q "renderer: opengl" "$OUT/glf.log" 2>/dev/null; then
     FAIL=$((FAIL+1))
 else
     echo "    opengl(fluid): SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
+fi
+stop_xvfb
+
+# ---- OpenGL tier: GPU ripple (the scene that used to be locked out of ------
+# GPU compositing entirely — refraction composites against the accum FBO)
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 REV_FAKE_POINTER=0.1 timeout 10 \
+    ./build/reverie -R opengl --shot 6 "$OUT/rip" scenes/ripple-lake.rev \
+    > "$OUT/rip.log" 2>&1 || true
+if grep -q "simulations: GPU" "$OUT/rip.log" 2>/dev/null \
+   && ! grep -q "scene needs CPU compositing" "$OUT/rip.log" 2>/dev/null; then
+    echo "    opengl(ripple): PASS (GPU compositing + GPU sim$( [ -f "$OUT/rip.png" ] && echo ', screenshot' ))"
+    PASS=$((PASS+1))
+elif grep -q "renderer: opengl" "$OUT/rip.log" 2>/dev/null; then
+    echo "    opengl(ripple): FAIL (ripple scene fell back to CPU compositing)"
+    cat "$OUT/rip.log"
+    FAIL=$((FAIL+1))
+else
+    echo "    opengl(ripple): SKIP (no libEGL / GL vendor on this system)"
     SKIP=$((SKIP+1))
 fi
 stop_xvfb

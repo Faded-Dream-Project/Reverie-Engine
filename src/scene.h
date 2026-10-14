@@ -77,9 +77,11 @@ typedef struct {
         bool sim_offload;  /* renderer owns the sims (input flag) */
 } RTFrameList;
 
-/* True when no layer needs below-composite feedback (ripple), i.e. the
- * frame can be built as an independent layer list for GPU compositing. */
-bool rtscene_gpu_capable(const RTScene *sc);
+/* True when the frame can be built as an independent layer list for GPU
+ * compositing. Ripple layers need the renderer to own simulations (their
+ * refraction composites against the below-frame ON the GPU); without sim
+ * offload such scenes must composite on the CPU. */
+bool rtscene_gpu_capable(const RTScene *sc, bool sim_offload);
 
 /* Renders the scene for monitor `mon` into fb at time t (seconds since
  * scene start), advancing simulations by dt. */
