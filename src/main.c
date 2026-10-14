@@ -396,6 +396,12 @@ int main(int argc, char **argv)
         while (g_run) {
                 f64 now = rev_monotonic();
                 f64 dt = now - last_frame;
+                /* dt must span START-to-START (render + pacing wait): the
+                 * old code set last_frame AFTER the pacing wait, so dt was
+                 * the few microseconds between wait-end and loop-top — every
+                 * simulation (fluid/ripple/particles) stepped with dt≈0 and
+                 * effectively froze (only wall-clock-t animations moved). */
+                last_frame = now;
                 f64 t = now - t0;
 
                 plat->pump(plat);
@@ -592,7 +598,6 @@ int main(int argc, char **argv)
                         if (!g_run || plat->should_close(plat))
                                 break;    /* quit arrived during the wait */
                 }
-                last_frame = rev_monotonic();
                 frames++;
         }
 
