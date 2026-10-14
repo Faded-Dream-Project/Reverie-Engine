@@ -13,13 +13,15 @@
  *
  * Automatic selection (documented, measured, no software layers without
  * benefit — see docs/BACKENDS.md for the rationale and benchmarks):
- *     1. OpenGL with a HARDWARE context — the only tier that actually
- *        renders and simulates on the GPU today
- *     2. the native CPU renderer when no hardware GL exists (a software
- *        GL stack would initialize llvmpipe to do what the CPU renderer
- *        does natively; REV_AUTO_GL_SW=1 opts into llvmpipe anyway)
- *     3. the Vulkan tier is EXCLUDED from auto while it is present-only
- *        (CPU compositing + a frame upload); REV_AUTO_VK=1 opts in
+ *     1. OpenGL with a HARDWARE context — renders and simulates on the
+ *        GPU; the long-proven tier, so it keeps first place in auto
+ *     2. the Vulkan tier on a HARDWARE device — the GPU compute
+ *        compositing tier (every layer op and the fluid/ripple solvers
+ *        run as compute kernels)
+ *     3. the native CPU renderer otherwise (a software GL or lavapipe
+ *        stack would initialize an entire software pipeline to deliver
+ *        what the CPU renderer does natively; REV_AUTO_GL_SW /
+ *        REV_AUTO_VK opt in anyway)
  *
  * All GPU backends are loaded with dlopen() at runtime and never linked.
  *

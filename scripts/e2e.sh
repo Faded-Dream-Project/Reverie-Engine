@@ -7,9 +7,12 @@
 #   1. cpu          (always available — the engine's own compositor)
 #   2. opengl       (requires libEGL + a GL vendor; llvmpipe counts)
 #   3. vulkan       (requires libvulkan + an ICD; lavapipe counts)
-#      - twice: the 0.1.1 default (platform SHM present) AND the WSI
-#        swapchain present (REV_VK_PRESENT=wsi), so both paths stay
-#        regression-tested.
+#      - the GPU compute compositing tier, present via the platform SHM
+#        path (default) and the WSI swapchain (REV_VK_PRESENT=wsi), with
+#        PIXEL PARITY vs the CPU renderer on both paths (static scene,
+#        byte-for-byte) and the GPU sims (fluid + ripple) forced on via
+#        REV_VK_SIMS_SW=1 — the whole compute path stays regression
+#        tested without hardware.
 #
 # GPU tiers are skipped gracefully when their libraries are not loadable.
 # When the local test stack exists at ../gpulibs/root (llvmpipe + lavapipe,
@@ -305,16 +308,21 @@ else
     SKIP=$((SKIP+1))
 fi
 
-# ---- Vulkan tier: default present path (platform SHM) -----------------------
+# ---- Vulkan tier: GPU compute compositing, platform present -----------------
+# The tier composites every layer as a compute kernel; the finished frame is
+# copied out and presented via wl_shm/MIT-SHM.
 start_xvfb
-DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \
+DISPLAY="$XDISPLAY" env $GPU_ENV timeout 10 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \
     > "$OUT/vk.log" 2>&1 || true
 if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null; then
-    if grep -q "frames present via the platform SHM path" "$OUT/vk.log" 2>/dev/null; then
-        echo "    vulkan(shm):  PASS (renderer active$( [ -f "$OUT/vk.png" ] && echo ', screenshot' ))"
+    ok=1
+    grep -q "GPU COMPUTE COMPOSITING" "$OUT/vk.log" 2>/dev/null || ok=0
+    grep -q "platform SHM path" "$OUT/vk.log" 2>/dev/null || ok=0
+    if [ "$ok" = 1 ]; then
+        echo "    vulkan(shm):  PASS (GPU compute compositing active)"
         PASS=$((PASS+1))
     else
-        echo "    vulkan(shm):  FAIL (present-path log line missing)"
+        echo "    vulkan(shm):  FAIL (compute compositing / present-path log missing)"
         FAIL=$((FAIL+1))
     fi
 else
@@ -323,21 +331,94 @@ else
 fi
 stop_xvfb
 
-# ---- Vulkan tier: WSI swapchain present (REV_VK_PRESENT=wsi) ----------------
-start_xvfb
-DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_PRESENT=wsi timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vkw" "$SCENE" \
-    > "$OUT/vkw.log" 2>&1 || true
-if grep -q "renderer: vulkan" "$OUT/vkw.log" 2>/dev/null; then
-    if grep -q "swapchain present path ready" "$OUT/vkw.log" 2>/dev/null; then
-        echo "    vulkan(wsi):  PASS (swapchain present active$( [ -f "$OUT/vkw.png" ] && echo ', screenshot' ))"
-        PASS=$((PASS+1))
-    else
-        echo "    vulkan(wsi):  FAIL (swapchain path did not initialize)"
-        FAIL=$((FAIL+1))
+# ---- Vulkan tier: GPU compositing pixel parity (static scene) ---------------
+# A static scene removes animation timing from the comparison, so the
+# compute kernels' output must match the CPU compositor BYTE FOR BYTE.
+if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null; then
+    start_xvfb
+    STATIC=$(mktemp -d)
+    sed 's/fps = 60/fps = 5/; s/parallax = 0.14//; s/parallax = 0.05//; s/opacity = 0.8/opacity = 1.0/' \
+        "$SCENE" > "$STATIC/static.rev" 2>/dev/null || cp "$SCENE" "$STATIC/static.rev"
+    # assets are referenced relative to the scene file
+    SCENE_DIR=$(dirname "$SCENE")
+    if [ -d "$SCENE_DIR/assets" ]; then
+        cp -r "$SCENE_DIR/assets" "$STATIC/" 2>/dev/null || true
     fi
+    DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 2 "$OUT/stcpu" "$STATIC/static.rev" \
+        > "$OUT/stcpu.log" 2>&1 || true
+    DISPLAY="$XDISPLAY" env $GPU_ENV timeout 10 ./build/reverie -R vulkan --shot 2 "$OUT/stvk" "$STATIC/static.rev" \
+        > "$OUT/stvk.log" 2>&1 || true
+    DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_PRESENT=wsi timeout 10 ./build/reverie -R vulkan --shot 2 "$OUT/stvw" "$STATIC/static.rev" \
+        > "$OUT/stvw.log" 2>&1 || true
+    if [ -f "$OUT/stvk.png" ] && [ -f "$OUT/stcpu.png" ]; then
+        if python3 scripts/rev_shot_cmp.py "$OUT/stvk.png" "$OUT/stcpu.png" 2 8 >/dev/null 2>&1; then
+            echo "    vulkan(cmp):  PASS (platform path pixels match CPU tier)"
+            PASS=$((PASS+1))
+        else
+            echo "    vulkan(cmp):  FAIL (compute compositing diverged from CPU tier)"
+            python3 scripts/rev_shot_cmp.py "$OUT/stvk.png" "$OUT/stcpu.png" 2 8 || true
+            FAIL=$((FAIL+1))
+        fi
+    else
+        echo "    vulkan(cmp):  SKIP (screenshot missing)"
+        SKIP=$((SKIP+1))
+    fi
+    if [ -f "$OUT/stvw.png" ] && [ -f "$OUT/stcpu.png" ]; then
+        if python3 scripts/rev_shot_cmp.py "$OUT/stvw.png" "$OUT/stcpu.png" 2 8 >/dev/null 2>&1; then
+            echo "    vulkan(wcmp): PASS (WSI blit path pixels match CPU tier)"
+            PASS=$((PASS+1))
+        else
+            echo "    vulkan(wcmp): FAIL (WSI blit path diverged from CPU tier)"
+            python3 scripts/rev_shot_cmp.py "$OUT/stvw.png" "$OUT/stcpu.png" 2 8 || true
+            FAIL=$((FAIL+1))
+        fi
+    else
+        echo "    vulkan(wcmp): SKIP (screenshot missing)"
+        SKIP=$((SKIP+1))
+    fi
+    rm -rf "$STATIC"
+    stop_xvfb
+fi
+
+# ---- Vulkan tier: GPU sims (forced on software devices via REV_VK_SIMS_SW) --
+# The whole GPU sim path (fluid splats/Jacobi/advection/tonemap + ripple wave
+# equation/refraction composite) stays regression-tested on lavapipe.
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_SIMS_SW=1 timeout 12 \
+    ./build/reverie -R vulkan --shot 5 "$OUT/vkf" scenes/fluid-aurora.rev \
+    > "$OUT/vkf.log" 2>&1 || true
+if grep -q "fluid + ripple solvers on GPU" "$OUT/vkf.log" 2>/dev/null \
+   && grep -q "simulations: GPU" "$OUT/vkf.log" 2>/dev/null; then
+    echo "    vulkan(fluid): PASS (GPU sim active$( [ -f "$OUT/vkf.png" ] && echo ', screenshot' ))"
+    PASS=$((PASS+1))
+elif grep -q "renderer: vulkan" "$OUT/vkf.log" 2>/dev/null; then
+    echo "    vulkan(fluid): FAIL (GPU sim did not activate)"
+    cat "$OUT/vkf.log"
+    FAIL=$((FAIL+1))
 else
-    echo "    vulkan(wsi):  SKIP (no libvulkan / ICD on this system)"
+    echo "    vulkan(fluid): SKIP (no libvulkan / ICD on this system)"
     SKIP=$((SKIP+1))
+fi
+stop_xvfb
+
+# ---- Vulkan tier: GPU ripple + click parity (the field-reported scene) -------
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_SIMS_SW=1 REV_FAKE_POINTER=0.1 REV_FAKE_CLICK="0.5,0.5@2" \
+    timeout 12 ./build/reverie -R vulkan --shot 2.6 "$OUT/ripv" scenes/ripple-lake.rev \
+    > "$OUT/ripv.log" 2>&1 || true
+if grep -q "fluid + ripple solvers on GPU" "$OUT/ripv.log" 2>/dev/null \
+   && [ -f "$OUT/ripv.png" ]; then
+    echo "    vulkan(ripple): PASS (GPU wave equation + refraction active)"
+    PASS=$((PASS+1))
+else
+    if grep -q "renderer: vulkan" "$OUT/ripv.log" 2>/dev/null; then
+        echo "    vulkan(ripple): FAIL (GPU ripple did not activate)"
+        cat "$OUT/ripv.log"
+        FAIL=$((FAIL+1))
+    else
+        echo "    vulkan(ripple): SKIP (no libvulkan / ICD on this system)"
+        SKIP=$((SKIP+1))
+    fi
 fi
 stop_xvfb
 

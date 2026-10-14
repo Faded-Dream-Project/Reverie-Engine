@@ -204,6 +204,25 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **The Vulkan tier renders on the GPU (2026-10, third field report).**
+  "Vulkan still falls back on the CPU for the rendering — it needs to use
+  the GPU specifically." It does now: the tier is a full GPU compute
+  compositing renderer. Every layer operation — the W3C blend composite,
+  the blur chain, gradients, particles, video planes, and the fluid +
+  ripple solvers — runs as a SPIR-V compute kernel (bit-parity ports of
+  the GL tier's shaders, row-space orientation, RGBA16F sim fields), so
+  the engine's CPU compositor is never in the frame path and the
+  reporter's ripple-lake runs with `simulations: GPU (no per-pixel CPU
+  work)` — sim 0.0 ms instead of the reported 37.5 ms climb. Kernels are
+  compiled from src/shaders/*.comp and embedded (scripts/gen_spv.sh;
+  normal builds need no shader compiler). E2E now verifies the tier
+  **pixel-exact against the CPU renderer** on both present paths (the
+  default platform-SHM copy-out and the `REV_VK_PRESENT=wsi` swapchain
+  blit — UNORM swapchain formats preferred, one sRGB-decode pass for
+  SRGB-only surfaces), GPU sims regression-tested on lavapipe via
+  `REV_VK_SIMS_SW=1`, and GPU timestamps give `REV_PROFILE` an honest
+  async `gpu=` figure like the GL tier. Auto selection: hardware GL
+  first (proven), then hardware Vulkan, then the CPU renderer.
 * **Renderer selection repaired (2026-10).** Auto no longer probes the
   present-only Vulkan tier ahead of the actually-accelerated GL tier (on
   the reporter's NVIDIA machine, plain `reverie <scene>` used to pick
@@ -239,10 +258,9 @@ Still no tags and no GitHub releases. This dev cycle:
   later clicks splash normally (new unit + e2e click-after-calm tests on
   both CPU and GPU tiers), and the idle CPU/Vulkan tier costs composite +
   upload only (sim 0.0 ms at 1080p, measured). While waves visibly roll
-  the CPU-compositing tiers still pay full-screen refraction (~16–28 ms
-  at 1080p for the waves' ~20 s life) — `-R opengl` is the zero-CPU-sim
-  path; GPU rendering inside the Vulkan tier itself remains future work
-  (see docs/BACKENDS.md for the postmortem with the numbers).
+  the CPU-compositing tier still pays full-screen refraction (~16–28 ms
+  at 1080p for the waves' ~20 s life); `-R opengl` and, since this cycle,
+  `-R vulkan` are the zero-CPU-sim paths (see the next bullet).
 
 * **GPU-first rendering, everywhere it belongs.** The maintainer's
   direction after the 1050 Ti field report (fluid-aurora at 57-59 fps —
@@ -257,7 +275,9 @@ Still no tags and no GitHub releases. This dev cycle:
   per-frame raster + upload), video (Y/U/V plane upload + BT.601
   conversion in the composite pass). Software rasterizers keep the CPU
   path where it genuinely wins (llvmpipe wide points crawl at 6 fps vs
-  60 — measured, and the engine chooses accordingly at init). The CPU
+  60 — measured, and the engine chooses accordingly at init), and the
+  same GPU-first layer paths now also drive the Vulkan tier's compute
+  kernels. The CPU
   renderer remains the untouched reference implementation.
 * **An honest profiler.** `REV_PROFILE=1` reports frame-time percentiles
   (p50/p95/max — averages hid multi-hundred-ms stalls), splits render
@@ -277,11 +297,14 @@ Still no tags and no GitHub releases. This dev cycle:
   GPU color conversion. docs/VIDEO.md records the full decoder
   architecture assessment (why a from-scratch H.264 decoder is the
   wrong project, licensing notes, and the phase-2 hardware-decode plan).
-* **Verification.** 9 unit suites (new: theme, video), e2e 16/16 under
-  Xvfb (new legs: GPU ripple, folder/packed theme parity, corrupt-pack
-  rejection, video on CPU and GL tiers, delayed click-after-calm on CPU
-  and GL tiers), ASan+UBSan clean including daemon smokes with clicks on
-  the CPU and Vulkan tiers. Field
+* **Verification.** 9 unit suites, e2e 19/19 under
+  Xvfb (new this cycle: Vulkan GPU-compositing pixel parity vs the CPU
+  renderer on both present paths, GPU sims forced on lavapipe, GPU ripple
+  click parity; earlier legs: GPU ripple, folder/packed theme parity,
+  corrupt-pack rejection, video on CPU and GL tiers, delayed
+  click-after-calm on CPU and GL tiers), plus a clean run under the
+  Vulkan validation layer (REV_VK_VALIDATE=1). ASan+UBSan clean including
+  daemon smokes with clicks on the CPU and Vulkan tiers. Field
   validation on the 1050 Ti box remains open: the GPU-path performance
   claims come from paired measurements on this 2-core sandbox plus the
   user's prior report; the profiler now gives the next field run the

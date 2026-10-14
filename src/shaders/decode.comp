@@ -1,0 +1,35 @@
+/* decode.comp — sRGB decode for _SRGB swapchain present. The blit into an
+ * _SRGB destination applies the sRGB ENCODE; presenting engine bytes that
+ * are already display-encoded needs a decode first so the roundtrip is
+ * the identity (within 8-bit quantization). Rare path: only for surfaces
+ * that offer no UNORM swapchain format.
+ *
+ * UBO:
+ *   [0] dims (x,y), _, _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[1];
+} u;
+
+layout(rgba8, set = 0, binding = 8) uniform image2D src_rd;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_wr;
+
+vec3 srgb_decode(vec3 c)
+{
+    vec3 lo = c / 12.92;
+    vec3 hi = pow(max(c + 0.055, vec3(0.0)) / 1.055, vec3(2.4));
+    return mix(lo, hi, step(vec3(0.04045), c));
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec4 s = imageLoad(src_rd, pc);
+    imageStore(dst_wr, pc, vec4(srgb_decode(s.rgb), s.a));
+}

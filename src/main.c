@@ -527,8 +527,6 @@ int main(int argc, char **argv)
                 free(base_dir);
                 return 1;
         }
-        if (!rend->wants_layers && strcmp(rend->name, "vulkan") == 0)
-                LOGI("vulkan tier: present path follows REV_VK_PRESENT (default: platform SHM)");
 
         /* sim offload: only when the renderer owns simulations (GL tier with
          * float render targets) — the scene then skips the CPU fluid/ripple

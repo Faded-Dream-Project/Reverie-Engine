@@ -1,0 +1,39 @@
+/* fluid_vort.comp — vorticity confinement. Port of FS_FLUID_VORT.
+ *
+ * UBO:
+ *   [0] grid (gw,gh), k, _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[1];
+} u;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D vel_rd;
+layout(rgba16f, set = 0, binding = 10) uniform image2D curl_rd;
+layout(rgba16f, set = 0, binding = 9) uniform image2D vel_wr;
+
+float cload(ivec2 pc)
+{
+    ivec2 grid = ivec2(u.p[0].xy);
+    return imageLoad(curl_rd, clamp(pc, ivec2(0), grid - 1)).x;
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = ivec2(u.p[0].xy);
+    if (pc.x >= grid.x || pc.y >= grid.y)
+        return;
+    vec2 vel = imageLoad(vel_rd, pc).xy;
+    float c = imageLoad(curl_rd, pc).x;
+    float xr = abs(cload(pc + ivec2(1, 0)));
+    float xl = abs(cload(pc - ivec2(1, 0)));
+    float yu = abs(cload(pc + ivec2(0, 1)));
+    float yd = abs(cload(pc - ivec2(0, 1)));
+    vec2 g = vec2((xr - xl) * 0.5, (yu - yd) * 0.5);
+    vec2 n = g / (length(g) + 1e-9);
+    vec2 outv = vel + vec2(u.p[0].z * n.y * c, -u.p[0].z * n.x * c);
+    imageStore(vel_wr, pc, vec4(outv, 0.0, 1.0));
+}

@@ -1,0 +1,40 @@
+/* fluid_dyef.comp — dye splats (pointer + wisp colors). Port of
+ * FS_FLUID_DYEF on the dye grid.
+ *
+ * UBO:
+ *   [0] grid (dw,dh), _, _
+ *   [1] posA (uv), radA
+ *   [2] posB (uv), radB
+ *   [3] colA (rgb), _
+ *   [4] colB (rgb), _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[5];
+} u;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D dye_rd;
+layout(rgba16f, set = 0, binding = 9) uniform image2D dye_wr;
+
+float splat(ivec2 pc, vec2 pos, float rad)
+{
+    vec2 grid = u.p[0].xy;
+    vec2 d = (vec2(pc) + 0.5) - pos * grid;
+    return exp(-dot(d, d) / (rad * rad) * 3.0);
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = ivec2(u.p[0].xy);
+    if (pc.x >= grid.x || pc.y >= grid.y)
+        return;
+
+    vec4 v = imageLoad(dye_rd, pc);
+    vec3 dye = v.rgb;
+    dye += u.p[3].rgb * (splat(pc, u.p[1].xy, u.p[1].w) * 0.9);
+    dye += u.p[4].rgb * (splat(pc, u.p[2].xy, u.p[2].w) * 0.9);
+    imageStore(dye_wr, pc, vec4(dye, 1.0));
+}

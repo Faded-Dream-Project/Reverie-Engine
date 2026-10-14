@@ -1,0 +1,58 @@
+/* ripple_step.comp — the STABLE damped wave-equation update. Exact port of
+ * FS_RIPPLE_STEP / ripple.c: nh = 2h - prev + c2*lap - dv*(h - prev)
+ * - ga*h, absorbing border band, sub-visible fade, momentum-gated snap.
+ * Border texels pass through (the CPU loops 1..gw-2).
+ *
+ * UBO:
+ *   [0] grid (gw, gh), damp (dv), _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[1];
+} u;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D field_rd;
+layout(rgba16f, set = 0, binding = 9) uniform image2D field_wr;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = ivec2(u.p[0].xy);
+    if (pc.x >= grid.x || pc.y >= grid.y)
+        return;
+
+    vec4 f = imageLoad(field_rd, pc);
+
+    /* border: edge cells never change (CPU loop bounds 1..gw-2) */
+    if (pc.x < 1 || pc.y < 1 || pc.x > grid.x - 2 || pc.y > grid.y - 2) {
+        imageStore(field_wr, pc, f);
+        return;
+    }
+
+    float h = f.r;
+    float hl = imageLoad(field_rd, pc - ivec2(1, 0)).r;
+    float hr = imageLoad(field_rd, pc + ivec2(1, 0)).r;
+    float hu = imageLoad(field_rd, pc + ivec2(0, 1)).r;
+    float hd = imageLoad(field_rd, pc - ivec2(0, 1)).r;
+    float lap = hl + hr + hu + hd - 4.0 * h;
+
+    /* stable damped wave: nh = 2h - prev + c2*lap - dv*(h - prev)
+     * - ga*h (ga drains the DC/level mode velocity damping leaves) */
+    float nh = 2.0 * h - f.g + 0.24 * lap - u.p[0].z * (h - f.g)
+             - 0.0025 * h;
+
+    /* absorbing border band: attx/atty tapers (band 24 cells, edge 0.30) */
+    vec2 dist = min(vec2(pc), u.p[0].xy - 1.0 - vec2(pc));
+    vec2 band = clamp(dist / 24.0, 0.0, 1.0);
+    vec2 att = 1.0 - 0.30 * (1.0 - band);
+    nh *= att.x * att.y;
+
+    /* sub-visible fade + momentum-gated snap (mirrors ripple.c) */
+    if (abs(nh) < 0.08)
+        nh *= 0.94;
+    if (abs(nh) < 2.0e-4 && abs(h) < 2.0e-4 && abs(f.g) < 2.0e-4)
+        nh = 0.0;
+    imageStore(field_wr, pc, vec4(nh, h, 0.0, 1.0));
+}

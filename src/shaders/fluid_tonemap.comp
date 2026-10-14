@@ -1,0 +1,28 @@
+/* fluid_tonemap.comp — dye (float) -> straight-alpha RGBA8 layer texture.
+ * Port of FS_FLUID_TONEMAP with fluid_render()'s exact LUT curve:
+ * a = 1 - exp(-lum*2.2), k = a/lum.
+ *
+ * UBO: (none — dims via imageSize of the destination)
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D dye_rd;
+layout(rgba8, set = 0, binding = 7) uniform image2D out_wr;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = imageSize(out_wr);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec3 d = imageLoad(dye_rd, pc).rgb;
+    float lum = max(d.r, max(d.g, d.b));
+    float a = 1.0 - exp(-lum * 2.2);
+    if (a <= 0.003) {
+        imageStore(out_wr, pc, vec4(0.0));
+        return;
+    }
+    float k = a / lum;
+    imageStore(out_wr, pc, vec4(clamp(d * k, 0.0, 1.0), a));
+}

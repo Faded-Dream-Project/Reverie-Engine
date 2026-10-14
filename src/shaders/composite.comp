@@ -1,0 +1,78 @@
+/* composite.comp — W3C blend of one layer over the accumulation.
+ *
+ * Bit-parity port of render_gl.c's FS_COMPOSITE (which mirrors
+ * composite.c's blend_pixel() exactly), moved to row space: thread y = 0
+ * is ROW 0 of the image, which is the TOP row in CPU raster order — the
+ * same convention the Vulkan tier presents with (no flip anywhere).
+ *
+ * Slot A carries the layer texture with the sampler the layer asked for
+ * (NEAREST or LINEAR — filtering is a descriptor-side choice, no shader
+ * branch needed); slot B is the accumulation read (texelFetch at exact
+ * centers). The one intentional difference from the GL shader: GL's
+ * `discard` outside the placed rect relies on ping-pong FBO content; here
+ * every output texel is written explicitly (dst passes through, or black
+ * when u_first=1) — exactly the CPU compositor's semantics.
+ *
+ * UBO (std140, vec4-indexed floats, 512-byte slot):
+ *   [0] dst dims (x,y) / src dims (z,w)
+ *   [1] scale.xy, off.xy          placement inverse map (GL parity)
+ *   [2] blend, opacity, src_premul, first
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[4];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D src_tex;
+layout(set = 0, binding = 3) uniform sampler2D dst_tex;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+vec3 blend_fn(int m, vec3 cb, vec3 cs)
+{
+    if (m == 1) return clamp(cb + cs, 0.0, 1.0);
+    if (m == 2) return cb + cs - cb * cs;
+    if (m == 3) return cb * cs;
+    if (m == 4) return mix(2.0 * cb * cs,
+                           1.0 - 2.0 * (1.0 - cb) * (1.0 - cs),
+                           step(vec3(0.5), cb));
+    return cs;
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dst_dims = ivec2(u.p[0].xy);
+    if (pc.x >= dst_dims.x || pc.y >= dst_dims.y)
+        return;
+
+    vec2 s = (vec2(pc) + 0.5) / vec2(dst_dims);
+    vec2 uvsrc = s * u.p[1].xy + u.p[1].zw;
+
+    bool first = u.p[2].w > 0.5;
+    vec4 dp = first ? vec4(0.0) : texelFetch(dst_tex, pc, 0);
+
+    if (uvsrc.x < 0.0 || uvsrc.x > 1.0 || uvsrc.y < 0.0 || uvsrc.y > 1.0) {
+        /* outside the placed rect: pass-through (CPU semantics) */
+        imageStore(dst_img, pc, dp);
+        return;
+    }
+
+    vec4 sp = texture(src_tex, uvsrc);
+
+    float as = sp.a * u.p[2].y;
+    float ad = dp.a;
+    vec3 cs = (u.p[2].z > 0.5 && sp.a > 0.0) ? sp.rgb / sp.a : sp.rgb;
+    vec3 cd = dp.rgb;
+    float ao = as + ad * (1.0 - as);
+    if (ao <= 0.0) {
+        imageStore(dst_img, pc, vec4(0.0));
+        return;
+    }
+    float k1 = as * (1.0 - ad);
+    float k3 = (1.0 - as) * ad;
+    vec3 b = blend_fn(int(u.p[2].x + 0.5), cd, cs);
+    vec3 co = (k1 * cs + k3 * cd + as * ad * b) / ao;
+    imageStore(dst_img, pc, vec4(clamp(co, 0.0, 1.0), ao));
+}

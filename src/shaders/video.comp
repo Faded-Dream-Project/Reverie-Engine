@@ -1,0 +1,73 @@
+/* video.comp — YUV420P plane upload + BT.601 conversion + W3C blend onto
+ * the accumulation, in one dispatch. Port of FS_VIDEO: planes are sampled
+ * BILINEARLY (the GL tier binds them LINEAR), placed with the composite
+ * pass's inverse placement map, and blended like any layer.
+ *
+ * Bindings: y (1), u (2), v (3), accum_rd (4); accum_wr is the rgba8
+ * storage image (7).
+ *
+ * UBO:
+ *   [0] dst dims (x,y), _, _
+ *   [1] scale.xy, off.xy          placement inverse map
+ *   [2] blend, opacity, first, _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[3];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D y_tex;
+layout(set = 0, binding = 2) uniform sampler2D u_tex;
+layout(set = 0, binding = 3) uniform sampler2D v_tex;
+layout(set = 0, binding = 4) uniform sampler2D dst_tex;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+vec3 blend_fn(int m, vec3 cb, vec3 cs)
+{
+    if (m == 1) return clamp(cb + cs, 0.0, 1.0);
+    if (m == 2) return cb + cs - cb * cs;
+    if (m == 3) return cb * cs;
+    if (m == 4) return mix(2.0 * cb * cs,
+                           1.0 - 2.0 * (1.0 - cb) * (1.0 - cs),
+                           step(vec3(0.5), cb));
+    return cs;
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec2 s = (vec2(pc) + 0.5) / vec2(dims);
+    vec2 uvsrc = s * u.p[1].xy + u.p[1].zw;
+
+    bool first = u.p[2].z > 0.5;
+    vec4 dp = first ? vec4(0.0) : texelFetch(dst_tex, pc, 0);
+
+    if (uvsrc.x < 0.0 || uvsrc.x > 1.0 || uvsrc.y < 0.0 || uvsrc.y > 1.0) {
+        imageStore(dst_img, pc, dp);
+        return;
+    }
+
+    float yy = texture(y_tex, uvsrc).r;
+    float uu = texture(u_tex, uvsrc).r - 0.5;
+    float vv = texture(v_tex, uvsrc).r - 0.5;
+    /* BT.601 limited range */
+    vec3 cs = vec3(1.164 * (yy - 0.0625) + 1.596 * vv,
+                   1.164 * (yy - 0.0625) - 0.391 * uu - 0.813 * vv,
+                   1.164 * (yy - 0.0625) + 2.018 * uu);
+    cs = clamp(cs, 0.0, 1.0);
+
+    float as = u.p[2].y;    /* planes are fully opaque */
+    float ad = dp.a;
+    float ao = as + ad * (1.0 - as);
+    float k1 = as * (1.0 - ad);
+    float k3 = (1.0 - as) * ad;
+    vec3 b = blend_fn(int(u.p[2].x + 0.5), dp.rgb, cs);
+    vec3 co = ao > 0.0 ? (k1 * cs + k3 * dp.rgb + as * ad * b) / ao
+                       : vec3(0.0);
+    imageStore(dst_img, pc, vec4(clamp(co, 0.0, 1.0), ao));
+}

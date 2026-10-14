@@ -1,0 +1,38 @@
+/* blur.comp — separable 9-tap gaussian. Port of FS_BLUR: the H pass runs
+ * at the DOWNSAMPLED resolution and samples the full-res premultiplied
+ * source bilinearly at spacing-scaled offsets (linear-sampling downscaled
+ * blur — identical math to the GL tier). Direction is in source uv units.
+ *
+ * UBO:
+ *   [0] dst dims (x,y), _, _
+ *   [1] dir.xy (uv units), _, _
+ *   [2..4] weights[9] (w[2].xyzw = taps 0..3, w[3].xyzw = taps 4..7,
+ *           w[4].x = tap 8)
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[5];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D src_tex;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec2 uv = (vec2(pc) + 0.5) / vec2(dims);
+    vec4 sum = vec4(0.0);
+    for (int i = 0; i < 9; i++) {
+        float w;
+        if (i < 4)      w = u.p[2][i];
+        else if (i < 8) w = u.p[3][i - 4];
+        else            w = u.p[4].x;
+        sum += texture(src_tex, uv + u.p[1].xy * float(i - 4)) * w;
+    }
+    imageStore(dst_img, pc, sum);
+}

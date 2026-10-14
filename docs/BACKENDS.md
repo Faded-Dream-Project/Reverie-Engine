@@ -60,9 +60,11 @@ name, device type, and hardware/software classification at init.
    would boot an entire software GL stack to do what the CPU renderer does
    natively (and on llvmpipe the GL tier itself keeps sims, point sprites
    and gradients on the CPU for speed). Override with `REV_AUTO_GL_SW=1`.
-3. **The Vulkan tier is excluded from auto** while it is present-only (see
-   below) — auto-selecting it initializes a Vulkan device that then does no
-   rendering. Override with `REV_AUTO_VK=1`.
+3. **The Vulkan tier (hardware devices only)** — the GPU compute
+   compositing tier (see below): every layer op and the fluid/ripple
+   solvers run as compute kernels. A software Vulkan device (lavapipe)
+   boots a whole software stack to do what the CPU renderer does natively,
+   so software Vulkan stays out of auto. Override with `REV_AUTO_VK=1`.
 
 ### why auto does not probe software stacks — the measurements
 
@@ -83,55 +85,83 @@ var away. The numbers above are from a 2-core sandbox; both paths are
 irrelevant on machines with working hardware GL, which is what auto actually
 selects.
 
-### tier 3 — vulkan (present path)
+### tier 3 — vulkan (GPU compute compositing)
 
 * Everything loaded at runtime: `dlopen("libvulkan.so.1")`, entry points via
   `vkGetInstanceProcAddr` / `vkGetDeviceProcAddr`.
 * The structure types, enums, and struct layouts are vendored by hand and
-  verified against the official Khronos headers.
+  verified against the official Khronos headers. The validation layer runs
+  clean on the whole frame path (`REV_VK_VALIDATE=1` with
+  `glslang`-validated SPIR-V — see scripts/gen_spv.sh).
 * X11 WSI: `vkCreateXcbSurfaceKHR` with an xcb connection from a
   runtime-dlopen'd `libxcb.so.1`. The window XID comes from our own raw X11
   client — server-side objects are global, so this is legal without Xlib.
-  Wayland WSI: the shim's `wl_display*`/`wl_surface*` (experimental).
+  Wayland WSI: the shim's `wl_display*`/`wl_surface*`.
 * **Device selection (2026-10):** every physical device is enumerated and
   reported (name + type); the tier picks by hardware class —
-  discrete > integrated > virtual > other > CPU — among devices that can
-  present with a TRANSFER_DST swapchain. Loader enumeration order no longer
-  decides anything (with a software ICD listed first, the old first-match
-  loop used to pick lavapipe while a real GPU sat behind it). The selected
-  device, its type, Vulkan version, driver version, and the honest
-  hardware/software verdict are logged.
-* **Capability, stated honestly:** this tier is PRESENT-ONLY. The engine
-  composites every frame on the CPU; the GPU receives finished frames —
-  either
-  - *platform present (default)* — hands the frame to the backend's proven
-    presenter (MIT-SHM on X11, wl_shm on Wayland), or
-  - *WSI present (`REV_VK_PRESENT=wsi`)* — memcpy into a host-visible
-    staging buffer → `vkCmdCopyBufferToImage` with layout barriers → FIFO
-    present.
-  No GPU rendering or compositing exists in this tier yet; that is why auto
-  does not select it. The default present path flipped in 0.1.1 after a
-  field report of a **black screen on XWayland with a real GPU driver** (see
-  Troubleshooting); both paths are E2E-tested and pixel-exact vs the CPU
-  renderer on lavapipe. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or
-  present is reported explicitly and stops presenting; OUT_OF_DATE at
-  present recreates the swapchain.
-* **CPU cost, stated honestly (2026-10):** because this tier composites on
-  the CPU, one core does the frame work — that is the tier's design, not a
-  bug. What WAS a bug: on `themes/ripple-lake` the anti-damped wave solver
-  (see the second ripple postmortem below) kept the whole height field
-  energized forever, so after the first click the refraction pass never
-  returned to its flat-water fast path — the reporter measured sim time
-  climbing 13.3 → 36.0 ms/frame and a permanently pegged core. With the
-  corrected solver the lake calms to an exact zero field (~15–20 s after a
-  click at 1080p), the ripple layer becomes a true pass-through, and the
-  idle tier costs only composite + upload (measured: sim 0.0 ms, frame
-  p50 = refresh interval). While waves are actively rolling the CPU tier
-  still pays full-screen refraction (~16–28 ms at 1080p for the ~20 s the
-  waves are visible) — that is physics, not a leak; users who want zero
-  per-pixel CPU work should run `-R opengl` (GPU sims + compositing).
-  Making the Vulkan tier itself render on the GPU (compute pipelines) is
-  documented future work.
+  discrete > integrated > virtual > other > CPU — among devices with a
+  GRAPHICS+COMPUTE queue family that can present with a TRANSFER_DST
+  swapchain. Loader enumeration order no longer decides anything (with a
+  software ICD listed first, the old first-match loop used to pick lavapipe
+  while a real GPU sat behind it). The selected device, its type, Vulkan
+  version, driver version, and the honest hardware/software verdict are
+  logged.
+* **GPU compute compositing (0.2.0 — the fix for the third field report):**
+  the tier used to be PRESENT-ONLY (the engine composited on the CPU and
+  uploaded finished frames; the reporter measured sim climbing to 37.5 ms
+  on ripple-lake). Now every layer operation runs as a SPIR-V compute
+  kernel (src/shaders/*.comp, embedded in src/vk_spv.h, regenerated by
+  scripts/gen_spv.sh — committed, so builds need no shader compiler):
+  - the W3C blend composite (all 5 blend modes, placement, opacity,
+    straight/premultiplied sources),
+  - the separable blur chain (premultiply → downsample → H/V 9-tap →
+    upscale),
+  - gradient evaluation (shader-evaluated, cached by content serial),
+  - particle layers — tile-binned *ordered* source-over splats (one 8x8
+    workgroup owns a 64x64 tile; a shared-memory list preserves blend
+    order, so the result is the GL point-sprite path's exact per-pixel
+    sequence, not an approximation),
+  - video planes + BT.601 conversion + blend in one dispatch,
+  - the full fluid solver (splats, vorticity, Jacobi projection,
+    advection, tonemap) and the ripple wave equation + refraction
+    composite on RGBA16F storage images — identical constants and pass
+    order to the GL tier's shaders.
+  The engine's CPU compositor is never in the frame path; the CPU records
+  dispatches, and (on the platform present path) copies the finished frame
+  out. E2E-verified **bit-exact against the CPU renderer** on both present
+  paths (static scenes compare byte-for-byte; ripple click parity holds).
+* **GPU timing:** core Vulkan 1.0 timestamp queries bracket every frame's
+  compute; `REV_PROFILE` reports them asynchronously (several frames
+  behind) exactly like the GL tier's timer queries — labeled `gpu=...*`,
+  never conflated with CPU wall time.
+* **Present paths (mechanism unchanged since 0.1.1, fed by GPU frames):**
+  - *platform present (default)* — the finished image is copied to a
+    host-visible buffer and handed to the backend's proven presenter
+    (MIT-SHM on X11, wl_shm on Wayland). Same pixels, same window, the
+    mechanism every field report confirmed; the GPU does all the rendering.
+  - *WSI present (`REV_VK_PRESENT=wsi`)* — the image is blitted into the
+    swapchain (UNORM formats preferred; the blit handles the BGRA
+    component swizzle) and presented FIFO, zero-copy. Surfaces that only
+    offer _SRGB swapchain formats get one sRGB-decode compute pass first
+    so the blit's encode roundtrips to the identity.
+  The default stays platform-SHM because the 0.1.0 WSI path had a black
+  screen on one real XWayland stack; both paths are E2E-tested and
+  pixel-exact. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or present
+  is reported explicitly and stops presenting; OUT_OF_DATE recreates the
+  swapchain.
+* **Software devices (lavapipe):** the tier initializes and reports
+  honestly, but GPU sims / particles / gradients are declined by default
+  (a CPU-running Vulkan device executes compute slower than the native CPU
+  paths — the same policy the GL tier applies to llvmpipe).
+  `REV_VK_SIMS_SW=1` forces them on for regression testing; that is what
+  E2E uses to keep the whole GPU sim path tested without hardware.
+* **Synchronization:** 3 frame slots per window, each with its own command
+  pool, descriptor pool, 512-byte-stride dynamic uniform buffer and upload
+  arena; a slot is reused only after its fence retired. Images live in
+  `VK_IMAGE_LAYOUT_GENERAL` for their whole lifetime with explicit access
+  barriers. Replaced resources go through a graveyard freed three frames
+  later, so ping-pong reallocations never pull memory out from under an
+  in-flight frame.
 
 ### tier 2 — opengl (GPU compositing)
 
@@ -342,7 +372,8 @@ selects.
   `perf:` stage line before reporting: if `sim` dominates, that is the
   single-threaded solver; if `render+present` dominates on a *hardware*
   GPU, look at the driver path instead. Truly idle-CPU simulation means
-  GPU compute, which is future work.
+  GPU compute — which both GPU tiers now do (`-R opengl`, and `-R vulkan`
+  since 0.2.0; the CPU tier keeps its documented single-core cost).
 * **`eglCreateWindowSurface failed (0x300b)` with `--renderer opengl` on
   Wayland (dev-cycle postmortem)** — field report: with `REV_WAYLAND_GPU=1`
   active, the GL tier died at "renderer init" with EGL error 0x300b

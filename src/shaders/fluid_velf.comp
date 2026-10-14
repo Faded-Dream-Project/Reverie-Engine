@@ -1,0 +1,54 @@
+/* fluid_velf.comp — velocity forces: pointer/wisp splats + ambient drift.
+ * Port of FS_FLUID_VELF (Stam solver parity with fluid.c via the GL tier).
+ * Orientation: row space — v+ = row+1 = downscreen, matching the GL tier's
+ * texture-v convention (v=0 is CPU row 0).
+ *
+ * UBO:
+ *   [0] grid (gw,gh), dt, t
+ *   [1] posA (uv), radA
+ *   [2] impA (cells/s), ambient
+ *   [3] posB (uv), radB
+ *   [4] impB, _, _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[5];
+} u;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D vel_rd;
+layout(rgba16f, set = 0, binding = 9) uniform image2D vel_wr;
+
+float splat(ivec2 pc, vec2 pos, float rad)
+{
+    vec2 grid = u.p[0].xy;
+    vec2 d = (vec2(pc) + 0.5) - pos * grid;
+    return exp(-dot(d, d) / (rad * rad) * 3.0);
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = ivec2(u.p[0].xy);
+    if (pc.x >= grid.x || pc.y >= grid.y)
+        return;
+
+    vec4 v = imageLoad(vel_rd, pc);
+    vec2 vel = v.xy;
+    vel += u.p[2].xy * splat(pc, u.p[1].xy, u.p[1].w);
+    vel += u.p[4].xy * splat(pc, u.p[3].xy, u.p[3].w);
+
+    float ambient = u.p[2].w;
+    if (ambient > 0.0) {
+        vec2 n = (vec2(pc) + 0.5) / u.p[0].xy;
+        float t = u.p[0].w;
+        float fx = sin(n.y * 6.0 + t * 0.35) * cos(n.x * 4.0 - t * 0.22);
+        float fy = cos(n.x * 5.0 + t * 0.3) * sin(n.y * 5.0 + t * 0.18);
+        /* the 3x3 sparse lattice fluid.c drives the drift through */
+        bool on = mod(float(pc.x) - 1.0, 3.0) < 1.0 && mod(float(pc.y) - 1.0, 3.0) < 1.0;
+        if (on)
+            vel += vec2(fx, fy) * (ambient * u.p[0].z * 8.0);
+    }
+    imageStore(vel_wr, pc, vec4(vel, 0.0, 1.0));
+}

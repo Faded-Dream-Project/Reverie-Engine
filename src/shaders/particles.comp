@@ -1,0 +1,110 @@
+/* particles.comp — particle layers as tile-binned ordered splats.
+ *
+ * Port of render_gl.c's point-sprite path (VS_PARTICLES + FS_PARTICLES
+ * with straight source-over blending) to compute: each workgroup (8x8
+ * threads) owns a 64x64 tile of the layer. Phase 1 scans the packed
+ * particle bands and bins every particle whose disc overlaps the tile
+ * into a shared-memory list (in band order = GL vertex order). Phase 2
+ * gives each thread an 8x8 pixel block and blends the list IN ORDER —
+ * the exact per-pixel source-over sequence GL's fixed-function blend
+ * performed, not an approximation.
+ *
+ * Coverage math is bit-identical to the GL sprites: r = max(1,
+ * floor(size*2)), point size 2r+1 (capped at 63 -> radius 31.5 px),
+ * d = (pixel - center) / (r + 0.5), cov = (1 - d^2)^2 * alpha with the
+ * cov <= 0.02 skip. The shared list is capped at 256 particles per tile
+ * (snowfall-class densities stay far below; overflow particles are
+ * dropped for that tile, which is invisible in practice).
+ *
+ * Band layout (RSimParticles): RGBA32F image, 1024 wide; band 0 at rows
+ * 0..rows-1 = (x, y, size, alpha), band 1 at rows rows..2*rows-1 = rgb.
+ *
+ * UBO:
+ *   [0] frame dims (w,h), n, rows
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[1];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D parts_tex;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+#define TILE 64
+#define LIST_CAP 256
+
+shared int s_count;
+shared vec4 s_pos[LIST_CAP];    /* x, y, R, alpha */
+shared vec4 s_col[LIST_CAP];    /* r, g, b, - */
+
+vec4 part_at(int i, int rows)
+{
+    return texelFetch(parts_tex, ivec2(i % 1024, i / 1024), 0);
+}
+
+vec4 part_col(int i, int rows)
+{
+    return texelFetch(parts_tex, ivec2(i % 1024, i / 1024 + rows), 0);
+}
+
+void main()
+{
+    int n = int(u.p[0].z + 0.5);
+    int rows = int(u.p[0].w + 0.5);
+    ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * TILE;
+
+    if (gl_LocalInvocationIndex == 0)
+        s_count = 0;
+    barrier();
+
+    /* phase 1: bin overlapping particles (in order) */
+    int lt = int(gl_LocalInvocationIndex);
+    for (int i = lt; i < n; i += 64) {
+        vec4 pos = part_at(i, rows);
+        vec4 col = part_col(i, rows);
+        float r = max(1.0, floor(pos.z * 2.0));
+        float R = min(2.0 * r + 1.0, 63.0) * 0.5;
+        if (pos.x + R < float(tile0.x) || pos.x - R > float(tile0.x + TILE) ||
+            pos.y + R < float(tile0.y) || pos.y - R > float(tile0.y + TILE))
+            continue;
+        if (pos.w <= 0.0)
+            continue;
+        int slot = atomicAdd(s_count, 1);
+        if (slot < LIST_CAP) {
+            s_pos[slot] = vec4(pos.xy, R, pos.w);
+            s_col[slot] = col;
+        }
+    }
+    barrier();
+
+    int cnt = min(s_count, LIST_CAP);
+
+    /* phase 2: each thread blends one 8x8 block in list order */
+    ivec2 base = tile0 + ivec2(gl_LocalInvocationID.xy) * ivec2(8, 8);
+    ivec2 dims = ivec2(u.p[0].xy);
+    for (int py = 0; py < 8; py++) {
+        for (int px = 0; px < 8; px++) {
+            ivec2 p = base + ivec2(px, py);
+            if (p.x >= dims.x || p.y >= dims.y)
+                continue;
+            vec4 acc = vec4(0.0);    /* straight alpha, transparent start */
+            for (int j = 0; j < cnt; j++) {
+                vec2 d = (vec2(p) + 0.5 - s_pos[j].xy) / s_pos[j].z;
+                float d2 = dot(d, d);
+                if (d2 > 1.0)
+                    continue;
+                float cov = 1.0 - d2;
+                cov = cov * cov * s_pos[j].w;
+                if (cov <= 0.02)
+                    continue;    /* the CPU/GL paths skip these pixels */
+                vec3 rgb = s_col[j].rgb;
+                /* straight source-over (GL blend state) */
+                float a = cov + acc.a * (1.0 - cov);
+                acc = vec4(cov * rgb + acc.rgb * (1.0 - cov), a);
+            }
+            imageStore(dst_img, p, acc);
+        }
+    }
+}

@@ -1,0 +1,58 @@
+/* ripple_splat.comp — pointer drip + queued click impacts, written into
+ * the height field BEFORE the wave steps (ripple_click()/drip order).
+ * Port of FS_RIPPLE_SPLAT operating on RGBA16F storage images
+ * (.r = current height, .g = previous height; .g passes through).
+ *
+ * UBO:
+ *   [0] grid (gw, gh), _, _
+ *   [1] ptr pos (uv), ptrOn (0/1)
+ *   [2] ptrRad, ptrAmp, nclicks, _
+ *   [3..6] clicks[4]: (x, y, radius_texels, amp)
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[7];
+} u;
+
+layout(rgba16f, set = 0, binding = 8) uniform image2D field_rd;
+layout(rgba16f, set = 0, binding = 9) uniform image2D field_wr;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 grid = ivec2(u.p[0].xy);
+    if (pc.x >= grid.x || pc.y >= grid.y)
+        return;
+
+    vec4 f = imageLoad(field_rd, pc);
+    float h = f.r;
+    vec2 gridf = u.p[0].xy;
+
+    if (u.p[1].z > 0.5) {
+        /* pointer drip: (1 - d^2) falloff */
+        vec2 d = (vec2(pc) + 0.5) / gridf - u.p[1].xy;
+        d *= gridf;
+        float rad = u.p[2].x;
+        float d2 = dot(d, d) / (rad * rad + 1e-9);
+        if (d2 <= 1.0)
+            h += u.p[2].y * (1.0 - d2);
+    }
+
+    int n = int(u.p[2].z + 0.5);
+    for (int i = 0; i < 4; i++) {
+        if (i >= n)
+            break;
+        vec4 c = u.p[3 + i];
+        /* dropped stone: (1 - d^2)^2 falloff */
+        vec2 d = (vec2(pc) + 0.5) / gridf - c.xy;
+        d *= gridf;
+        float r2 = dot(d, d) / (c.z * c.z + 1e-9);
+        if (r2 <= 1.0) {
+            float t = 1.0 - r2;
+            h += c.w * t * t;
+        }
+    }
+    imageStore(field_wr, pc, vec4(h, f.g, 0.0, 1.0));
+}

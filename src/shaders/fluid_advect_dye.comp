@@ -1,0 +1,32 @@
+/* fluid_advect_dye.comp — semi-Lagrangian dye advection with dissipation
+ * folded in. Port of FS_FLUID_ADVECT_DYE: dye and velocity are sampled
+ * BILINEARLY (velocity at the dye texel's normalized uv — both fields
+ * share normalized [0..1] space, exactly like the GL tier).
+ *
+ * UBO:
+ *   [0] vel grid (gw,gh), dt, fade
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[1];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D dye_tex;
+layout(set = 0, binding = 2) uniform sampler2D vel_tex;
+layout(rgba16f, set = 0, binding = 9) uniform image2D dye_wr;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    /* dye dims come from the destination image itself via imageSize */
+    ivec2 dims = imageSize(dye_wr);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec2 uv = (vec2(pc) + 0.5) / vec2(dims);
+    vec2 vel = texture(vel_tex, uv).xy;
+    vec2 back = uv - vel * u.p[0].z / (u.p[0].xy - vec2(1.0));
+    vec3 dye = texture(dye_tex, back).rgb * u.p[0].w;
+    imageStore(dye_wr, pc, vec4(dye, 1.0));
+}

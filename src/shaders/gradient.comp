@@ -1,0 +1,60 @@
+/* gradient.comp — shader-evaluated gradient layer. Port of FS_GRADIENT:
+ * linear t = projection onto the axis, radial t = |P-C|/r, PAD spread,
+ * sorted stops with implicit end caps, straight-RGBA lerp. The CPU
+ * quantizes t through a 256-entry LUT; this evaluates t continuously.
+ *
+ * UBO:
+ *   [0] dims (w,h), shape, n
+ *   [1] p0 (pixels)
+ *   [2] p1 (pixels)
+ *   [3] rc (pixels), rr
+ *   [4..20] cols[17] (rgba, 0..1)
+ *   [21..25] offs[17] packed as float[20] in 5 vec4s
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[26];
+} u;
+
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+float offs(int k)
+{
+    return u.p[21 + k / 4][k % 4];
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    /* pixel centers (row space: y=0 is the top row, like the CPU raster) */
+    vec2 p = (vec2(pc) + 0.5);
+    float t;
+    if (u.p[0].z < 0.5) {
+        vec2 d = u.p[2].xy - u.p[1].xy;
+        float len2 = dot(d, d);
+        t = len2 < 1e-18 ? 0.0 : dot(p - u.p[1].xy, d) / len2;
+    } else {
+        t = u.p[3].w < 1e-12 ? 0.0 : length(p - u.p[3].xy) / u.p[3].w;
+    }
+    t = clamp(t, 0.0, 1.0);    /* PAD spread */
+    int n = int(u.p[0].w + 0.5);
+    vec4 c = u.p[4];
+    for (int k = 1; k < 17; k++) {
+        if (k >= n)
+            break;
+        if (t <= offs(k)) {
+            float span = offs(k) - offs(k - 1);
+            float f = span > 1e-12 ? (t - offs(k - 1)) / span : 1.0;
+            f = clamp(f, 0.0, 1.0);
+            c = mix(u.p[4 + (k - 1)], u.p[4 + k], f);
+            break;
+        }
+        c = u.p[4 + k];
+    }
+    imageStore(dst_img, pc, c);
+}

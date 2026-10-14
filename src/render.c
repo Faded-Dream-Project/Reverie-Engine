@@ -4,13 +4,14 @@
  *
  *   explicit request -> that renderer only; failure is FATAL (no silent
  *                        substitution — the log shows which tier failed)
- *   auto             -> opengl-hardware, else native CPU
- *                        (the present-only Vulkan tier and software GL are
- *                        excluded from auto by default: they initialize an
+ *   auto             -> opengl-hardware, else vulkan-hardware (the GPU
+ *                        compute compositing tier), else native CPU
+ *                        (software GL / software Vulkan initialize an
  *                        entire software stack to deliver what the CPU
- *                        renderer already does — see docs/BACKENDS.md for
- *                        the measured rationale; REV_AUTO_VK / REV_AUTO_GL_SW
- *                        override for compatibility testing)
+ *                        renderer already does natively — see
+ *                        docs/BACKENDS.md for the measured rationale;
+ *                        REV_AUTO_VK / REV_AUTO_GL_SW override for
+ *                        compatibility testing)
  *
  * Every selection and every skip logs its reason, so the daemon log is a
  * complete audit trail of the decision.
@@ -43,7 +44,8 @@ static void log_selected(RRenderer *r, const char *how)
         LOGI("renderer: %s (tier %d, %s)%s%s [%s]",
              r->name, r->tier,
              r->wants_layers
-                 ? (r->software ? "CPU layer compositing" : "GPU compositing")
+                 ? (r->software ? "GPU-API compositing on a software device"
+                                : "GPU compositing")
                  : "CPU compositing",
              r->device_desc[0] ? " — " : "",
              r->device_desc[0] ? r->device_desc : "",
@@ -109,8 +111,8 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
         const char *sw_gl_env = getenv("REV_AUTO_GL_SW");
         const char *auto_vk_env = getenv("REV_AUTO_VK");
 
-        /* 1. hardware OpenGL — the only tier that actually renders and
-         *    simulates on the GPU in the current engine. */
+        /* 1. hardware OpenGL — renders and simulates on the GPU; the
+         *    long-proven tier, so it keeps first place in auto. */
         r = render_gl_create();
         if (r) {
                 if (try_init(r, p, why, sizeof why)) {
@@ -140,18 +142,33 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
                 }
         }
 
-        /* 2. optional Vulkan (present-only tier) — only with the explicit
-         *    compatibility override; it composites on the CPU either way */
-        if (auto_vk_env && *auto_vk_env) {
+        /* 2. hardware Vulkan — the GPU compute compositing tier (every
+         *    layer op and the fluid/ripple solvers run as compute kernels).
+         *    Software Vulkan (lavapipe) stays out of auto unless the
+         *    compatibility override asks for it. */
+        {
                 RRenderer *vk = render_vk_create();
-                if (vk && try_init(vk, p, why, sizeof why)) {
-                        LOGI("renderer: auto — present-only Vulkan tier "
-                             "selected (REV_AUTO_VK=1 override)");
-                        log_selected(vk, "auto: Vulkan (override)");
-                        return vk;
+                if (vk) {
+                        if (try_init(vk, p, why, sizeof why)) {
+                                if (!vk->software) {
+                                        log_selected(vk, "auto: hardware Vulkan");
+                                        return vk;
+                                }
+                                if (auto_vk_env && *auto_vk_env) {
+                                        LOGI("renderer: auto — software Vulkan "
+                                             "kept (REV_AUTO_VK=1)");
+                                        log_selected(vk, "auto: software Vulkan (override)");
+                                        return vk;
+                                }
+                                LOGI("renderer: auto — Vulkan initialized as SOFTWARE "
+                                     "(%s); skipping it for the native CPU renderer "
+                                     "(set REV_AUTO_VK=1 to keep software Vulkan)",
+                                     vk->device_desc[0] ? vk->device_desc : "lavapipe");
+                        } else {
+                                LOGI("renderer: auto — Vulkan unavailable (%s)", why);
+                        }
+                        renderer_destroy(vk);
                 }
-                renderer_destroy(vk);
-                LOGI("renderer: auto — Vulkan unavailable (%s)", why);
         }
 
         /* 3. the native CPU renderer — always works */

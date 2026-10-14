@@ -1,0 +1,86 @@
+/* ripple_composite.comp — refraction of the below-composite. Port of
+ * FS_RIPPLE_COMPOSITE: sample the accum offset by the surface-normal
+ * gradient (the height field is sampled bilinearly — the GL tier binds it
+ * LINEAR; here 4 imageLoads), add the upper-left specular glint, then
+ * source-over onto the accum with the layer opacity.
+ *
+ * Bindings: slot A = accum (nearest, texelFetch for the base read);
+ * slot B = the SAME accum view with the LINEAR sampler (the refraction
+ * offset sample); field (rgba16f, storage-read, manual bilinear);
+ * accum_wr is the rgba8 storage image.
+ *
+ * UBO:
+ *   [0] dst dims (x,y), grid (gw, gh)
+ *   [1] amp.xy (strength*26 / (w,h)), opacity, first
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[2];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D dst_tex;
+layout(set = 0, binding = 2) uniform sampler2D dst_texL;
+layout(rgba16f, set = 0, binding = 8) uniform image2D field_rd;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+/* manual bilinear on the height channel, CLAMP_TO_EDGE — matches the GL
+ * tier's LINEAR-filtered field texture */
+float hsample(vec2 uv)
+{
+    vec2 grid = u.p[0].zw;
+    vec2 f = clamp(uv * grid - 0.5, vec2(0.0), grid - 1.0);
+    ivec2 c0 = ivec2(f);
+    ivec2 c1 = ivec2(min(c0 + ivec2(1), ivec2(grid) - 1));
+    vec2 t = f - vec2(c0);
+    float a = imageLoad(field_rd, c0).r;
+    float b = imageLoad(field_rd, ivec2(c1.x, c0.y)).r;
+    float c = imageLoad(field_rd, ivec2(c0.x, c1.y)).r;
+    float d = imageLoad(field_rd, c1).r;
+    return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+
+    vec2 grid = u.p[0].zw;
+    vec2 screen = (vec2(pc) + 0.5) / vec2(dims);
+    vec2 texel = screen * grid;
+    /* CPU clamps gradient samples to 1..gw-2 */
+    vec2 c = clamp(texel, vec2(1.0), grid - vec2(2.0));
+    vec2 base = c / grid;
+    float hl = hsample(base - vec2(1.0 / grid.x, 0.0));
+    float hr = hsample(base + vec2(1.0 / grid.x, 0.0));
+    float hu = hsample(base + vec2(0.0, 1.0 / grid.y));
+    float hd = hsample(base - vec2(0.0, 1.0 / grid.y));
+    float dxn = (hr - hl) * 0.5;
+    float dyn = (hu - hd) * 0.5;
+
+    bool first = u.p[1].w > 0.5;
+    vec4 dst = first ? vec4(0.0) : texelFetch(dst_tex, pc, 0);
+
+    /* refraction: offset sample of the below-composite */
+    vec2 suv = clamp(screen + vec2(dxn, dyn) * u.p[1].xy, vec2(0.0), vec2(1.0));
+    vec4 pp = texture(dst_texL, suv);
+
+    /* specular highlight: light from the upper-left (ripple_apply) */
+    float len = sqrt(dxn * dxn + dyn * dyn + 0.25);
+    float dt = (dyn * -0.7 + 0.5 * 0.7) / len;
+    float spec = dt > 0.0 ? pow(dt, 24.0) : 0.0;
+    vec3 rgb = clamp(pp.rgb + vec3(spec * (110.0 / 255.0),
+                                   spec * (112.0 / 255.0),
+                                   spec * (120.0 / 255.0)), 0.0, 1.0);
+
+    /* source-over onto the accum with layer opacity (straight alpha) */
+    float as = pp.a * u.p[1].z;
+    float ad = dst.a;
+    float ao = as + ad * (1.0 - as);
+    vec3 co = ao > 0.0 ? (as * rgb + (1.0 - as) * ad * dst.rgb) / ao
+                       : vec3(0.0);
+    imageStore(dst_img, pc, vec4(co, ao));
+}

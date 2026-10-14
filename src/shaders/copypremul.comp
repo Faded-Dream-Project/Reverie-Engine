@@ -1,0 +1,31 @@
+/* copypremul.comp — straight -> premultiplied (blur chain input), or plain
+ * copy (blur chain upscale output). Port of FS_PREMULT + FS_COPY. The
+ * sampler (nearest / linear) is a descriptor-side choice: premult samples
+ * exact centers, the upscale pass wants bilinear.
+ *
+ * UBO:
+ *   [0] dst dims (x,y), _, _
+ *   [1] premul (0/1), _, _, _
+ */
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 p[2];
+} u;
+
+layout(set = 0, binding = 1) uniform sampler2D src_tex;
+layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
+
+void main()
+{
+    ivec2 pc = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dims = ivec2(u.p[0].xy);
+    if (pc.x >= dims.x || pc.y >= dims.y)
+        return;
+    vec2 uv = (vec2(pc) + 0.5) / vec2(dims);
+    vec4 s = texture(src_tex, uv);
+    if (u.p[1].x > 0.5)
+        s = vec4(s.rgb * s.a, s.a);
+    imageStore(dst_img, pc, s);
+}
