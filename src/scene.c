@@ -96,6 +96,11 @@ struct RTLayerInst {
         RSimFluid simdesc;
         /* GPU ripple offload descriptor (same identity contract) */
         RSimRipple rdesc;
+        /* GPU particle offload: descriptor + packed float bands (grown on
+         * demand; one malloc total per layer instance at steady state) */
+        RSimParticles pdesc;
+        f32 *pband;
+        u32 pband_slots;
         /* raster content serial — bumped on every (re)build; renderers
          * cache textures against it and skip redundant re-uploads */
         u64 content_id;
@@ -478,6 +483,7 @@ void rtscene_free(RTScene *sc)
                         free(in->raster.px);
                                         free(in->sim_fb.px);
                                         in->sim_fb.px = NULL;
+                        free(in->pband);
                         free(in->blurred.px);
                         fluid_free(in->fluid);
                         ripple_free(in->ripple);
@@ -806,6 +812,16 @@ static bool ensure_sim_fb(RTLayerInst *in, u32 w, u32 h)
         return in->sim_fb.px != NULL;
 }
 
+bool rtscene_has_particles(const RTScene *sc)
+{
+        if (!sc)
+                return false;
+        for (int i = 0; i < sc->n; i++)
+                if (sc->layers[i].type == LT_PARTICLES)
+                        return true;
+        return false;
+}
+
 bool rtscene_gpu_capable(const RTScene *sc, bool sim_offload)
 {
         if (!sc)
@@ -1077,6 +1093,55 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 f64 ms = rev_monotonic();
                                 particles_step(in->parts, dt);
                                 sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
+                                /* GPU point-sprite offload: the CPU keeps the
+                                 * cheap per-particle state update and packs
+                                 * live particles into ~128KB of floats; the
+                                 * renderer draws them as point sprites (the
+                                 * old path rasterized a full-frame sprite layer
+                                 * on the CPU and uploaded 8MB RGBA every
+                                 * frame). Rain's vertical streaks are not
+                                 * point-sprite-shaped — that preset keeps the
+                                 * CPU raster. */
+                                if (fl && fl->point_offload && L->p_preset != RPPRESET_RAIN) {
+                                        u32 live = 0;
+                                        /* one-time band buffer sized to the
+                                         * particle capacity (4096 slots) */
+                                        u32 slots = 4096;
+                                        if (!in->pband) {
+                                                in->pband = (f32 *)malloc((size_t)slots * 4 * 2 * sizeof(f32));
+                                                in->pband_slots = in->pband ? slots : 0;
+                                        }
+                                        if (in->pband) {
+                                                memset(in->pband, 0, (size_t)in->pband_slots * 4 * 2 * sizeof(f32));
+                                                live = particles_pack(in->parts, in->pband,
+                                                                      in->pband + (size_t)in->pband_slots * 4,
+                                                                      in->pband_slots);
+                                                RSimParticles *pd = &in->pdesc;
+                                                pd->n = live;
+                                                pd->slots = in->pband_slots;
+                                                pd->band0 = in->pband;
+                                                pd->band1 = in->pband + (size_t)in->pband_slots * 4;
+                                                pd->frame_w = (u32)W;
+                                                pd->frame_h = (u32)H;
+                                                if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                                        break;
+                                                RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                                memset(cmd, 0, sizeof *cmd);
+                                                cmd->psim = pd;
+                                                cmd->w = (u32)W;
+                                                cmd->h = (u32)H;
+                                                cmd->place_w = 0;
+                                                cmd->place_h = 0;
+                                                cmd->dx = 0;
+                                                cmd->dy = 0;
+                                                cmd->blend = L->blend;
+                                                cmd->opacity = e.opacity;
+                                                cmd->blur = 0.0;
+                                                cmd->linear = false;
+                                                cmd->content_id = 0;
+                                                continue;
+                                        }
+                                }
                                 RFb *target;
                                 if (fl) {
                                         if (!ensure_sim_fb(in, (u32)W, (u32)H))
@@ -1105,6 +1170,9 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 free(in->raster.px);
                                         free(in->sim_fb.px);
                                         in->sim_fb.px = NULL;
+                                        free(in->pband);
+                                        in->pband = NULL;
+                                        in->pband_slots = 0;
                                 in->raster.px = (u32 *)malloc((size_t)rw * rh * 4);
                                 in->raster.w = rw;
                                 in->raster.h = rh;

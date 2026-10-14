@@ -307,6 +307,47 @@ int main(void)
 		}
 	}
 
+	/* 4b-4. GPU particle offload: sim_offload=true packs live particles
+	 *     into float bands (no full-res CPU raster, no pixels emitted);
+	 *     rain keeps the CPU raster (streaks are not point sprites). */
+	{
+		const char *txt =
+			"scene {"
+			"  layer s { type = particles  preset = snow }"
+			"  layer r { type = particles  preset = rain }"
+			"}";
+		RTScene *sc = compile(txt, err, sizeof err);
+		CHECK(sc != NULL, "compile: %s", err);
+		if (sc) {
+			RTFrameList fl;
+			memset(&fl, 0, sizeof fl);
+			fl.w = 400;
+			fl.h = 300;
+			fl.sim_offload = true;
+			fl.point_offload = true;
+			rtscene_render_layers(sc, &fl, 0, 0.1, 2.0);
+			CHECK(fl.n == 2, "two layers emitted (n=%d)", fl.n);
+			if (fl.n == 2) {
+				RTLayerCmd *c = &fl.cmds[0];
+				CHECK(c->psim != NULL, "snow: particle descriptor present");
+				CHECK(c->px == NULL, "snow: no CPU pixels");
+				if (c->psim) {
+					CHECK(c->psim->frame_w == 400 && c->psim->frame_h == 300,
+					      "frame size relayed");
+					CHECK(c->psim->slots == 4096, "band capacity");
+					CHECK(c->psim->band0 != NULL && c->psim->band1 != NULL,
+					      "bands packed");
+					CHECK(c->psim->n > 0 && c->psim->n <= 4096,
+					      "live particles packed (n=%u)", c->psim->n);
+				}
+				RTLayerCmd *r = &fl.cmds[1];
+				CHECK(r->psim == NULL, "rain: no descriptor (streaks) ");
+				CHECK(r->px != NULL, "rain: CPU raster fallback emits pixels");
+			}
+			rtscene_free(sc);
+		}
+	}
+
 	/* 4c. animated gradient rebuilds WRITE cleanly â the old path
 	 *     re-rasterized into the same buffer every frame and blended
 	 *     over the previous frame's raster, so once a region had been

@@ -75,7 +75,13 @@ typedef struct {
         int n;
         u32 w, h;          /* target size for this frame */
         bool sim_offload;  /* renderer owns the sims (input flag) */
+        bool point_offload; /* renderer rasterizes particle layers as GPU
+                               point sprites (input flag; llvmpipe keeps the
+                               CPU sprite raster — wide points crawl there) */
 } RTFrameList;
+
+/* True when the scene contains at least one particle layer. */
+bool rtscene_has_particles(const RTScene *sc);
 
 /* True when the frame can be built as an independent layer list for GPU
  * compositing. Ripple layers need the renderer to own simulations (their

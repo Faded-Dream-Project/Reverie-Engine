@@ -371,3 +371,35 @@ void particles_render(const RevParticles *pp, u32 *px, u32 w, u32 h)
         }
         (void)SPRITE;
 }
+
+u32 particles_pack(const RevParticles *pp, f32 *band0, f32 *band1, u32 slots)
+{
+	const struct RevParticles *p = pp;
+	if (!p || !band0 || !band1 || slots == 0)
+		return 0;
+	u32 n = 0;
+	for (int i = 0; i < p->n && n < slots; i++) {
+		const Part *t = &p->parts[i];
+		/* alpha exactly as particles_render computes it */
+		f64 fade = t->life / t->maxlife;
+		f64 alpha = fade < 0.8 ? 1.0 : (1.0 - (fade - 0.8) / 0.2);
+		if (p->preset == RPPRESET_FIREflies || p->preset == RPPRESET_EMBERS)
+			alpha *= 0.55 + 0.45 * sin(t->life * 6.0 + i);
+		if (alpha <= 0.02)
+			continue;
+		f64 sz = t->size;
+		if (sz < 0.5) sz = 0.5;
+		f32 *a = band0 + (size_t)n * 4;
+		a[0] = (f32)t->x;
+		a[1] = (f32)t->y;
+		a[2] = (f32)sz;
+		a[3] = (f32)alpha;
+		f32 *b = band1 + (size_t)n * 4;
+		b[0] = (f32)t->c.r / 255.0f;
+		b[1] = (f32)t->c.g / 255.0f;
+		b[2] = (f32)t->c.b / 255.0f;
+		b[3] = 0.0f;
+		n++;
+	}
+	return n;
+}

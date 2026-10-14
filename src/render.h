@@ -67,6 +67,24 @@ typedef struct {
         u32 gw, gh;            /* height field grid (matches ripple_new)*/
 } RSimRipple;
 
+/* Per-frame particle layer descriptor (GPU raster offload). The CPU keeps
+ * the lightweight per-particle state update (position/velocity/life —
+ * microseconds for sane counts) and packs the LIVE particles into two
+ * float bands for one tiny RGBA32F texture upload; the renderer draws them
+ * as point sprites and blends them into a layer texture on the GPU. This
+ * replaces the old full-resolution CPU sprite raster + full-frame RGBA
+ * upload every frame. Band 0: (x, y, size, alpha) per particle; band 1:
+ * (r, g, b, 0). Bands are `slots` entries of 4 floats each, laid out as
+ * 1024-wide rows (particle i at column i%1024, row i/1024; band 1 starts
+ * at row slots/1024). */
+typedef struct {
+        u32 n;                 /* live particles packed below            */
+        u32 slots;             /* band capacity in 4-float entries       */
+        const f32 *band0;      /* position/size/alpha                    */
+        const f32 *band1;      /* color                                 */
+        u32 frame_w, frame_h;  /* device-pixel size of the layer         */
+} RSimParticles;
+
 /* One layer emission (GPU compositing). Pixels are straight-alpha RGBA8
  * packed u32 — identical to RFb contents — UNLESS sim != NULL, in which case
  * px is NULL and the renderer owns that layer's simulation. */
@@ -90,6 +108,8 @@ typedef struct {
                                   for plain pixel layers              */
         const RSimRipple *rsim;/* ripple layer handed to the GPU; NULL
                                   unless this is a GPU ripple layer   */
+        const RSimParticles *psim; /* particle layer rasterized on the
+                                  GPU as point sprites; NULL otherwise */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;
@@ -100,6 +120,11 @@ struct RRenderer {
         bool wants_layers;  /* GPU compositing of RLayerCmd streams */
         bool wants_sims;    /* GPU-owned layer simulations (fluid, ripple) —
                                settled during init(), never after */
+        bool wants_points;  /* GPU point-sprite rasterization of particle
+                               layers — false on software rasterizers where
+                               wide-point rendering is pathologically slow
+                               (llvmpipe); the CPU sprite raster is faster
+                               there. Settled during init(), never after. */
 
         bool (*init)(RRenderer *r, RPlatform *p, char *err, size_t errcap);
         void (*fini)(RRenderer *r);

@@ -42,4 +42,11 @@ void particles_burst(RevParticles *p, f64 x, f64 y, int n);
 void particles_step(RevParticles *p, f64 dt);
 void particles_render(const RevParticles *p, u32 *px, u32 w, u32 h);
 
+/* GPU point-sprite offload: packs live particles into two float bands
+ * (band0: x, y, size, alpha; band1: r, g, b, 0 — same alpha math as
+ * particles_render, including the fireflies/embers flicker). Each band
+ * holds `slots` entries of 4 floats in 1024-wide row layout. Returns
+ * the number of particles packed. */
+u32 particles_pack(const RevParticles *p, f32 *band0, f32 *band1, u32 slots);
+
 #endif /* REV_PARTICLES_H */

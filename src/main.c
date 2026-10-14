@@ -417,6 +417,11 @@ int main(int argc, char **argv)
                 LOGI("simulations: %s",
                      sim_offload ? "GPU (no per-pixel CPU work)"
                                  : "CPU (renderer declined GPU sims)");
+        const bool point_offload = rend->wants_points;
+        if (gpu_layers && rtscene_has_particles(sf.sc))
+                LOGI("particles: %s",
+                     point_offload ? "GPU point sprites"
+                                   : "CPU sprite raster");
 
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -539,6 +544,7 @@ int main(int argc, char **argv)
                                 fl.h = fbs[i].h;
                                 fl.n = 0;
                                 fl.sim_offload = sim_offload;
+                                fl.point_offload = point_offload;
                                 rtscene_render_layers(sf.sc, &fl, i, t, dt);
                                 f64 s_ms, ra_ms;
                                 rtscene_profile(sf.sc, &s_ms, &ra_ms);
@@ -562,6 +568,7 @@ int main(int argc, char **argv)
                                         cmd.content_id = fl.cmds[k].content_id;
                                         cmd.sim = fl.cmds[k].sim;
                                         cmd.rsim = fl.cmds[k].rsim;
+                                        cmd.psim = fl.cmds[k].psim;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);

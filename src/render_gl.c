@@ -80,6 +80,11 @@
 #define GL_RGBA 0x1908
 #define GL_RGBA8 0x8058
 #define GL_RGBA16F 0x881A
+#define GL_RGBA32F 0x8814
+#define GL_BLEND 0x0BE2
+#define GL_SRC_ALPHA 0x0302
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+#define GL_ONE 1
 #define GL_VENDOR 0x1F00
 #define GL_RENDERER 0x1F01
 #define GL_VERSION 0x1F02
@@ -163,6 +168,8 @@ typedef struct {
         void (*glClear)(GLenum_);
         void (*glViewport)(GLint_, GLint_, GLsizei_, GLsizei_);
         void (*glDisable)(GLenum_);
+        void (*glEnable)(GLenum_);
+        void (*glBlendFuncSeparate)(GLenum_, GLenum_, GLenum_, GLenum_);
         GLenum_ (*glGetError)(void);
         void (*glReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void *);
         const GLchar_ *(*glGetString)(GLenum_);
@@ -611,11 +618,60 @@ static const char *FS_RIPPLE_COMPOSITE =
         "    fragColor = vec4(co, ao);\n"
         "}\n";
 
+/* ---- GPU particle layers (GLSL ES 3.00) -----------------------------------
+ * Point sprites replacing the full-resolution CPU sprite raster. The CPU
+ * stays authoritative for particle STATE (position/velocity/life — the
+ * cheap part) and packs live particles into one small RGBA32F texture;
+ * this vertex shader places each particle as a gl_Point sized exactly like
+ * the CPU sprite (2r+1 px, r = max(1, size*2)) and the fragment shader
+ * reproduces the soft coverage falloff cov = (1-d^2)^2 * alpha, with GL
+ * source-over blending doing the same straight-alpha math the CPU sprite
+ * blit did. Rain's vertical streaks are not point-sprite-shaped and stay
+ * on the CPU raster path. */
+static const char *VS_PARTICLES =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform highp sampler2D u_parts;\n" /* RGBA32F: band0 pos, band1 col */
+        "uniform vec2 u_frame;\n"            /* device pixels                */
+        "uniform int u_rows;\n"              /* band rows (slots/1024)       */
+        "out vec3 v_col;\n"
+        "out float v_alpha;\n"
+        "void main() {\n"
+        "    int id = gl_VertexID;\n"
+        "    ivec2 pa = ivec2(id % 1024, id / 1024);\n"
+        "    vec4 pos = texelFetch(u_parts, pa, 0);\n"
+        "    vec4 col = texelFetch(u_parts, pa + ivec2(0, u_rows), 0);\n"
+        "    vec2 n = pos.xy / u_frame;\n"   /* [0..1], y from the TOP     */
+        "    gl_Position = vec4(n.x * 2.0 - 1.0, 1.0 - 2.0 * n.y, 0.0, 1.0);\n"
+        "    float r = max(1.0, floor(pos.z * 2.0));\n"
+        "    gl_PointSize = min(2.0 * r + 1.0, 63.0);\n"
+        "    v_col = col.rgb;\n"
+        "    v_alpha = pos.w;\n"
+        "}\n";
+
+static const char *FS_PARTICLES =
+        "#version 300 es\n"
+        "precision mediump float;\n"
+        "in vec3 v_col;\n"
+        "in float v_alpha;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 d = gl_PointCoord * 2.0 - 1.0;\n"
+        "    float d2 = dot(d, d);\n"        /* |d|=1 at r+0.5 px — the CPU's
+                                                  distance normalization     */
+        "    if (d2 > 1.0) discard;\n"
+        "    float cov = 1.0 - d2;\n"
+        "    cov = cov * cov * v_alpha;\n"
+        "    if (cov <= 0.02) discard;\n"     /* the CPU skips these pixels */
+        "    fragColor = vec4(v_col, cov);\n"
+        "}\n";
+
 /* ---- renderer state ------------------------------------------------------- */
 enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
        PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
        PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
-       PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_COUNT };
+       PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_PARTICLES,
+       PROG_COUNT };
 #define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
@@ -716,6 +772,13 @@ typedef struct {
         GLuint_ scratch_fbo[4];
         bool fbo_made;
 
+        /* GPU particle layer: RGBA32F particle texture (1024 wide, two
+         * stacked bands) + the frame-size layer target the sprites blend
+         * into before the standard composite pass */
+        GLuint_ ptex;
+        u32 ptex_h;
+        RTarget ptarget;
+
         /* GPU fluid + ripple solvers: enabled when RGBA16F render targets
          * probe OK AND the rasterizer is hardware (llvmpipe sims would be
          * slower than the CPU solvers — fragment dispatch overhead beats
@@ -749,6 +812,10 @@ typedef struct {
                 int clickPos, clickParam, nclicks;
                 int amp, opacity;
         } ru[PROG_COUNT];
+        /* particle program uniforms */
+        struct {
+                int frame, rows;
+        } pu[PROG_COUNT];
 
         RPlatform *plat;
         int cur_win;
@@ -770,6 +837,8 @@ typedef struct {
 /* ---- small helpers -------------------------------------------------------- */
 
 static bool gl_make_program(RenderGL *r, int idx, const char *fs, char *err, size_t errcap);
+static bool gl_make_program_vs(RenderGL *r, int idx, const char *vs, const char *fs,
+                               char *err, size_t errcap);
 static void pass_full(RenderGL *r, int pi, RTarget *dst);
 
 static void set_tex_params(GL *g, GLuint_ t, bool linear)
@@ -1317,6 +1386,64 @@ static GLuint_ gl_ripple_step(RenderGL *r, GLRipple *rp, const RSimRipple *sd)
         return rp->field[rp->cur];
 }
 
+/* ---- GPU particle layer ---------------------------------------------------- */
+
+/* Uploads the packed particle bands and renders the point-sprite layer
+ * into a frame-size transparent target; returns its texture for the
+ * standard composite pass. */
+static GLuint_ gl_particles_layer(RenderGL *r, const RLayerCmd *cmd)
+{
+        GL *g = &r->g;
+        const RSimParticles *pd = cmd->psim;
+        u32 rows = (pd->slots + 1023) / 1024;
+        u32 tex_h = rows * 2;
+
+        if (!r->ptex) {
+                g->glGenTextures(1, &r->ptex);
+                g->glBindTexture(GL_TEXTURE_2D, r->ptex);
+                g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        g->glBindTexture(GL_TEXTURE_2D, r->ptex);
+        if (r->ptex_h != tex_h) {
+                g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 1024, (int)tex_h, 0,
+                                GL_RGBA, GL_FLOAT, NULL);
+                r->ptex_h = tex_h;
+        }
+        if (pd->n) {
+                f64 up_t0 = rev_monotonic();
+                g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, (int)tex_h,
+                                   GL_RGBA, GL_FLOAT, pd->band0);
+                r->perf_upload_ms += (rev_monotonic() - up_t0) * 1000.0;
+        }
+
+        if (!ensure_target(g, &r->ptarget, cmd->w, cmd->h))
+                return 0;
+        g->glBindFramebuffer(GL_FRAMEBUFFER, r->ptarget.fbo);
+        g->glViewport(0, 0, (int)cmd->w, (int)cmd->h);
+        g->glClearColor(0, 0, 0, 0);
+        g->glClear(GL_COLOR_BUFFER_BIT);
+
+        if (pd->n) {
+                g->glUseProgram(r->prog[PROG_PARTICLES]);
+                g->glUniform2f(r->pu[PROG_PARTICLES].frame,
+                               (float)cmd->w, (float)cmd->h);
+                g->glUniform1i(r->pu[PROG_PARTICLES].rows, (int)rows);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, r->ptex);
+                /* source-over in straight alpha — the same blend the CPU
+                 * sprite blit performs into its transparent layer buffer */
+                g->glEnable(GL_BLEND);
+                g->glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                       GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                g->glDrawArrays(GL_POINTS, 0, (int)pd->n);
+                g->glDisable(GL_BLEND);
+        }
+        return r->ptarget.tex;
+}
+
 /* ---- content-addressed upload ---------------------------------------------- */
 static GLuint_ upload_layer_tex(RenderGL *r, const RLayerCmd *cmd)
 {
@@ -1615,6 +1742,8 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         LOADGL(glClear, "glClear");
         LOADGL(glViewport, "glViewport");
         LOADGL(glDisable, "glDisable");
+        LOADGL(glEnable, "glEnable");
+        LOADGL(glBlendFuncSeparate, "glBlendFuncSeparate");
         LOADGL(glGetError, "glGetError");
         LOADGL(glGetString, "glGetString");
         LOADGL(glReadPixels, "glReadPixels");
@@ -1639,9 +1768,6 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64v");
         r->tq_have = g->glGenQueriesQ && g->glBeginQueryQ && g->glEndQueryQ &&
                      g->glGetQueryObjectu64vQ;
-        if (r->tq_have)
-                LOGI("opengl: GPU timer queries available (REV_PROFILE reports "
-                     "async GPU timings)");
 
         const char *rend = (const char *)g->glGetString(GL_RENDERER);
         if (rend && (strstr(rend, "llvmpipe") || strstr(rend, "softpipe") || strstr(rend, "swrast"))) {
@@ -1650,13 +1776,32 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         } else {
                 LOGI("opengl: renderer %s", rend ? rend : "?");
         }
+        /* Timer queries are a hardware-GPU instrument. On software GL they
+         * would merely duplicate the CPU wall clock — worse, polling
+         * QUERY_RESULT_AVAILABLE serializes llvmpipe's async worker pool
+         * (measured: 1080p snowfall 60 fps async -> 6 fps serialized), so
+         * they are disabled there outright. */
+        if (r->software)
+                r->tq_have = false;
+        if (r->tq_have)
+                LOGI("opengl: GPU timer queries available (REV_PROFILE reports "
+                     "async GPU timings)");
+
+        /* Point-sprite particle layers: hardware only. llvmpipe's wide-point
+         * rasterization is pathologically slow (measured: 1080p snowfall
+         * 6 fps with GPU points vs 60 fps with the CPU sprite raster) —
+         * the CPU raster is the right tool there. The REV_GL_FLUID_SW test
+         * hook forces the GPU path on so it stays regression-covered. */
+        rr->wants_points = !r->software || getenv("REV_GL_FLUID_SW") != NULL;
 
         /* programs */
         if (!gl_make_program(r, PROG_PREMULT, FS_PREMULT, err, errcap) ||
             !gl_make_program(r, PROG_COPY, FS_COPY, err, errcap) ||
             !gl_make_program(r, PROG_BLUR, FS_BLUR, err, errcap) ||
             !gl_make_program(r, PROG_COMPOSITE, FS_COMPOSITE, err, errcap) ||
-            !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap))
+            !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap) ||
+            !gl_make_program_vs(r, PROG_PARTICLES, VS_PARTICLES, FS_PARTICLES,
+                                err, errcap))
                 return false;
 
         /* GPU fluid + ripple solvers: probe RGBA16F renderability by actually
@@ -1773,6 +1918,8 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 r->ru[i].nclicks = g->glGetUniformLocation(pg, "u_nclicks");
                 r->ru[i].amp = g->glGetUniformLocation(pg, "u_amp");
                 r->ru[i].opacity = g->glGetUniformLocation(pg, "u_opacity");
+                r->pu[i].frame = g->glGetUniformLocation(pg, "u_frame");
+                r->pu[i].rows = g->glGetUniformLocation(pg, "u_rows");
         }
         /* PROG_F_ADV_DYE samples BOTH u_dye and u_vel — the generic loop
          * above bound both to unit 0, so the dye advection read the DYE
@@ -1796,10 +1943,16 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
 
 static bool gl_make_program(RenderGL *r, int idx, const char *fs, char *err, size_t errcap)
 {
+        return gl_make_program_vs(r, idx, VS, fs, err, errcap);
+}
+
+static bool gl_make_program_vs(RenderGL *r, int idx, const char *vs, const char *fs,
+                               char *err, size_t errcap)
+{
         GL *g = &r->g;
         GLuint_ v = g->glCreateShader(GL_VERTEX_SHADER);
         GLuint_ f = g->glCreateShader(GL_FRAGMENT_SHADER);
-        const char *vsrc = VS, *fsrc = fs;
+        const char *vsrc = vs, *fsrc = fs;
         g->glShaderSource(v, 1, &vsrc, NULL);
         g->glShaderSource(f, 1, &fsrc, NULL);
         g->glCompileShader(v);
@@ -1962,11 +2115,17 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
         /* 1. obtain the layer's source texture:
          *    - GPU-owned fluid layers are simulated here (no CPU pixels,
          *      no upload — the whole per-pixel pipeline stays on the GPU)
+         *    - GPU particle layers rasterize point sprites here (the CPU
+         *      ships ~128KB of packed floats, not an 8MB full-frame raster)
          *    - pixel layers go through the content-addressed cache: static
          *      rasters re-upload ONLY when their content serial changes
          *      (the old path pushed every cached raster every frame). */
         GLuint_ src_tex;
-        if (cmd->sim) {
+        if (cmd->psim) {
+                src_tex = gl_particles_layer(r, cmd);
+                if (!src_tex)
+                        return false;
+        } else if (cmd->sim) {
                 if (!r->sims_ok)
                         return false;    /* scene should not have offloaded */
                 GLFluid *f = fluid_slot(r, r->cur_win, cmd->sim);
@@ -2279,6 +2438,14 @@ static void gl_fini(RRenderer *rr)
                                 g->glDeleteTextures(1, &r->texcache[i].tex);
                         r->texcache[i].tex = 0;
                 }
+                /* GPU particle layer resources */
+                if (r->ptex)
+                        g->glDeleteTextures(1, &r->ptex);
+                if (r->ptarget.tex) {
+                        g->glDeleteTextures(1, &r->ptarget.tex);
+                        g->glDeleteFramebuffers(1, &r->ptarget.fbo);
+                }
+                /* pending timer queries need no teardown: the context dies */
         }
         if (r->wegl_lib)
                 dlclose(r->wegl_lib);
