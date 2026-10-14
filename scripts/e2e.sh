@@ -171,6 +171,49 @@ else
 fi
 stop_xvfb
 
+# ---- Video wallpapers (needs the ffmpeg CLI to synthesize a fixture) --------
+if command -v ffmpeg >/dev/null 2>&1; then
+    VDIR=$(mktemp -d)
+    ffmpeg -y -loglevel error -f lavfi -i "testsrc2=size=320x180:rate=30" \
+        -t 4 -pix_fmt yuv420p -c:v libx264 -preset ultrafast "$VDIR/loop.mp4"
+    mkdir -p "$VDIR/assets"
+    mv "$VDIR/loop.mp4" "$VDIR/assets/loop.mp4"
+    printf 'scene { layer bg { type = video src = "assets/loop.mp4" loop = true } }\n' > "$VDIR/scene.rev"
+    printf '{ "id": "vtest", "name": "vtest", "scene": "scene.rev" }\n' > "$VDIR/theme.json"
+    # CPU tier: sws path
+    start_xvfb
+    DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/vid" "$VDIR" \
+        > "$OUT/vid.log" 2>&1 || true
+    # GL tier: plane upload + shader YUV->RGB
+    DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R opengl --shot 3 \
+        "$OUT/vidgl" "$VDIR" > "$OUT/vidgl.log" 2>&1 || true
+    stop_xvfb
+    if [ -f "$OUT/vid.png" ] && grep -q "video: 320x180" "$OUT/vid.log" 2>/dev/null; then
+        echo "    video(cpu):   PASS (decoded + rendered$( [ -f "$OUT/vidgl.png" ] && echo '; GL tier too' ))"
+        PASS=$((PASS+1))
+    else
+        echo "    video(cpu):   FAIL (no decoded frame)"
+        cat "$OUT/vid.log"
+        FAIL=$((FAIL+1))
+    fi
+    if grep -q "video: GPU planes + shader color convert" "$OUT/vidgl.log" 2>/dev/null \
+       && [ -f "$OUT/vidgl.png" ]; then
+        echo "    video(gl):    PASS (GPU plane path active)"
+        PASS=$((PASS+1))
+    elif grep -q "renderer: opengl" "$OUT/vidgl.log" 2>/dev/null; then
+        echo "    video(gl):    FAIL (GPU video path did not activate)"
+        cat "$OUT/vidgl.log"
+        FAIL=$((FAIL+1))
+    else
+        echo "    video(gl):    SKIP (no libEGL / GL vendor on this system)"
+        SKIP=$((SKIP+1))
+    fi
+    rm -rf "$VDIR"
+else
+    echo "    video:        SKIP (no ffmpeg CLI for the fixture)"
+    SKIP=$((SKIP+1))
+fi
+
 # ---- Vulkan tier: default present path (platform SHM) -----------------------
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \

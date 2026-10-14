@@ -19,6 +19,7 @@
 #include "ripple.h"
 #include "svg.h"
 #include "util.h"
+#include "video.h"
 
 /* --------------------------------------------------------------------------
  * types
@@ -74,6 +75,9 @@ typedef struct RTLayer {
         f64 p_rate, p_size, p_grav, p_drift;
         RColor p_c0, p_c1;
 
+        bool v_loop, v_paused; /* video layer                              */
+        RevVideo *vid;         /* layer-level decoder (shared by monitors) */
+
         RTAnim anims[16];
         int nanims;
 
@@ -103,6 +107,8 @@ struct RTLayerInst {
         u32 pband_slots;
         /* GPU gradient offload descriptor (address-stable) */
         RGradDesc gdesc;
+        /* video frame descriptor (address-stable) */
+        RSimVideo vdesc;
         /* raster content serial — bumped on every (re)build; renderers
          * cache textures against it and skip redundant re-uploads */
         u64 content_id;
@@ -243,7 +249,7 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
         sc->layers = (RTLayer *)calloc((size_t)(ir->nlayers ? ir->nlayers : 1), sizeof(RTLayer));
         sc->n = ir->nlayers;
 
-        static const char *type_names[] = { "image", "gradient", "solid", "fluid", "ripple", "particles" };
+        static const char *type_names[] = { "image", "gradient", "solid", "fluid", "ripple", "particles", "video" };
         static const char *blend_names[] = { "normal", "add", "screen", "multiply", "overlay" };
         static const char *fit_names[] = { "fill", "fit", "stretch", "tile" };
         static const char *shape_names[] = { "linear", "radial" };
@@ -291,7 +297,7 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                 if (!tv || tv->kind != RV_IDENT)
                         { fail(err, errcap, "layer '%s' (line %d): missing or invalid 'type'",
                                     rt->name, L->line); goto bad; }
-                rt->type = map_ident(tv, type_names, 6);
+                rt->type = map_ident(tv, type_names, 7);
                 if (rt->type < 0)
                         { fail(err, errcap, "layer '%s' (line %d): unknown type '%s'",
                                     rt->name, L->line, tv->str); goto bad; }
@@ -439,6 +445,24 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                         val_color(getp(L->props, L->nprops, "color"), &rt->p_c0);
                         val_color(getp(L->props, L->nprops, "color2"), &rt->p_c1);
                         sc->animated = true;
+                } else if (rt->type == LT_VIDEO) {
+                        const char *s;
+                        if (!val_str(getp(L->props, L->nprops, "src"), &s) || !*s)
+                                { fail(err, errcap, "layer '%s': video layers need src = \"file.mp4\"", rt->name); goto bad; }
+                        char *path = rev_path_join(base_dir, s);
+                        rt->src = path;
+                        if ((v = getp(L->props, L->nprops, "loop")))
+                                rt->v_loop = v->kind != RV_BOOL || v->b;
+                        if ((v = getp(L->props, L->nprops, "paused")) && v->kind == RV_BOOL)
+                                rt->v_paused = v->b;
+                        if ((v = getp(L->props, L->nprops, "fit"))) {
+                                int f = map_ident(v, fit_names, 4);
+                                if (f < 0)
+                                        { fail(err, errcap, "layer '%s': unknown fit '%s' (fill|fit|stretch|tile)",
+                                                    rt->name, v->str); goto bad; }
+                                rt->fit = f;
+                        }
+                        sc->animated = true;
                 }
 
                 /* anims */
@@ -498,6 +522,8 @@ void rtscene_free(RTScene *sc)
                 RTLayer *L = &sc->layers[i];
                 free(L->name);
                 free(L->src);
+                if (L->vid)
+                        rev_video_close(L->vid);
                 for (int m = 0; m < RT_MAX_MONITORS; m++) {
                         RTLayerInst *in = L->inst[m];
                         if (!in)
@@ -854,6 +880,16 @@ bool rtscene_has_gradients(const RTScene *sc)
         return false;
 }
 
+bool rtscene_has_video(const RTScene *sc)
+{
+        if (!sc)
+                return false;
+        for (int i = 0; i < sc->n; i++)
+                if (sc->layers[i].type == LT_VIDEO)
+                        return true;
+        return false;
+}
+
 bool rtscene_gpu_capable(const RTScene *sc, bool sim_offload)
 {
         if (!sc)
@@ -1194,6 +1230,125 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         particles_render(in->parts, target->px, (u32)W, (u32)H);
                                         sc->prof_sim_ms += (rev_monotonic() - ms2) * 1000.0;
                                         srcfb = target;
+                                }
+                        }
+                } else if (L->type == LT_VIDEO) {
+                        /* layer-level decoder shared across monitors (video
+                         * has no per-monitor interaction; all outputs show
+                         * the same frame). Missing libs / broken files drop
+                         * the layer with ONE diagnostic — never the engine. */
+                        if (!L->vid && !L->src)
+                                continue;
+                        if (!L->vid) {
+                                char verr[256] = { 0 };
+                                RVideoSource vs = { 0 };
+                                if (sc->asset_fn) {
+                                        size_t vlen = 0;
+                                        const u8 *vdata = sc->asset_fn(sc->asset_ctx, L->src, &vlen);
+                                        if (vdata) {
+                                                vs.data = vdata;
+                                                vs.len = vlen;
+                                        }
+                                }
+                                if (!vs.data && rev_file_exists(L->src))
+                                        vs.path = L->src;
+                                if (vs.path || vs.data)
+                                        L->vid = rev_video_open(&vs, L->v_loop, verr, sizeof verr);
+                                if (!L->vid) {
+                                        static bool warned_video;
+                                        if (!warned_video) {
+                                                warned_video = true;
+                                                LOGW("layer '%s': %s", L->name,
+                                                     verr[0] ? verr :
+                                                     "video unavailable");
+                                        }
+                                        free(L->src);
+                                        L->src = NULL;
+                                        continue;
+                                }
+                        }
+                        const RVideoFrame *vf = rev_video_display(L->vid,
+                                                                 L->v_paused ? 0.0 : dt);
+                        if (vf && vf->w) {
+                                /* fit rect (same semantics as image layers) */
+                                f64 iw = vf->w, ih = vf->h;
+                                f64 s;
+                                switch (L->fit) {
+                                case FIT_STRETCH: s = -1; break;
+                                case FIT_CONTAIN: s = W / iw < H / ih ? W / iw : H / ih; break;
+                                default:          s = W / iw > H / ih ? W / iw : H / ih; break;
+                                }
+                                u32 pw, ph;
+                                if (s < 0) {
+                                        pw = (u32)W;
+                                        ph = (u32)H;
+                                } else {
+                                        pw = (u32)(iw * s + 0.5);
+                                        ph = (u32)(ih * s + 0.5);
+                                        if (pw < 1) pw = 1;
+                                        if (ph < 1) ph = 1;
+                                }
+                                i32 dx = (i32)((W - pw) / 2.0), dy = (i32)((H - ph) / 2.0);
+
+                                if (fl && fl->video_offload) {
+                                        /* GPU: hand the YUV planes over — the
+                                         * renderer uploads them (3.1MB at
+                                         * 1080p vs 8.3MB as RGBA) and converts
+                                         * to RGB inside the composite pass */
+                                        RSimVideo *vd = &in->vdesc;
+                                        vd->y = vf->y;
+                                        vd->u = vf->u;
+                                        vd->v = vf->v;
+                                        vd->ls_y = vf->ls_y;
+                                        vd->ls_u = vf->ls_u;
+                                        vd->ls_v = vf->ls_v;
+                                        vd->w = vf->w;
+                                        vd->h = vf->h;
+                                        if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                                break;
+                                        RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                        memset(cmd, 0, sizeof *cmd);
+                                        cmd->vsim = vd;
+                                        cmd->w = vf->w;
+                                        cmd->h = vf->h;
+                                        cmd->place_w = pw;
+                                        cmd->place_h = ph;
+                                        cmd->dx = dx;
+                                        cmd->dy = dy;
+                                        cmd->blend = L->blend;
+                                        cmd->opacity = e.opacity;
+                                        cmd->blur = 0.0;
+                                        cmd->linear = true;
+                                        cmd->content_id = 0;
+                                        continue;
+                                }
+                                /* CPU: sws_scale straight into the placed
+                                 * rect (one conversion per monitor) */
+                                if (!ensure_sim_fb(in, pw, ph))
+                                        continue;
+                                if (rev_video_to_rgba(vf, in->sim_fb.px, pw, ph)) {
+                                        if (fl) {
+                                                if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                                        break;
+                                                RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                                memset(cmd, 0, sizeof *cmd);
+                                                cmd->px = in->sim_fb.px;
+                                                cmd->w = pw;
+                                                cmd->h = ph;
+                                                cmd->place_w = 0;
+                                                cmd->place_h = 0;
+                                                cmd->dx = dx;
+                                                cmd->dy = dy;
+                                                cmd->blend = L->blend;
+                                                cmd->opacity = e.opacity;
+                                                cmd->blur = 0.0;
+                                                cmd->linear = false;
+                                                cmd->content_id = 0;
+                                        } else {
+                                                RFb src = { in->sim_fb.px, pw, ph };
+                                                rev_comp_blend_at(fb, &src, dx, dy,
+                                                                  L->blend, e.opacity);
+                                        }
                                 }
                         }
                 } else {

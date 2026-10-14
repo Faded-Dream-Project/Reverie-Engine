@@ -85,6 +85,10 @@
 #define GL_SRC_ALPHA 0x0302
 #define GL_ONE_MINUS_SRC_ALPHA 0x0303
 #define GL_ONE 1
+#define GL_R8 0x8229
+#define GL_RED 0x1903
+#define GL_UNPACK_ROW_LENGTH 0x0CF2
+#define GL_UNPACK_ALIGNMENT 0x0CF5
 #define GL_VENDOR 0x1F00
 #define GL_RENDERER 0x1F01
 #define GL_VERSION 0x1F02
@@ -100,6 +104,8 @@
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #define GL_TEXTURE0 0x84C0
 #define GL_TEXTURE1 0x84C1
+#define GL_TEXTURE2 0x84C2
+#define GL_TEXTURE3 0x84C3
 #define GL_ACTIVE_TEXTURE 0x84E0
 
 typedef unsigned int EGLBoolean_;
@@ -138,6 +144,7 @@ typedef struct {
         void (*glTexSubImage2D)(GLenum_, GLint_, GLint_, GLint_, GLsizei_, GLsizei_,
                                 GLenum_, GLenum_, const void *);
         void (*glTexParameteri)(GLenum_, GLenum_, GLint_);
+        void (*glPixelStorei)(GLenum_, GLint_);
         void (*glGenFramebuffers)(GLsizei_, GLuint_ *);
         void (*glDeleteFramebuffers)(GLsizei_, const GLuint_ *);
         void (*glBindFramebuffer)(GLenum_, GLuint_);
@@ -714,12 +721,61 @@ static const char *FS_GRADIENT =
         "    fragColor = c;\n"
         "}\n";
 
+/* ---- GPU video composite (GLSL ES 3.00) ------------------------------------
+ * YUV420P planes as R8 textures, BT.601 limited-range conversion, then the
+ * same W3C blend math as FS_COMPOSITE (video layers participate in the
+ * scene's blending like any other layer). Plane upload is 3.1MB at 1080p
+ * vs 8.3MB as RGBA — and no CPU color conversion at all. */
+static const char *FS_VIDEO =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_y;\n"          /* unit 0                       */
+        "uniform sampler2D u_u;\n"          /* unit 1                       */
+        "uniform sampler2D u_v;\n"          /* unit 2                       */
+        "uniform sampler2D u_dst;\n"        /* unit 3: accumulation         */
+        "uniform int u_blend;\n"
+        "uniform float u_opacity;\n"
+        "in vec2 v_uvsrc;\n"                /* video uv (placed rect)      */
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "vec3 blend_fn(int m, vec3 cb, vec3 cs) {\n"
+        "    if (m == 1) return clamp(cb + cs, 0.0, 1.0);\n"
+        "    if (m == 2) return cb + cs - cb * cs;\n"
+        "    if (m == 3) return cb * cs;\n"
+        "    if (m == 4) return mix(2.0 * cb * cs,\n"
+        "                           1.0 - 2.0 * (1.0 - cb) * (1.0 - cs),\n"
+        "                           step(vec3(0.5), cb));\n"
+        "    return cs;\n"
+        "}\n"
+        "void main() {\n"
+        "    if (v_uvsrc.x < 0.0 || v_uvsrc.x > 1.0 ||\n"
+        "        v_uvsrc.y < 0.0 || v_uvsrc.y > 1.0) discard;\n"
+        "    float yy = texture(u_y, v_uvsrc).r;\n"
+        "    float uu = texture(u_u, v_uvsrc).r - 0.5;\n"
+        "    float vv = texture(u_v, v_uvsrc).r - 0.5;\n"
+        "    /* BT.601 limited range */\n"
+        "    vec3 cs = vec3(1.164 * (yy - 0.0625) + 1.596 * vv,\n"
+        "                   1.164 * (yy - 0.0625) - 0.391 * uu - 0.813 * vv,\n"
+        "                   1.164 * (yy - 0.0625) + 2.018 * uu);\n"
+        "    cs = clamp(cs, 0.0, 1.0);\n"
+        "    vec4 dp = texture(u_dst, v_screen);\n"
+        "    float as = u_opacity;\n"        /* planes are fully opaque      */
+        "    float ad = dp.a;\n"
+        "    float ao = as + ad * (1.0 - as);\n"
+        "    float k1 = as * (1.0 - ad);\n"
+        "    float k3 = (1.0 - as) * ad;\n"
+        "    vec3 b = blend_fn(u_blend, dp.rgb, cs);\n"
+        "    vec3 co = ao > 0.0 ? (k1 * cs + k3 * dp.rgb + as * ad * b) / ao\n"
+        "                       : vec3(0.0);\n"
+        "    fragColor = vec4(clamp(co, 0.0, 1.0), ao);\n"
+        "}\n";
+
 /* ---- renderer state ------------------------------------------------------- */
 enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
        PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
        PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
        PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_PARTICLES,
-       PROG_GRADIENT, PROG_COUNT };
+       PROG_GRADIENT, PROG_VIDEO, PROG_COUNT };
 #define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
@@ -836,6 +892,10 @@ typedef struct {
         } rgcache[8];
         u64 rg_clock;
 
+        /* video plane textures (R8, re-allocated on size change) */
+        GLuint_ vtex_y, vtex_u, vtex_v;
+        u32 vtex_w;
+
         /* GPU fluid + ripple solvers: enabled when RGBA16F render targets
          * probe OK AND the rasterizer is hardware (llvmpipe sims would be
          * slower than the CPU solvers — fragment dispatch overhead beats
@@ -877,6 +937,10 @@ typedef struct {
         struct {
                 int shape, p0, p1, rc, rr, cols, offs, n, dims;
         } gu[PROG_COUNT];
+        /* video program uniforms */
+        struct {
+                int y, u, v, dst, blend, opacity;
+        } vu[PROG_COUNT];
 
         RPlatform *plat;
         int cur_win;
@@ -1863,6 +1927,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         LOADGL(glTexImage2D, "glTexImage2D");
         LOADGL(glTexSubImage2D, "glTexSubImage2D");
         LOADGL(glTexParameteri, "glTexParameteri");
+        LOADGL(glPixelStorei, "glPixelStorei");
         LOADGL(glGenFramebuffers, "glGenFramebuffers");
         LOADGL(glDeleteFramebuffers, "glDeleteFramebuffers");
         LOADGL(glBindFramebuffer, "glBindFramebuffer");
@@ -1948,6 +2013,10 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         /* Shader-evaluated gradients: hardware only (a fullscreen fragment
          * pass costs more than the LUT fill it replaces on software GL). */
         rr->wants_grads = !r->software || getenv("REV_GL_FLUID_SW") != NULL;
+        /* Video plane upload + shader conversion: R8 textures are ES3 core —
+         * strictly less bandwidth than the CPU path's RGBA upload, and the
+         * conversion rides along with a pass we already pay for. */
+        rr->wants_video = true;
 
         /* programs */
         if (!gl_make_program(r, PROG_PREMULT, FS_PREMULT, err, errcap) ||
@@ -1956,6 +2025,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
             !gl_make_program(r, PROG_COMPOSITE, FS_COMPOSITE, err, errcap) ||
             !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap) ||
             !gl_make_program(r, PROG_GRADIENT, FS_GRADIENT, err, errcap) ||
+            !gl_make_program(r, PROG_VIDEO, FS_VIDEO, err, errcap) ||
             !gl_make_program_vs(r, PROG_PARTICLES, VS_PARTICLES, FS_PARTICLES,
                                 err, errcap))
                 return false;
@@ -2085,6 +2155,25 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 r->gu[i].offs = g->glGetUniformLocation(pg, "u_offs[0]");
                 r->gu[i].n = g->glGetUniformLocation(pg, "u_n");
                 r->gu[i].dims = g->glGetUniformLocation(pg, "u_dims");
+                r->vu[i].y = g->glGetUniformLocation(pg, "u_y");
+                r->vu[i].u = g->glGetUniformLocation(pg, "u_u");
+                r->vu[i].v = g->glGetUniformLocation(pg, "u_v");
+                r->vu[i].dst = g->glGetUniformLocation(pg, "u_dst");
+                r->vu[i].blend = g->glGetUniformLocation(pg, "u_blend");
+                r->vu[i].opacity = g->glGetUniformLocation(pg, "u_opacity");
+        }
+        /* PROG_VIDEO: y/u/v on units 0/1/2, accum on unit 3 (the generic
+         * loop only knows u_dst = unit 1) */
+        if (r->prog[PROG_VIDEO]) {
+                g->glUseProgram(r->prog[PROG_VIDEO]);
+                int ly = g->glGetUniformLocation(r->prog[PROG_VIDEO], "u_y");
+                int lu = g->glGetUniformLocation(r->prog[PROG_VIDEO], "u_u");
+                int lv = g->glGetUniformLocation(r->prog[PROG_VIDEO], "u_v");
+                int ld = g->glGetUniformLocation(r->prog[PROG_VIDEO], "u_dst");
+                if (ly >= 0) g->glUniform1i(ly, 0);
+                if (lu >= 0) g->glUniform1i(lu, 1);
+                if (lv >= 0) g->glUniform1i(lv, 2);
+                if (ld >= 0) g->glUniform1i(ld, 3);
         }
         /* PROG_F_ADV_DYE samples BOTH u_dye and u_vel — the generic loop
          * above bound both to unit 0, so the dye advection read the DYE
@@ -2286,6 +2375,105 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
          *      rasters re-upload ONLY when their content serial changes
          *      (the old path pushed every cached raster every frame). */
         GLuint_ src_tex;
+        if (cmd->vsim) {
+                /* video: upload Y/U/V planes as R8 textures and composite
+                 * through the dedicated YUV->RGB blend program (placement
+                 * math shared with the standard composite below) */
+                const RSimVideo *vd = cmd->vsim;
+                g->glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                g->glPixelStorei(GL_UNPACK_ROW_LENGTH, vd->ls_y);
+                src_tex = 0;
+                if (!r->vtex_y)
+                        g->glGenTextures(1, &r->vtex_y);
+                if (!r->vtex_u)
+                        g->glGenTextures(1, &r->vtex_u);
+                if (!r->vtex_v)
+                        g->glGenTextures(1, &r->vtex_v);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_y);
+                if (r->vtex_w != vd->w) {
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        g->glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (int)vd->w, (int)vd->h, 0,
+                                        GL_RED, GL_UNSIGNED_BYTE, NULL);
+                        r->vtex_w = vd->w;
+                }
+                f64 up_t0 = rev_monotonic();
+                g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)vd->w, (int)vd->h,
+                                   GL_RED, GL_UNSIGNED_BYTE, vd->y);
+                g->glPixelStorei(GL_UNPACK_ROW_LENGTH, vd->ls_u);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_u);
+                {
+                        u32 cw = vd->w / 2, ch = vd->h / 2;
+                        if (cw < 1) cw = 1;
+                        if (ch < 1) ch = 1;
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        g->glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (int)cw, (int)ch, 0,
+                                        GL_RED, GL_UNSIGNED_BYTE, NULL);
+                        g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cw, (int)ch,
+                                           GL_RED, GL_UNSIGNED_BYTE, vd->u);
+                }
+                g->glPixelStorei(GL_UNPACK_ROW_LENGTH, vd->ls_v);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_v);
+                {
+                        u32 cw = vd->w / 2, ch = vd->h / 2;
+                        if (cw < 1) cw = 1;
+                        if (ch < 1) ch = 1;
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                        g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                        g->glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, (int)cw, (int)ch, 0,
+                                        GL_RED, GL_UNSIGNED_BYTE, NULL);
+                        g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cw, (int)ch,
+                                           GL_RED, GL_UNSIGNED_BYTE, vd->v);
+                }
+                r->perf_upload_ms += (rev_monotonic() - up_t0) * 1000.0;
+                g->glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                g->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+                /* composite: planes + accum -> flipped accum */
+                int wi = r->cur_win;
+                u32 pw = cmd->place_w ? cmd->place_w : cmd->w;
+                u32 ph = cmd->place_h ? cmd->place_h : cmd->h;
+                RTarget *accum_rd = &r->accum[wi][r->accum_cur[wi]];
+                RTarget *accum_wr = &r->accum[wi][r->accum_cur[wi] ^ 1];
+                g->glBindFramebuffer(GL_FRAMEBUFFER, accum_wr->fbo);
+                g->glViewport(0, 0, (int)accum_wr->w, (int)accum_wr->h);
+                g->glUseProgram(r->prog[PROG_VIDEO]);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_y);
+                g->glActiveTexture(GL_TEXTURE1);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_u);
+                g->glActiveTexture(GL_TEXTURE2);
+                g->glBindTexture(GL_TEXTURE_2D, r->vtex_v);
+                g->glActiveTexture(GL_TEXTURE3);
+                g->glBindTexture(GL_TEXTURE_2D, accum_rd->tex);
+                g->glActiveTexture(GL_TEXTURE0);
+                {
+                        int pi = PROG_VIDEO;
+                        if (r->u[pi].off >= 0)
+                                g->glUniform2f(r->u[pi].off,
+                                               (float)(-(double)cmd->dx / (double)pw),
+                                               (float)(-(double)cmd->dy / (double)ph));
+                        if (r->u[pi].scale >= 0)
+                                g->glUniform2f(r->u[pi].scale,
+                                               (float)((double)accum_wr->w / (double)pw),
+                                               (float)((double)accum_wr->h / (double)ph));
+                        if (r->vu[pi].blend >= 0)
+                                g->glUniform1i(r->vu[pi].blend, cmd->blend);
+                        if (r->vu[pi].opacity >= 0)
+                                g->glUniform1f(r->vu[pi].opacity,
+                                               (float)(cmd->opacity < 0 ? 0 :
+                                                       cmd->opacity > 1 ? 1 : cmd->opacity));
+                }
+                draw_full(g);
+                r->accum_cur[wi] ^= 1;
+                return true;
+        }
         if (cmd->grad) {
                 src_tex = gl_grad_layer(r, cmd);
                 if (!src_tex)
@@ -2621,6 +2809,13 @@ static void gl_fini(RRenderer *rr)
                                 g->glDeleteFramebuffers(1, &r->rgcache[i].t.fbo);
                         }
                 }
+                /* video plane textures */
+                if (r->vtex_y)
+                        g->glDeleteTextures(1, &r->vtex_y);
+                if (r->vtex_u)
+                        g->glDeleteTextures(1, &r->vtex_u);
+                if (r->vtex_v)
+                        g->glDeleteTextures(1, &r->vtex_v);
                 /* pending timer queries need no teardown: the context dies */
         }
         if (r->wegl_lib)

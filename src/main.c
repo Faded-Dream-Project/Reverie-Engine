@@ -510,6 +510,11 @@ int main(int argc, char **argv)
                 LOGI("gradients: %s",
                      grad_offload ? "GPU shader evaluation"
                                   : "CPU rasterization");
+        const bool video_offload = rend->wants_video;
+        if (gpu_layers && rtscene_has_video(sf.sc))
+                LOGI("video: %s",
+                     video_offload ? "GPU planes + shader color convert"
+                                   : "CPU swscale");
 
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -634,6 +639,7 @@ int main(int argc, char **argv)
                                 fl.sim_offload = sim_offload;
                                 fl.point_offload = point_offload;
                                 fl.grad_offload = grad_offload;
+                                fl.video_offload = video_offload;
                                 rtscene_render_layers(sf.sc, &fl, i, t, dt);
                                 f64 s_ms, ra_ms;
                                 rtscene_profile(sf.sc, &s_ms, &ra_ms);
@@ -659,6 +665,7 @@ int main(int argc, char **argv)
                                         cmd.rsim = fl.cmds[k].rsim;
                                         cmd.psim = fl.cmds[k].psim;
                                         cmd.grad = fl.cmds[k].grad;
+                                        cmd.vsim = fl.cmds[k].vsim;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);

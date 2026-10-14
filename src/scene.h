@@ -20,7 +20,8 @@ enum {
         LT_SOLID,
         LT_FLUID,
         LT_RIPPLE,
-        LT_PARTICLES
+        LT_PARTICLES,
+        LT_VIDEO
 };
 
 enum {
@@ -82,6 +83,9 @@ typedef struct {
                                CPU sprite raster — wide points crawl there) */
         bool grad_offload;  /* renderer evaluates gradient layers in shaders
                                (input flag; only when wants_grads) */
+        bool video_offload; /* renderer uploads video planes + converts in
+                               shaders (input flag; only when wants_video);
+                               otherwise sws_scale to RGBA on the CPU */
 } RTFrameList;
 
 /* True when the scene contains at least one particle layer. */
@@ -89,6 +93,9 @@ bool rtscene_has_particles(const RTScene *sc);
 
 /* True when the scene contains at least one gradient layer. */
 bool rtscene_has_gradients(const RTScene *sc);
+
+/* True when the scene contains at least one video layer. */
+bool rtscene_has_video(const RTScene *sc);
 
 /* True when the frame can be built as an independent layer list for GPU
  * compositing. Ripple layers need the renderer to own simulations (their

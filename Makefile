@@ -23,9 +23,27 @@ DEFS     = -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 OPTS     = -fno-math-errno -funroll-loops
 ALL_CFLAGS  = -std=c11 $(WARN) $(DEFS) $(CFLAGS) $(OPTS) -Isrc
 LDFLAGS     =
-LIBS        = -lm -ldl
+LIBS        = -lm -ldl -lpthread
 
 BUILD   = build
+
+# ---- optional video support (FFmpeg headers at build, dlopen at run) --------
+# System headers first (matches the user's distro exactly); the vendored
+# contrib/ffmpeg-headers (Debian 13 / FFmpeg 7.1) as fallback. Without either,
+# video_stub.c builds and the engine is exactly as before.
+AV_DIRS := /usr/include/x86_64-linux-gnu /usr/include
+AV_INC  := $(firstword $(foreach d,$(AV_DIRS),$(wildcard $(d)/libavcodec/avcodec.h)))
+ifeq ($(AV_INC),)
+AV_INC  := $(firstword $(wildcard contrib/ffmpeg-headers/libavcodec/avcodec.h))
+endif
+ifneq ($(AV_INC),)
+AV_DIR  := $(patsubst %/libavcodec/avcodec.h,%,$(AV_INC))
+VIDEO_OBJ  = $(BUILD)/video.o
+VIDEO_CPPF = -DREV_VIDEO=1 -I$(AV_DIR)
+else
+VIDEO_OBJ  = $(BUILD)/video_stub.o
+VIDEO_CPPF =
+endif
 
 # ---- core engine objects (everything except the X11 backend) ---------------
 CORE_SRC = \
@@ -58,10 +76,18 @@ CORE_SRC = \
 	src/render_gl.c \
 	src/render_vk.c
 
-CORE_OBJ = $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC))
+CORE_OBJ = $(patsubst src/%.c,$(BUILD)/%.o,$(CORE_SRC)) $(VIDEO_OBJ)
 LIBREV   = $(BUILD)/libreverie.a
 
+# video.o needs the FFmpeg headers (system or vendored); video_stub.o needs
+# nothing - whichever was selected by the AV_INC detection above
+$(BUILD)/video.o: src/video.c src/video.h | $(BUILD)
+	$(CC) $(ALL_CFLAGS) $(VIDEO_CPPF) -c $< -o $@
+$(BUILD)/video_stub.o: src/video_stub.c src/video.h | $(BUILD)
+	$(CC) $(ALL_CFLAGS) -c $< -o $@
+
 # ---- executables -------------------------------------------------------------
+.DEFAULT_GOAL := all
 BINS  = $(BUILD)/reverie $(BUILD)/revtool
 
 # ---- tests -------------------------------------------------------------------

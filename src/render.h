@@ -85,6 +85,16 @@ typedef struct {
         u32 frame_w, frame_h;  /* device-pixel size of the layer         */
 } RSimParticles;
 
+/* Video frame descriptor (GPU plane upload + shader color conversion).
+ * Planes are YUV420P (BT.601 limited range — the overwhelming default for
+ * wallpaper loops) borrowed from the decoder's current frame; they stay
+ * valid until the layer's next render call. */
+typedef struct {
+        const u8 *y, *u, *v;
+        int ls_y, ls_u, ls_v;    /* plane line sizes, bytes            */
+        u32 w, h;                /* coded size                         */
+} RSimVideo;
+
 /* Gradient layer descriptor (GPU evaluation). The CPU rasterizes gradient
  * layers at LUT speed but ANIMATED gradients rebuild a full-resolution
  * raster every frame and upload it (8MB at 1080p); the renderer can instead
@@ -130,6 +140,8 @@ typedef struct {
                                   GPU as point sprites; NULL otherwise */
         const RGradDesc *grad;    /* gradient evaluated on the GPU; NULL
                                   for plain pixel layers             */
+        const RSimVideo *vsim;    /* video planes uploaded + converted on
+                                  the GPU; NULL otherwise            */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;
@@ -149,6 +161,9 @@ struct RRenderer {
                                (replaces the per-frame CPU raster + full-
                                frame upload of animated gradients). False
                                on software rasterizers. Settled at init. */
+        bool wants_video;   /* GPU path for video layers: Y/U/V plane
+                               upload + shader YUV->RGB (vs sws_scale +
+                               full-frame RGBA upload). Settled at init. */
 
         bool (*init)(RRenderer *r, RPlatform *p, char *err, size_t errcap);
         void (*fini)(RRenderer *r);
