@@ -55,12 +55,14 @@ static f32 *fld_new(int n)
         return p;
 }
 
-RevFluid *fluid_new(u32 w, u32 h, f64 res_scale)
+/* Shared grid sizing (fluid_new + the GPU solver in render_gl.c must agree
+ * on the velocity/dye resolution a layer gets for identical visuals). */
+void fluid_grid_size(u32 w, u32 h, f64 res_scale, u32 *out_gw, u32 *out_gh)
 {
-        if (w < 8 || h < 8)
-                return NULL;
-        if (res_scale <= 0) res_scale = 0.25;
-        if (res_scale > 1.0) res_scale = 1.0;
+        if (res_scale <= 0)
+                res_scale = 0.25;
+        if (res_scale > 1.0)
+                res_scale = 1.0;
 
         int gw = (int)(w * res_scale);
         int gh = (int)(h * res_scale);
@@ -76,6 +78,20 @@ RevFluid *fluid_new(u32 w, u32 h, f64 res_scale)
                 gh = (int)((f64)gw * h / w);
                 if (gh > 384) gh = 384;
         }
+        if (out_gw)
+                *out_gw = (u32)gw;
+        if (out_gh)
+                *out_gh = (u32)gh;
+}
+
+RevFluid *fluid_new(u32 w, u32 h, f64 res_scale)
+{
+        if (w < 8 || h < 8)
+                return NULL;
+
+        u32 gwx, ghy;
+        fluid_grid_size(w, h, res_scale, &gwx, &ghy);
+        int gw = (int)gwx, gh = (int)ghy;
 
         Fluid *f = (Fluid *)calloc(1, sizeof(Fluid));
         f->gw = gw;

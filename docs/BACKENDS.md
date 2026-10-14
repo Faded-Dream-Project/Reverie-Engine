@@ -16,7 +16,7 @@ only linked libraries are libc and libm.
 | hidpi                  | not applicable (core X11)   | scale factor honored (pixel-sized buffers + `set_buffer_scale`) |
 | input                  | QueryPointer polling + latched button edges | wl_seat/wl_pointer events (consume-on-read, click latching) |
 | frame pacing           | X connection fd polling | wl_surface.frame callbacks via wait_frame() |
-| GPU present            | EGL (raw XID) or Vulkan (runtime-dlopen'd libxcb) | experimental WSI shim (`REV_WAYLAND_GPU=1`) — EGL via wl_egl_window |
+| GPU present            | EGL (raw XID) or Vulkan (runtime-dlopen'd libxcb) | WSI shim (default on, `REV_WAYLAND_GPU=0` opts out) — EGL via wl_egl_window |
 
 ### Selection
 
@@ -73,16 +73,28 @@ and logged as such.)
   `eglGetProcAddress`. On X11, `eglGetDisplay(EGL_DEFAULT_DISPLAY)` makes
   Mesa open its own connection — the engine hands EGL only the raw XID, so
   **no Xlib exists anywhere in the process** (not even dlopen'd).
-* On Wayland (WSI shim active) the display is opened via
+* On Wayland (WSI shim — active by default, `REV_WAYLAND_GPU=0` opts out)
+  the display is opened via
   `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR)` and every window
   surface lives on a `wl_egl_window` from `libwayland-egl.so.1` (also
   dlopen'd) — the raw `wl_surface` is not an EGL native window (0x300b,
   see Troubleshooting). Buffer-pixel dimensions throughout; output
   geometry changes resize the wrapper in place. While EGL owns a window,
   the shim's `wl_shm` presenter is locked off its surface.
-* Pipeline: upload straight-alpha raster → premultiply pass → downsample +
-  separable 9-tap gaussian + upscale → W3C blend shader onto a ping-pong
-  accumulation FBO → present (unpremultiply).
+* Pipeline: content-addressed texture cache (static rasters upload only
+  when their content serial changes) → blur path: premultiply pass →
+  downsample + separable 9-tap gaussian + upscale → W3C blend shader onto a
+  ping-pong accumulation FBO holding STRAIGHT alpha (exactly like the CPU
+  framebuffer — no premult/unpremult round-trip on faint pixels) → present.
+* GPU fluid simulation: when the hardware can render to RGBA16F targets,
+  fluid layers arrive as simulation descriptors instead of pixels — splats,
+  vorticity confinement, Jacobi pressure projection (the parallel form of
+  the CPU's Gauss-Seidel), semi-Lagrangian advection with dissipation
+  folded in, and the dye tonemap all run as fragment shaders over
+  ping-pong float textures. `sim=` in the REV_PROFILE line drops to ~0.
+  Software GL (llvmpipe) keeps the CPU solver — fragment dispatch overhead
+  loses to tight C loops there — and `REV_GL_FLUID_SW=1` forces the GPU
+  path on software GL for testing.
 * The blend shader mirrors `composite.c`'s `blend_pixel()` exactly, so GPU
   and CPU output stay comparable; the blur is a gaussian approximation
   where the CPU tier uses a 3-pass box filter — small visual differences
@@ -105,8 +117,9 @@ and logged as such.)
 | `REV_RENDERER`      | same as `--renderer`                                |
 | `REV_BACKEND`       | same as `--backend`                                 |
 | `REV_VK_PRESENT`    | `wsi` = vulkan tier presents via its swapchain (default: platform SHM path; on Wayland+shim that is the shim's own wl_shm presenter) |
-| `REV_WAYLAND_GPU`   | `1` = activate the experimental Wayland WSI shim    |
+| `REV_WAYLAND_GPU`   | `0` = opt OUT of the Wayland WSI shim (default: active whenever libwayland-client loads) |
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
+| `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 | `REV_PROFILE`       | `1` = append a per-frame stage breakdown (`sim / raster / render+present` ms) to the periodic `perf:` line |
 

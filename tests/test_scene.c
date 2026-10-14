@@ -184,6 +184,7 @@ int main(void)
 		CHECK(sc != NULL, "compile: %s", err);
 		if (sc) {
 			RTFrameList fl;
+			memset(&fl, 0, sizeof fl);
 			fl.w = 400;
 			fl.h = 300;
 			rtscene_render_layers(sc, &fl, 0, 0.1, 1.0 / 30.0);
@@ -204,6 +205,50 @@ int main(void)
 			rtscene_free(sc);
 		}
 	}
+
+
+		/* 4b-2. GPU sim offload: sim_offload=true emits a descriptor (no
+		 *     CPU solver runs, no pixels, dye grid mirrors fluid_grid_size)
+		 *     with stretch placement over the frame. */
+		{
+			const char *txt =
+				"scene {"
+				"  layer f { type = fluid  res = 0.25 dye = #ff0000 dye2 = #00ff00 }"
+				"}";
+			RTScene *sc = compile(txt, err, sizeof err);
+			CHECK(sc != NULL, "compile: %s", err);
+			if (sc) {
+				RTFrameList fl;
+				memset(&fl, 0, sizeof fl);
+				fl.w = 400;
+				fl.h = 300;
+				fl.sim_offload = true;
+				rtscene_render_layers(sc, &fl, 0, 0.1, 1.0 / 30.0);
+				CHECK(fl.n == 1, "one layer emitted (n=%d)", fl.n);
+				if (fl.n == 1) {
+					RTLayerCmd *c = &fl.cmds[0];
+					CHECK(c->sim != NULL, "sim descriptor present");
+					CHECK(c->px == NULL, "no CPU pixels emitted");
+					CHECK(c->w == 200 && c->h == 150,
+					      "dye-grid size 200x150 (got %ux%u)", c->w, c->h);
+					CHECK(c->place_w == 400 && c->place_h == 300,
+					      "stretch placement (got %ux%u)", c->place_w, c->place_h);
+					CHECK(c->linear, "linear filtering requested");
+					if (c->sim) {
+						CHECK(c->sim->dye_w == 200 && c->sim->dye_h == 150,
+						      "descriptor dye grid (got %ux%u)",
+						      c->sim->dye_w, c->sim->dye_h);
+						CHECK(c->sim->frame_w == 400 && c->sim->frame_h == 300,
+						      "descriptor frame size");
+						CHECK(c->sim->dt > 0 && c->sim->dt <= 0.1,
+						      "descriptor dt sane (%.3f)", c->sim->dt);
+						CHECK(c->sim->dye_a.r == 255 && c->sim->dye_b.g == 255,
+						      "descriptor dye palette");
+					}
+				}
+				rtscene_free(sc);
+			}
+		}
 
 	/* 4c. animated gradient rebuilds WRITE cleanly â the old path
 	 *     re-rasterized into the same buffer every frame and blended

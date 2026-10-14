@@ -19,6 +19,12 @@
  * themselves on the GPU. Otherwise the engine composites on the CPU and
  * hands the finished frame to end().
  *
+ * Renderers with wants_sims=true ALSO own layer simulations: fluid layers
+ * arrive as RSimFluid descriptors (cmd.sim != NULL, cmd.px == NULL) and are
+ * stepped entirely on the GPU — the CPU never touches a per-pixel loop for
+ * them. Fixed at init() time (float render targets are probed there), so
+ * the scene knows before rendering whether to offload or run the CPU sim.
+ *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
 #ifndef REV_RENDER_H
@@ -28,8 +34,26 @@
 #include "platform.h"
 #include "rev_types.h"
 
+/* Per-frame fluid simulation descriptor (GPU offload). The renderer keys
+ * its GPU state on the struct's ADDRESS (stable per layer instance /
+ * monitor, owned by the scene) and mirrors the CPU solver's grid sizing
+ * from dye_w/dye_h. Pointer coordinates are layer-normalized [0..1],
+ * deltas consume-on-read. */
+typedef struct {
+        f64 dt;                /* step seconds (already clamped)        */
+        f64 px, py;            /* pointer position, [0..1]              */
+        f64 pdx, pdy;          /* per-frame pointer delta               */
+        bool pressed;          /* button held                           */
+        f64 force, radius;     /* animated splat strength / size        */
+        f64 dissip, ambient;   /* dye fade / autonomous drift           */
+        RColor dye_a, dye_b;   /* splat palette                         */
+        u32 frame_w, frame_h;  /* device-pixel size of the layer        */
+        u32 dye_w, dye_h;      /* dye grid (matches the CPU solver)     */
+} RSimFluid;
+
 /* One layer emission (GPU compositing). Pixels are straight-alpha RGBA8
- * packed u32 — identical to RFb contents. */
+ * packed u32 — identical to RFb contents — UNLESS sim != NULL, in which case
+ * px is NULL and the renderer owns that layer's simulation. */
 typedef struct {
         const u32 *px;
         u32 w, h;              /* texture size                          */
@@ -43,6 +67,11 @@ typedef struct {
         f64 blur;              /* gaussian sigma, px; 0 = none          */
         i32 dx, dy;            /* top-left placement into the target    */
         bool linear;           /* linear texture filtering              */
+        u64 content_id;        /* non-zero: raster serial — renderers
+                                  skip re-upload while it is unchanged;
+                                  0: pixels change every frame        */
+        const RSimFluid *sim;  /* fluid layer handed to the GPU; NULL
+                                  for plain pixel layers              */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;
@@ -51,6 +80,8 @@ struct RRenderer {
         const char *name;   /* "vulkan" | "opengl" | "cpu" */
         int tier;           /* 3 = vulkan, 2 = opengl, 1 = cpu */
         bool wants_layers;  /* GPU compositing of RLayerCmd streams */
+        bool wants_sims;    /* GPU-owned layer simulations (fluid) —
+                               settled during init(), never after */
 
         bool (*init)(RRenderer *r, RPlatform *p, char *err, size_t errcap);
         void (*fini)(RRenderer *r);

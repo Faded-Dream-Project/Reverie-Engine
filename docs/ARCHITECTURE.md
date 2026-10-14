@@ -44,7 +44,7 @@ One process, one thread, zero locks. Data flows in one direction:
 | `rev.c`         | `.rev` lexer + recursive-descent parser → typed IR with line/col errors |
 | `scene.c`       | validation/compilation, animation evaluation, per-monitor layer instances, raster/blur caching, parallax oversizing, the render pipeline |
 | `composite.c`   | W3C separable blend modes, 3-pass premultiplied box blur, bilinear resampling |
-| `fluid.c`       | Stam "stable fluids": pressure projection (Gauss–Seidel), semi-Lagrangian advection, vorticity confinement, dye at 2× velocity resolution, ambient forcing |
+| `fluid.c`       | Stam "stable fluids": pressure projection (Gauss–Seidel), semi-Lagrangian advection, vorticity confinement, dye at 2× velocity resolution, ambient forcing — the CPU twin of the GPU solver in render_gl.c (fluid_grid_size keeps both on the same grid) |
 | `ripple.c`      | wave-equation height field; refraction of the below-composite + specular highlights |
 | `particles.c`   | deterministic PRNG particle system with ambient presets and pointer bursts |
 | `pack.c`        | **the .revpack container** — scene + assets in one CRC-checked binary |
@@ -55,7 +55,7 @@ One process, one thread, zero locks. Data flows in one direction:
 | `wayland.c`     | **the raw Wayland wire client**: registry, layer-shell, wl_shm, pointer |
 | `render.c/.h`   | renderer interface + the auto chain (vulkan → opengl → cpu) |
 | `render_cpu.c`  | tier 1: composite.c-based compositor + platform present |
-| `render_gl.c`   | tier 2: dlopen'd EGL/ES3, GLSL premultiply/blur/blend/present pipeline |
+| `render_gl.c`   | tier 2: dlopen'd EGL/ES3, GLSL premultiply/blur/blend/present pipeline, content-addressed upload cache, and the GPU fluid solver (RGBA16F ping-pong passes: splats/vorticity/Jacobi/advection/tonemap) |
 | `render_vk.c`   | tier 3: dlopen'd libvulkan, staging-buffer copy present path |
 | `wlshim.c`      | EXPERIMENTAL opt-in Wayland GPU WSI shim (real libwayland-client via dlopen) |
 | `main.c`        | the daemon: backend+renderer selection, frame loop, pointer, hot-reload, --shot E2E hook |

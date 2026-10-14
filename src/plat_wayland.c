@@ -26,12 +26,20 @@ static bool pw_init(RPlatform *p, char *err, size_t errcap)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
 
-        /* optional accelerated path: REV_WAYLAND_GPU=1 activates the shim,
-         * which then owns display/surfaces and provides native handles. */
+        /* GPU WSI shim (default ON, REV_WAYLAND_GPU=0 opts out): drives a
+         * real libwayland-client connection so EGL/Vulkan get proper
+         * wl_display/wl_surface handles — a present GPU should be used. When
+         * it cannot come up (no libwayland-client, compositor without
+         * layer-shell), fall back to the raw hand-written client; the
+         * renderer chain then falls to the CPU tier on its own. */
         if (wlshim_active()) {
-                p->has_gpu = true;
-                c->wl = NULL;
-                return wlshim_platform_init(p, err, errcap);
+                if (wlshim_platform_init(p, err, errcap)) {
+                        p->has_gpu = true;
+                        c->wl = NULL;
+                        return true;
+                }
+                LOGW("wayland GPU WSI unavailable (%s) — raw client, CPU present",
+                     err && *err ? err : "init failed");
         }
 
         p->has_gpu = false;    /* raw mode: no usable native handles for EGL/Vulkan */

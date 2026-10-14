@@ -19,9 +19,10 @@
 #                     sync:         01 00 00 00 00 00 0c 00 03 00 00 00
 #                  (captured from a live session; word 1 = (size<<16)|opcode)
 #
-#   C. wlshim GPU:  REV_WAYLAND_GPU=1 through real libwayland against weston's
+#   C. wlshim GPU:  default-on shim through real libwayland against weston's
 #                  registry flood + wl_output v4 name/description events —
-#                  the exact field-crash conditions of the 0.1.4 segfault.
+#                  the exact field-crash conditions of the 0.1.4 segfault;
+#                  C2 checks the REV_WAYLAND_GPU=0 opt-out.
 #
 # Requires the local test stack under $REV_GPU_ROOT (default:
 # ../gpulibs relative to the repo — weston, libwayland, desktop-shell).
@@ -187,24 +188,42 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# ---- C. GPU shim against the real compositor ---------------------------------
-# REV_WAYLAND_GPU=1 drives the wlshim (real libwayland) through weston's
-# full registry flood + the post-bind event burst — wl_output v4 delivers
-# name/description (opcodes 4/5), which segfaulted the 0.1.4 shim whose
-# listener table stopped at scale. Weston has no layer-shell, so the run
-# must end at the clean, self-diagnosing gate (not a crash/abort).
+# ---- C. GPU shim against the real compositor (default ON since the
+#      "use the GPU that is present" rework) ---------------------------------
+# No env var: the wlshim now engages by default, runs weston's full registry
+# flood + the post-bind event burst (wl_output v4 name/description events,
+# opcodes 4/5 — the 0.1.4 segfault conditions), then falls back to the raw
+# client at the clean layer-shell gate (weston does not implement it).
 start_weston || exit 1
 XDG_RUNTIME_DIR="$XDG" WAYLAND_DISPLAY="$SOCK" timeout 12 \
-    env REV_WAYLAND_GPU=1 ./build/reverie -B wayland "$SCENE" > "$OUT/c.log" 2>&1
+    ./build/reverie -B wayland "$SCENE" > "$OUT/c.log" 2>&1
 if grep -q "listener function for opcode" "$OUT/c.log"; then
     echo "    wlshim GPU:    FAIL (listener table too short — real compositor events)"
     FAIL=$((FAIL+1))
-elif grep -q "wlshim: compositor lacks wl_compositor or zwlr_layer_shell_v1" "$OUT/c.log"; then
-    echo "    wlshim GPU:    PASS (registry flood + v4 output events dispatched; clean gate)"
+elif grep -q "wlshim: compositor lacks wl_compositor or zwlr_layer_shell_v1" "$OUT/c.log" \
+     && grep -q "wayland GPU WSI unavailable" "$OUT/c.log"; then
+    echo "    wlshim GPU:    PASS (registry flood dispatched; clean fallback to raw client)"
     PASS=$((PASS+1))
 else
     echo "    wlshim GPU:    FAIL (unexpected outcome)"
     cat "$OUT/c.log"
+    FAIL=$((FAIL+1))
+fi
+kill "$WESTON_PID" 2>/dev/null; wait "$WESTON_PID" 2>/dev/null; WESTON_PID=""
+
+# ---- C2. explicit opt-out: REV_WAYLAND_GPU=0 keeps the raw client ------------
+start_weston || exit 1
+XDG_RUNTIME_DIR="$XDG" WAYLAND_DISPLAY="$SOCK" timeout 12 \
+    env REV_WAYLAND_GPU=0 ./build/reverie -B wayland "$SCENE" > "$OUT/c2.log" 2>&1
+if grep -q "wlshim" "$OUT/c2.log"; then
+    echo "    wlshim optout: FAIL (shim engaged despite REV_WAYLAND_GPU=0)"
+    FAIL=$((FAIL+1))
+elif grep -q "zwlr_layer_shell_v1" "$OUT/c2.log"; then
+    echo "    wlshim optout: PASS (raw client only, own layer-shell gate)"
+    PASS=$((PASS+1))
+else
+    echo "    wlshim optout: FAIL (unexpected outcome)"
+    cat "$OUT/c2.log"
     FAIL=$((FAIL+1))
 fi
 kill "$WESTON_PID" 2>/dev/null; wait "$WESTON_PID" 2>/dev/null; WESTON_PID=""

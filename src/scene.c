@@ -91,6 +91,12 @@ struct RTLayerInst {
         RevFluid *fluid;
         RevRipple *ripple;
         RevParticles *parts;
+        /* GPU fluid offload descriptor (address-stable: the GL renderer
+         * keys its per-layer GPU sim state on &simdesc) */
+        RSimFluid simdesc;
+        /* raster content serial — bumped on every (re)build; renderers
+         * cache textures against it and skip redundant re-uploads */
+        u64 content_id;
         /* image source cache */
         bool img_loaded;
         bool img_is_svg;
@@ -98,6 +104,16 @@ struct RTLayerInst {
         RevSvg *svg;
         f64 src_w, src_h;
 };
+
+/* Process-global raster serial: strictly monotonic, never reused — a
+ * content_id identifies one raster build uniquely even across hot
+ * reloads (new RTScene instances reset layer insts, not this counter). */
+static u64 g_content_serial;
+
+static inline u64 content_serial_next(void)
+{
+        return ++g_content_serial;
+}
 
 struct RTScene {
         char *title;
@@ -893,6 +909,48 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 }
                         }
                 } else if (L->type == LT_FLUID) {
+                        if (fl && fl->sim_offload) {
+                                /* The renderer owns the simulation — emit a
+                                 * descriptor instead of stepping the CPU
+                                 * solver. The dye grid mirrors fluid_new's
+                                 * sizing exactly (fluid_grid_size) so both
+                                 * paths render the same field shape. */
+                                u32 gw, gh;
+                                fluid_grid_size((u32)W, (u32)H, L->f_res, &gw, &gh);
+                                RSimFluid *sd = &in->simdesc;
+                                sd->dt = dt;
+                                sd->px = px;
+                                sd->py = py;
+                                sd->pdx = pdx;
+                                sd->pdy = pdy;
+                                sd->pressed = pressed;
+                                sd->force = e.force;
+                                sd->radius = e.radius;
+                                sd->dissip = L->f_dissip;
+                                sd->ambient = L->f_ambient;
+                                sd->dye_a = L->f_dye;
+                                sd->dye_b = L->f_dye2;
+                                sd->frame_w = (u32)W;
+                                sd->frame_h = (u32)H;
+                                sd->dye_w = gw * 2;
+                                sd->dye_h = gh * 2;
+                                if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                        break;
+                                RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                memset(cmd, 0, sizeof *cmd);
+                                cmd->sim = sd;
+                                cmd->w = sd->dye_w;
+                                cmd->h = sd->dye_h;
+                                cmd->place_w = (u32)W;
+                                cmd->place_h = (u32)H;
+                                cmd->dx = 0;
+                                cmd->dy = 0;
+                                cmd->blend = L->blend;
+                                cmd->opacity = e.opacity;
+                                cmd->blur = 0.0;
+                                cmd->linear = true;
+                                continue;
+                        }
                         if (!in->fluid) {
                                 in->fluid = fluid_new((u32)W, (u32)H, L->f_res);
                                 if (in->fluid)
@@ -1003,6 +1061,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
                                 in->raster_ok = true;
                                 in->blurred_ok = false;
+                                in->content_id = content_serial_next();
                         }
 
                         /* gradient angle is the ONLY raster-affecting animated
@@ -1018,6 +1077,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         f64 ms = rev_monotonic();
                                         build_gradient_raster(&in->raster, L, &e);
                                         sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
+                                        in->content_id = content_serial_next();
                                 }
                         }
 
@@ -1060,6 +1120,12 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         cmd->blur = (L->type == LT_IMAGE || L->type == LT_GRADIENT ||
                                      L->type == LT_SOLID) ? emit_blur : 0.0;
                         cmd->linear = emit_linear;
+                        /* static rasters carry their content serial (renderers
+                         * skip re-uploads while it is unchanged); sims and
+                         * animated rebuilds upload every frame */
+                        cmd->content_id = (L->type == LT_IMAGE || L->type == LT_GRADIENT ||
+                                           L->type == LT_SOLID) ? in->content_id : 0;
+                        cmd->sim = NULL;
                         if (emit_stretch) {
                                 /* sub-frame-res sim stretched over the whole frame */
                                 cmd->place_w = (u32)W;

@@ -46,11 +46,18 @@ Reverie probes, in order, and takes the first that works:
   default presents through the platform's proven path (MIT-SHM / wl_shm)
   after field reports of driver-specific XWayland black screens with no
   error output. Both paths are E2E-tested and pixel-exact.
-* **opengl** — full GPU compositing: layers are uploaded as textures,
-  blurred with a downsample + separable gaussian pipeline, and blended with
-  W3C blend-mode shaders that mirror the CPU implementation exactly.
-  Driven by `dlopen("libEGL.so.1")` + `eglGetProcAddress`; on X11 it needs
-  nothing but the raw window ID.
+* **opengl** — full GPU compositing **and GPU simulation**: layers are
+  uploaded as textures (static rasters only re-upload when their content
+  actually changes), blurred with a downsample + separable gaussian
+  pipeline, and blended with W3C blend-mode shaders that mirror the CPU
+  implementation exactly. Fluid layers run their ENTIRE simulation on the
+  GPU — splats, vorticity confinement, Jacobi pressure projection,
+  semi-Lagrangian advection and the dye tonemap all execute as fragment
+  shaders over RGBA16F ping-pong textures, so no per-pixel CPU work
+  remains in a fluid scene. Driven by `dlopen("libEGL.so.1")` +
+  `eglGetProcAddress`; on X11 it needs nothing but the raw window ID.
+  When float render targets are unavailable the sim gracefully stays on
+  the CPU solver (the layer/composite pipeline is unaffected).
 * **opengl on llvmpipe** — not a separate code path: when Mesa reports a
   software rasterizer, the engine logs it and keeps rendering. This is the
   software-GL tier of the chain and works on machines with no GPU at all.
@@ -70,8 +77,11 @@ Force a tier with `--renderer` or `REV_RENDERER={auto,vulkan,opengl,cpu}`.
 * **Wayland** — hand-written wire protocol: registry handshake, monitor
   enumeration, `zwlr_layer_shell_v1` background surfaces, double-buffered
   `wl_shm` presentation with premultiplication, pointer events. No
-  libwayland-client linkage. GPU-accelerated presentation on Wayland is
-  available experimentally via an opt-in WSI shim (`REV_WAYLAND_GPU=1`).
+  libwayland-client linkage. GPU-accelerated presentation engages by
+  default through the WSI shim (it dlopens libwayland-client at runtime);
+  `REV_WAYLAND_GPU=0` opts out for the pure hand-written client. If the
+  shim cannot come up — no libwayland-client, or a compositor without
+  layer-shell — the engine falls back to the raw client automatically.
 
 See [docs/BACKENDS.md](docs/BACKENDS.md) for the full matrix, selection
 rules, and per-tier notes.

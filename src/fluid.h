@@ -18,6 +18,10 @@ typedef struct RevFluid RevFluid;
 RevFluid *fluid_new(u32 w, u32 h, f64 res_scale);
 void fluid_free(RevFluid *f);
 
+/* Grid sizing shared by the CPU solver and the GPU solver (render_gl.c):
+ * same inputs -> same velocity grid, hence same dye resolution. */
+void fluid_grid_size(u32 w, u32 h, f64 res_scale, u32 *gw, u32 *gh);
+
 void fluid_configure(RevFluid *f, RColor dye_a, RColor dye_b,
                      f64 force, f64 radius, f64 dissipation, f64 ambient);
 

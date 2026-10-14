@@ -59,7 +59,13 @@ static void usage(void)
 "  REV_BACKEND     same as --backend\n"
 "  REV_VK_PRESENT  wsi = vulkan tier presents via its swapchain\n"
 "                  (default: the platform's proven SHM present path)\n"
-"  REV_WAYLAND_GPU 1 = opt into the experimental Wayland GPU WSI shim\n"
+"  REV_WAYLAND_GPU 0 = opt OUT of the Wayland GPU WSI shim and use the\n"
+"                  raw hand-written client (default: the shim is active\n"
+"                  whenever libwayland-client loads, so a present GPU is\n"
+"                  actually used)\n"
+"  REV_GL_FLUID_SW 1 = run the GPU fluid solver even on software GL\n"
+"                  (llvmpipe test hook — normally software keeps the CPU\n"
+"                  solver, which is faster there)\n"
 "  REV_WL_TRACE    1 = dump raw Wayland wire traffic to stderr\n"
 "\n"
 "renderer chain (auto): vulkan -> opengl -> opengl-on-llvmpipe -> cpu.\n");
@@ -375,6 +381,14 @@ int main(int argc, char **argv)
         const bool gpu_layers = rend->wants_layers && rtscene_gpu_capable(sf.sc);
         if (rend->wants_layers && !gpu_layers)
                 LOGI("scene needs CPU compositing (ripple layers present)");
+        /* sim offload: only when the renderer owns simulations (GL tier with
+         * float render targets) — the scene then skips the CPU fluid solver
+         * entirely and emits GPU descriptors instead */
+        const bool sim_offload = rend->wants_sims;
+        if (gpu_layers)
+                LOGI("fluid simulation: %s",
+                     sim_offload ? "GPU (no per-pixel CPU work)"
+                                 : "CPU (renderer declined GPU sims)");
 
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -456,6 +470,7 @@ int main(int argc, char **argv)
                                 fl.w = fbs[i].w;
                                 fl.h = fbs[i].h;
                                 fl.n = 0;
+                                fl.sim_offload = sim_offload;
                                 rtscene_render_layers(sf.sc, &fl, i, t, dt);
                                 f64 s_ms, ra_ms;
                                 rtscene_profile(sf.sc, &s_ms, &ra_ms);
@@ -476,6 +491,8 @@ int main(int argc, char **argv)
                                         cmd.dx = fl.cmds[k].dx;
                                         cmd.dy = fl.cmds[k].dy;
                                         cmd.linear = fl.cmds[k].linear;
+                                        cmd.content_id = fl.cmds[k].content_id;
+                                        cmd.sim = fl.cmds[k].sim;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);

@@ -10,6 +10,7 @@
 #define REV_SCENE_H
 
 #include "composite.h"
+#include "render.h"
 #include "rev.h"
 #include "rev_types.h"
 
@@ -55,26 +56,25 @@ void rtscene_click(RTScene *sc, int mon, f64 x, f64 y);
 
 #define RT_FRAME_MAX_LAYERS 64
 
-/* One emitted layer (GPU offload mode). Pixels are straight-alpha RGBA8,
- * matching RFb packing. */
-typedef struct {
-        const u32 *px;
-        u32 w, h;          /* texture size                      */
-        u32 place_w, place_h; /* placement size; 0 = same as w,h */
-        int blend;         /* REV_BLEND_*                       */
-        f64 opacity;       /* 0..1                              */
-        f64 blur;          /* gaussian sigma px                 */
-        i32 dx, dy;        /* top-left placement into the frame */
-        bool linear;       /* linear texture filtering (sub-frame-res sims) */
-} RTLayerCmd;
+/* One emitted layer (GPU offload mode) — identical to the renderer-side
+ * RLayerCmd (render.h): pixels are straight-alpha RGBA8 packed u32, or a
+ * GPU-owned simulation descriptor when .sim is set. */
+typedef RLayerCmd RTLayerCmd;
 
 /* A frame's layer list, filled by rtscene_render_layers(). Pixel buffers
  * remain owned by the scene's per-monitor layer instances and stay valid
- * until the next render call. */
+ * until the next render call.
+ *
+ * INPUT fields the caller sets BEFORE the call:
+ *   w, h          target size for this frame
+ *   sim_offload   true: fluid layers are emitted as GPU simulation
+ *                 descriptors (no CPU sim runs, no pixels) — only set
+ *                 this when the renderer reported wants_sims. */
 typedef struct {
         RTLayerCmd cmds[RT_FRAME_MAX_LAYERS];
         int n;
         u32 w, h;          /* target size for this frame */
+        bool sim_offload;  /* renderer owns the sims (input flag) */
 } RTFrameList;
 
 /* True when no layer needs below-composite feedback (ripple), i.e. the

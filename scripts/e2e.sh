@@ -90,6 +90,28 @@ else
 fi
 stop_xvfb
 
+# ---- OpenGL tier: GPU fluid solver (forced via the llvmpipe test hook) ------
+# REV_GL_FLUID_SW=1 runs the shader-based fluid sim even on software GL so
+# the whole GPU sim path (splat/vorticity/Jacobi/advection/tonemap) stays
+# regression-tested without hardware.
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 timeout 10 \
+    ./build/reverie -R opengl --shot 5 "$OUT/glf" scenes/fluid-aurora.rev \
+    > "$OUT/glf.log" 2>&1 || true
+if grep -q "fluid solver on GPU" "$OUT/glf.log" 2>/dev/null \
+   && grep -q "fluid simulation: GPU" "$OUT/glf.log" 2>/dev/null; then
+    echo "    opengl(fluid): PASS (GPU sim active$( [ -f "$OUT/glf.png" ] && echo ', screenshot' ))"
+    PASS=$((PASS+1))
+elif grep -q "renderer: opengl" "$OUT/glf.log" 2>/dev/null; then
+    echo "    opengl(fluid): FAIL (GPU sim did not activate)"
+    cat "$OUT/glf.log"
+    FAIL=$((FAIL+1))
+else
+    echo "    opengl(fluid): SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
+fi
+stop_xvfb
+
 # ---- Vulkan tier: default present path (platform SHM) -----------------------
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \

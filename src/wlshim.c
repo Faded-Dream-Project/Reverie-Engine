@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 /* ============================================================================
  * Reverie Engine — wlshim.c
- * Optional Wayland WSI shim (EXPERIMENTAL, opt-in via REV_WAYLAND_GPU=1).
+ * Wayland WSI shim (ACTIVE BY DEFAULT; REV_WAYLAND_GPU=0 opts out).
  *
  * EGL and Vulkan need *libwayland-owned* wl_display/wl_surface handles to
  * create accelerated surfaces on Wayland — hand-rolled wire structs cannot
@@ -507,8 +507,15 @@ bool wlshim_active(void)
 {
         if (!S.tried) {
                 S.tried = true;
+                /* Default: ON. A GPU that is present should be USED — the
+                 * maintainer's field reports were exactly "GPU available,
+                 * engine still doing the rendering on the CPU". The shim is
+                 * attempted whenever libwayland-client loads; the renderer
+                 * chain still falls back to the CPU path when EGL fails.
+                 * REV_WAYLAND_GPU=0 is the explicit opt-out for the raw
+                 * hand-written client. */
                 const char *env = getenv("REV_WAYLAND_GPU");
-                if (!env || strcmp(env, "1") != 0)
+                if (env && strcmp(env, "0") == 0)
                         return false;
                 /* REV_WL_LIB: explicit .so path (tests pin a known library);
                  * default resolves the system libwayland-client. */
@@ -528,7 +535,7 @@ bool wlshim_active(void)
 
 /* ---- platform-level implementation ------------------------------------------- */
 
-bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
+static bool wlshim_init_inner(RPlatform *p, char *err, size_t errcap)
 {
         (void)p;
         if (!S.active) {
@@ -712,6 +719,21 @@ bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
 
         S.roundtrip(S.display);
         return true;
+}
+
+bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap)
+{
+        if (!S.active) {
+                snprintf(err, errcap, "wlshim not active");
+                return false;
+        }
+        if (wlshim_init_inner(p, err, errcap))
+                return true;
+        /* failed half-way (e.g. compositor without layer-shell): tear the
+         * connection down and deactivate so the platform falls back to the
+         * raw client instead of calling into a half-initialized shim. */
+        wlshim_platform_fini(p);
+        return false;
 }
 
 void wlshim_platform_fini(RPlatform *p)

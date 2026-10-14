@@ -1,14 +1,16 @@
 /* ============================================================================
  * Reverie Engine — wlshim.h
- * Optional Wayland WSI shim: drives a REAL libwayland-client connection
- * (dlopen'd, never linked) so that EGL/Vulkan can obtain wl_display /
- * wl_surface handles for accelerated presentation on Wayland.
+ * Wayland WSI shim: drives a REAL libwayland-client connection (dlopen'd,
+ * never linked) so that EGL/Vulkan can obtain wl_display / wl_surface
+ * handles for accelerated presentation on Wayland.
  *
- * EXPERIMENTAL and opt-in: activated only when REV_WAYLAND_GPU=1 is set AND
- * libwayland-client.so.0 can be dlopened. Without it the engine runs the
- * fully hand-written raw protocol client with the CPU compositor — which
- * always works. All functions below are safe to call when the shim is off
- * (they report "inactive" / fail gracefully).
+ * ACTIVE BY DEFAULT (a present GPU should be used): the shim engages
+ * whenever libwayland-client.so.0 loads. REV_WAYLAND_GPU=0 opts out for
+ * the fully hand-written raw protocol client. If the shim cannot
+ * initialize (no layer-shell on the compositor), the platform falls back
+ * to the raw client and the renderer chain to the CPU tier. All functions
+ * below are safe to call when the shim is off (they report "inactive" /
+ * fail gracefully).
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -18,7 +20,7 @@
 #include "platform.h"
 #include "rev_types.h"
 
-/* True when REV_WAYLAND_GPU=1 and libwayland-client is loadable. */
+/* True when the shim is engaged (default) and libwayland-client loaded. */
 bool wlshim_active(void);
 
 /* ---- platform-level operations (delegated from plat_wayland.c) ---- */

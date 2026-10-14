@@ -73,8 +73,11 @@
 #define GL_TEXTURE_WRAP_T 0x2803
 #define GL_CLAMP_TO_EDGE 0x812F
 #define GL_UNSIGNED_BYTE 0x1401
+#define GL_FLOAT 0x1406
+#define GL_HALF_FLOAT 0x140B
 #define GL_RGBA 0x1908
 #define GL_RGBA8 0x8058
+#define GL_RGBA16F 0x881A
 #define GL_VENDOR 0x1F00
 #define GL_RENDERER 0x1F01
 #define GL_VERSION 0x1F02
@@ -141,6 +144,7 @@ typedef struct {
         void (*glUniform1i)(GLint_, GLint_);
         void (*glUniform1f)(GLint_, GLfloat_);
         void (*glUniform2f)(GLint_, GLfloat_, GLfloat_);
+        void (*glUniform3f)(GLint_, GLfloat_, GLfloat_, GLfloat_);
         void (*glUniform1fv)(GLint_, GLsizei_, const GLfloat_ *);
         void (*glDrawArrays)(GLenum_, GLint_, GLsizei_);
         void (*glClearColor)(GLfloat_, GLfloat_, GLfloat_, GLfloat_);
@@ -216,14 +220,19 @@ static const char *FS_BLUR =
         "    fragColor = sum;\n"
         "}\n";
 
-/* W3C separable blend of a premultiplied layer over a premultiplied accum —
- * mirrors composite.c blend_pixel() (straight-alpha math, premul storage). */
+/* W3C blend of a layer over the accum — mirrors composite.c blend_pixel()
+ * EXACTLY (straight-alpha math, STRAIGHT storage — like the CPU fb, so
+ * the present pass is a plain passthrough with no un-premultiply divide
+ * amplifying 8-bit quantization on faint pixels). `u_src_premul` selects
+ * the source encoding: 0 = straight (uploads, GPU fluid tonemap), 1 =
+ * premultiplied (the blur chain's output). */
 static const char *FS_COMPOSITE =
         "#version 300 es\n"
         "precision mediump float;\n"
         "uniform sampler2D u_src;\n"
         "uniform sampler2D u_dst;\n"
         "uniform int u_blend;\n"
+        "uniform int u_src_premul;\n"
         "uniform float u_opacity;\n"
         "in vec2 v_uvsrc;\n"
         "in vec2 v_screen;\n"
@@ -244,18 +253,23 @@ static const char *FS_COMPOSITE =
         "    vec4 dp = texture(u_dst, v_screen);\n"
         "    float as = sp.a * u_opacity;\n"
         "    float ad = dp.a;\n"
-        "    vec3 cs = sp.a > 0.0 ? sp.rgb / sp.a : vec3(0.0);\n"
-        "    vec3 cd = ad  > 0.0 ? dp.rgb / ad : vec3(0.0);\n"
+        "    vec3 cs = (u_src_premul == 1 && sp.a > 0.0) ? sp.rgb / sp.a : sp.rgb;\n"
+        "    vec3 cd = dp.rgb;\n"
         "    float ao = as + ad * (1.0 - as);\n"
         "    if (ao <= 0.0) { fragColor = vec4(0.0); return; }\n"
         "    float k1 = as * (1.0 - ad);\n"
         "    float k3 = (1.0 - as) * ad;\n"
         "    vec3 b = blend_fn(u_blend, cd, cs);\n"
         "    vec3 co = (k1 * cs + k3 * cd + as * ad * b) / ao;\n"
-        "    fragColor = vec4(clamp(co, 0.0, 1.0) * ao, ao);\n"
+        "    fragColor = vec4(clamp(co, 0.0, 1.0), ao);\n"
         "}\n";
 
-/* present: straight texture passthrough (cpu_frame path) */
+/* present: passthrough of the STRAIGHT-alpha accum (the composite stores
+ * straight, exactly like the CPU renderer's framebuffer). v flip: GL window
+ * space is y-up, CPU raster rows are y-down — sampling with u_scale=(1,-1),
+ * u_off=(0,1) lands row 0 at the TOP of the surface, matching the CPU tier
+ * (verified pixel-wise against -R cpu screenshots; without it every GL
+ * frame presents upside down). */
 static const char *FS_PRESENT =
         "#version 300 es\n"
         "precision mediump float;\n"
@@ -265,14 +279,253 @@ static const char *FS_PRESENT =
         "out vec4 fragColor;\n"
         "void main() { fragColor = texture(u_tex, v_uvsrc); }\n";
 
+/* ---- GPU fluid solver (GLSL ES 3.00) -------------------------------------
+ * Mirrors fluid.c's Stam solver: splats + ambient drift, vorticity
+ * confinement, Jacobi pressure projection (the CPU's Gauss-Seidel is
+ * sequential; Jacobi is the parallel equivalent), semi-Lagrangian
+ * advection with dissipation folded in, and the same tonemap curve as
+ * fluid_render()'s LUT (a = 1 - exp(-lum*2.2), k = a/lum). Fields live in
+ * RGBA16F ping-pong textures; the CPU never touches a per-pixel loop. */
+static const char *FS_FLUID_VELF =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform vec2 u_grid;\n"          /* velocity grid (gw, gh)        */
+        "uniform vec2 u_posA;\n"          /* splat centers (uv)            */
+        "uniform vec2 u_impA;\n"          /* splat impulses (cells/s)      */
+        "uniform vec2 u_posB;\n"
+        "uniform vec2 u_impB;\n"
+        "uniform float u_radA;\n"         /* radius, grid texels           */
+        "uniform float u_radB;\n"
+        "uniform float u_ambient;\n"
+        "uniform float u_dt;\n"
+        "uniform float u_t;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "float splat(vec2 uv, vec2 pos, float rad) {\n"
+        "    vec2 d = (uv - pos) * u_grid;\n"
+        "    return exp(-dot(d, d) / (rad * rad) * 3.0);\n"
+        "}\n"
+        "void main() {\n"
+        "    vec2 vel = texture(u_vel, v_uvsrc).xy;\n"
+        "    vel += u_impA * splat(v_uvsrc, u_posA, u_radA);\n"
+        "    vel += u_impB * splat(v_uvsrc, u_posB, u_radB);\n"
+        "    if (u_ambient > 0.0) {\n"
+        "        vec2 n = v_uvsrc;\n"
+        "        float fx = sin(n.y * 6.0 + u_t * 0.35) * cos(n.x * 4.0 - u_t * 0.22);\n"
+        "        float fy = cos(n.x * 5.0 + u_t * 0.3) * sin(n.y * 5.0 + u_t * 0.18);\n"
+        "        vec2 t = floor(v_uvsrc * u_grid);\n"
+        "        bool on = mod(t.x - 1.0, 3.0) < 1.0 && mod(t.y - 1.0, 3.0) < 1.0;\n"
+        "        if (on)\n"
+        "            vel += vec2(fx, fy) * (u_ambient * u_dt * 8.0);\n"
+        "    }\n"
+        "    fragColor = vec4(vel, 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_DYEF =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_dye;\n"
+        "uniform vec2 u_grid;\n"          /* dye grid (dw, dh)            */
+        "uniform vec2 u_posA;\n"
+        "uniform vec2 u_posB;\n"
+        "uniform vec3 u_colA;\n"
+        "uniform vec3 u_colB;\n"
+        "uniform float u_radA;\n"         /* radius, dye texels           */
+        "uniform float u_radB;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "float splat(vec2 uv, vec2 pos, float rad) {\n"
+        "    vec2 d = (uv - pos) * u_grid;\n"
+        "    return exp(-dot(d, d) / (rad * rad) * 3.0);\n"
+        "}\n"
+        "void main() {\n"
+        "    vec3 dye = texture(u_dye, v_uvsrc).rgb;\n"
+        "    dye += u_colA * (splat(v_uvsrc, u_posA, u_radA) * 0.9);\n"
+        "    dye += u_colB * (splat(v_uvsrc, u_posB, u_radB) * 0.9);\n"
+        "    fragColor = vec4(dye, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_CURL =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform vec2 u_grid;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 r = texture(u_vel, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).xy;\n"
+        "    vec2 l = texture(u_vel, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).xy;\n"
+        "    vec2 u = texture(u_vel, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).xy;\n"
+        "    vec2 d = texture(u_vel, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).xy;\n"
+        "    fragColor = vec4(vec2((r.y - l.y) - (u.x - d.x)) * 0.5, 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_VORT =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform sampler2D u_curl;\n"
+        "uniform vec2 u_grid;\n"
+        "uniform float u_k;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 vel = texture(u_vel, v_uvsrc).xy;\n"
+        "    float c = texture(u_curl, v_uvsrc).x;\n"
+        "    float xr = abs(texture(u_curl, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).x);\n"
+        "    float xl = abs(texture(u_curl, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).x);\n"
+        "    float yu = abs(texture(u_curl, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).x);\n"
+        "    float yd = abs(texture(u_curl, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).x);\n"
+        "    vec2 g = vec2((xr - xl) * 0.5, (yu - yd) * 0.5);\n"
+        "    vec2 n = g / (length(g) + 1e-9);\n"
+        "    fragColor = vec4(vel + vec2(u_k * n.y * c, -u_k * n.x * c), 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_DIV =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform vec2 u_grid;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 r = texture(u_vel, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).xy;\n"
+        "    vec2 l = texture(u_vel, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).xy;\n"
+        "    vec2 u = texture(u_vel, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).xy;\n"
+        "    vec2 d = texture(u_vel, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).xy;\n"
+        "    fragColor = vec4(0.0, -0.5 * ((r.x - l.x) + (u.y - d.y)), 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_JACOBI =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_press;\n"     /* .x = p, .y = div            */
+        "uniform vec2 u_grid;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    float dv = texture(u_press, v_uvsrc).y;\n"
+        "    float pl = texture(u_press, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).x;\n"
+        "    float pr = texture(u_press, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).x;\n"
+        "    float pd = texture(u_press, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).x;\n"
+        "    float pu = texture(u_press, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).x;\n"
+        "    fragColor = vec4((dv + pl + pr + pd + pu) * 0.25, dv, 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_GRADSUB =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform sampler2D u_press;\n"
+        "uniform vec2 u_grid;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 vel = texture(u_vel, v_uvsrc).xy;\n"
+        "    float pl = texture(u_press, v_uvsrc - vec2(1.0 / u_grid.x, 0.0)).x;\n"
+        "    float pr = texture(u_press, v_uvsrc + vec2(1.0 / u_grid.x, 0.0)).x;\n"
+        "    float pd = texture(u_press, v_uvsrc - vec2(0.0, 1.0 / u_grid.y)).x;\n"
+        "    float pu = texture(u_press, v_uvsrc + vec2(0.0, 1.0 / u_grid.y)).x;\n"
+        "    fragColor = vec4(vel - vec2((pr - pl) * 0.5, (pu - pd) * 0.5), 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_ADVECT_VEL =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform vec2 u_grid;\n"
+        "uniform float u_dt;\n"
+        "uniform float u_damp;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 vel = texture(u_vel, v_uvsrc).xy;\n"
+        "    vec2 back = v_uvsrc - vel * u_dt / (u_grid - vec2(1.0));\n"
+        "    fragColor = vec4(texture(u_vel, back).xy * u_damp, 0.0, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_ADVECT_DYE =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_dye;\n"
+        "uniform sampler2D u_vel;\n"
+        "uniform vec2 u_grid;\n"          /* velocity grid — dye and     */
+        "uniform float u_dt;\n"            /* velocity share normalized   */
+        "uniform float u_fade;\n"          /* uv space                    */
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 vel = texture(u_vel, v_uvsrc).xy;\n"
+        "    vec2 back = v_uvsrc - vel * u_dt / (u_grid - vec2(1.0));\n"
+        "    fragColor = vec4(texture(u_dye, back).rgb * u_fade, 1.0);\n"
+        "}\n";
+
+static const char *FS_FLUID_TONEMAP =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D u_dye;\n"
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec3 d = texture(u_dye, v_uvsrc).rgb;\n"
+        "    float lum = max(d.r, max(d.g, d.b));\n"
+        "    float a = 1.0 - exp(-lum * 2.2);\n"
+        "    if (a <= 0.003) { fragColor = vec4(0.0); return; }\n"
+        "    float k = a / lum;\n"
+        "    fragColor = vec4(clamp(d * k, 0.0, 1.0), a);\n"
+        "}\n";
+
 /* ---- renderer state ------------------------------------------------------- */
-enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT, PROG_COUNT };
+enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
+       PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
+       PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
+       PROG_F_TONEMAP, PROG_COUNT };
+#define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
         GLuint_ tex;
         GLuint_ fbo;
         u32 w, h;
 } RTarget;
+
+/* ---- GPU fluid state (one per live fluid layer instance per window) ------ */
+#define GL_MAX_FLUIDS 8
+
+typedef struct {
+        const RSimFluid *key;    /* scene descriptor address (identity)  */
+        GLuint_ vel[2], dye[2], press[2], curl;
+        GLuint_ vel_fbo[2], dye_fbo[2], press_fbo[2], curl_fbo;
+        GLuint_ out8, out8_fbo;  /* tonemapped RGBA8 layer texture       */
+        u32 gw, gh, dw, dh;      /* velocity / dye grid                  */
+        int vc, dc, pc;          /* ping-pong current index              */
+        f64 amb_t, wisp_acc;     /* CPU-side clocks (match fluid.c)      */
+        u64 last_seen;           /* GC stamp (frame counter)             */
+        bool ok;                 /* resources valid                      */
+} GLFluid;
+
+/* ---- content-addressed upload cache ---------------------------------------
+ * Static layer rasters carry a monotonic content serial (scene.c); a cache
+ * slot whose serial matches skips the glTexSubImage2D re-upload — the
+ * pre-fix path pushed every cached raster over PCIe again every frame. */
+#define GL_TEX_CACHE 16
+
+typedef struct {
+        u64 id;                  /* content serial, 0 = uncached frame  */
+        u64 stamp;               /* LRU clock                            */
+        GLuint_ tex;
+        u32 w, h;
+} TexSlot;
 
 typedef struct {
         void *lib;
@@ -326,12 +579,32 @@ typedef struct {
         GLuint_ scratch_fbo[4];
         bool fbo_made;
 
+        /* GPU fluid solver: enabled when RGBA16F render targets probe OK
+         * AND the rasterizer is hardware (llvmpipe sims would be slower
+         * than the CPU solver — fragment dispatch overhead beats tight C
+         * loops there, so software GL keeps the CPU sim). */
+        bool fluid_ok;
+        GLFluid fluids[REV_PLATFORM_MAX_OUTPUTS][GL_MAX_FLUIDS];
+        u64 frame_no;
+
+        /* content-addressed upload cache (context-global: content serials
+         * are globally unique) */
+        TexSlot texcache[GL_TEX_CACHE];
+        u64 cache_clock;
+
         GLuint_ prog[PROG_COUNT];
         struct {
                 int off, scale, tex;
                 int dir, weights;
-                int src, dst, blend, opacity;
+                int src, dst, blend, opacity, src_premul;
         } u[PROG_COUNT];
+        /* fluid program uniforms (indexed like prog[]) */
+        struct {
+                int vel, dye, press, curl;
+                int grid, dt, damp, fade, t, k;
+                int posA, posB, impA, impB, radA, radB;
+                int colA, colB, ambient;
+        } fu[PROG_COUNT];
 
         RPlatform *plat;
         int cur_win;
@@ -342,6 +615,7 @@ typedef struct {
 /* ---- small helpers -------------------------------------------------------- */
 
 static bool gl_make_program(RenderGL *r, int idx, const char *fs, char *err, size_t errcap);
+static void pass_full(RenderGL *r, int pi, RTarget *dst);
 
 static void set_tex_params(GL *g, GLuint_ t, bool linear)
 {
@@ -406,6 +680,419 @@ static void gauss9(double sigma, float w[9])
         }
         for (int i = 0; i < 9; i++)
                 w[i] = (float)(w[i] / sum);
+}
+
+/* ---- GPU fluid solver ------------------------------------------------------ */
+
+static void fluid_zero(RenderGL *r, GLuint_ fbo)
+{
+        GL *g = &r->g;
+        g->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        g->glClearColor(0, 0, 0, 0);
+        g->glClear(GL_COLOR_BUFFER_BIT);
+}
+
+/* (re)create a float ping-pong pair at (w,h); on success the textures hold
+ * zeros. Returns false on FBO incompleteness (caller drops the slot). */
+static bool fluid_make_pair(RenderGL *r, GLuint_ *tex, GLuint_ *fbo, u32 w, u32 h)
+{
+        GL *g = &r->g;
+        for (int i = 0; i < 2; i++) {
+                if (!tex[i])
+                        g->glGenTextures(1, &tex[i]);
+                if (!fbo[i])
+                        g->glGenFramebuffers(1, &fbo[i]);
+                set_tex_params(g, tex[i], true);
+                g->glBindTexture(GL_TEXTURE_2D, tex[i]);
+                g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, (int)w, (int)h, 0,
+                                GL_RGBA, GL_HALF_FLOAT, NULL);
+                g->glBindFramebuffer(GL_FRAMEBUFFER, fbo[i]);
+                g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_TEXTURE_2D, tex[i], 0);
+                if (g->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                        return false;
+                fluid_zero(r, fbo[i]);
+        }
+        return true;
+}
+
+static void fluid_free_pair(GL *g, GLuint_ *tex, GLuint_ *fbo)
+{
+        g->glDeleteTextures(2, tex);
+        g->glDeleteFramebuffers(2, fbo);
+        tex[0] = tex[1] = fbo[0] = fbo[1] = 0;
+}
+
+/* run program `pi` into dst (may be NULL = window) at dst's size */
+static void fluid_pass(RenderGL *r, int pi, RTarget *dst)
+{
+        pass_full(r, pi, dst);
+}
+
+/* divergence + Jacobi + gradient subtraction on the current velocity */
+static void fluid_project(RenderGL *r, GLFluid *f)
+{
+        GL *g = &r->g;
+        const int gw = (int)f->gw, gh = (int)f->gh;
+
+        /* divergence pass: vel[vc] -> press[pc] (writes (0, div)) */
+        g->glUseProgram(r->prog[PROG_F_DIV]);
+        g->glUniform2f(r->fu[PROG_F_DIV].grid, (float)gw, (float)gh);
+        g->glActiveTexture(GL_TEXTURE0);
+        g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+        {
+                RTarget t = { f->press[f->pc], f->press_fbo[f->pc], f->gw, f->gh };
+                fluid_pass(r, PROG_F_DIV, &t);
+        }
+
+        /* Jacobi (Gauss-Seidel is sequential; Jacobi is the parallel form) */
+        g->glUseProgram(r->prog[PROG_F_JACOBI]);
+        g->glUniform2f(r->fu[PROG_F_JACOBI].grid, (float)gw, (float)gh);
+        for (int i = 0; i < 32; i++) {
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->press[f->pc]);
+                RTarget t = { f->press[f->pc ^ 1], f->press_fbo[f->pc ^ 1], f->gw, f->gh };
+                fluid_pass(r, PROG_F_JACOBI, &t);
+                f->pc ^= 1;
+        }
+
+        /* gradient subtraction: vel[vc] + press[pc] -> vel[vc^1] */
+        g->glUseProgram(r->prog[PROG_F_GRADSUB]);
+        g->glUniform2f(r->fu[PROG_F_GRADSUB].grid, (float)gw, (float)gh);
+        g->glActiveTexture(GL_TEXTURE0);
+        g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+        g->glActiveTexture(GL_TEXTURE1);
+        g->glBindTexture(GL_TEXTURE_2D, f->press[f->pc]);
+        g->glActiveTexture(GL_TEXTURE0);
+        {
+                RTarget t = { f->vel[f->vc ^ 1], f->vel_fbo[f->vc ^ 1], f->gw, f->gh };
+                fluid_pass(r, PROG_F_GRADSUB, &t);
+        }
+        f->vc ^= 1;
+}
+
+/* find/create the sim slot for a scene descriptor; NULL when the table is
+ * full (8 fluid layers per monitor is far past any sane scene). */
+static GLFluid *fluid_slot(RenderGL *r, int win, const RSimFluid *sd)
+{
+        GLFluid *tab = r->fluids[win];
+        for (int i = 0; i < GL_MAX_FLUIDS; i++)
+                if (tab[i].key == sd && tab[i].ok) {
+                        tab[i].last_seen = r->frame_no;
+                        return &tab[i];
+                }
+
+        /* pick a free or expired slot */
+        GLFluid *best = NULL;
+        for (int i = 0; i < GL_MAX_FLUIDS; i++) {
+                if (!tab[i].key) {
+                        best = &tab[i];
+                        break;
+                }
+                if (r->frame_no - tab[i].last_seen > 300 &&
+                    (!best || tab[i].last_seen < best->last_seen))
+                        best = &tab[i];
+        }
+        if (!best) {
+                static bool warned;
+                if (!warned) {
+                        warned = true;
+                        LOGW("opengl: too many fluid layers, dropping sims");
+                }
+                return NULL;
+        }
+
+        GL *g = &r->g;
+        fluid_free_pair(g, best->vel, best->vel_fbo);
+        fluid_free_pair(g, best->dye, best->dye_fbo);
+        fluid_free_pair(g, best->press, best->press_fbo);
+        if (best->curl) {
+                g->glDeleteTextures(1, &best->curl);
+                g->glDeleteFramebuffers(1, &best->curl_fbo);
+                best->curl = best->curl_fbo = 0;
+        }
+        if (best->out8) {
+                g->glDeleteTextures(1, &best->out8);
+                g->glDeleteFramebuffers(1, &best->out8_fbo);
+                best->out8 = best->out8_fbo = 0;
+        }
+
+        best->gw = sd->dye_w / 2;
+        best->gh = sd->dye_h / 2;
+        best->dw = sd->dye_w;
+        best->dh = sd->dye_h;
+        best->vc = best->dc = best->pc = 0;
+        best->amb_t = 0;
+        best->wisp_acc = 0;
+        best->ok = false;
+        best->key = sd;
+        best->last_seen = r->frame_no;
+
+        if (best->gw < 8 || best->gh < 8)
+                return NULL;
+        if (!fluid_make_pair(r, best->vel, best->vel_fbo, best->gw, best->gh) ||
+            !fluid_make_pair(r, best->dye, best->dye_fbo, best->dw, best->dh) ||
+            !fluid_make_pair(r, best->press, best->press_fbo, best->gw, best->gh))
+                return NULL;
+
+        if (!best->curl)
+                g->glGenTextures(1, &best->curl);
+        if (!best->curl_fbo)
+                g->glGenFramebuffers(1, &best->curl_fbo);
+        set_tex_params(g, best->curl, true);
+        g->glBindTexture(GL_TEXTURE_2D, best->curl);
+        g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, (int)best->gw, (int)best->gh, 0,
+                        GL_RGBA, GL_HALF_FLOAT, NULL);
+        g->glBindFramebuffer(GL_FRAMEBUFFER, best->curl_fbo);
+        g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  GL_TEXTURE_2D, best->curl, 0);
+        if (g->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                return NULL;
+
+        if (!best->out8)
+                g->glGenTextures(1, &best->out8);
+        if (!best->out8_fbo)
+                g->glGenFramebuffers(1, &best->out8_fbo);
+        set_tex_params(g, best->out8, true);
+        g->glBindTexture(GL_TEXTURE_2D, best->out8);
+        g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (int)best->dw, (int)best->dh, 0,
+                        GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        g->glBindFramebuffer(GL_FRAMEBUFFER, best->out8_fbo);
+        g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  GL_TEXTURE_2D, best->out8, 0);
+        if (g->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+                return NULL;
+
+        best->ok = true;
+        return best;
+}
+
+/* Advance one fluid step; returns the tonemapped straight-alpha RGBA8 dye
+ * texture (dw x dh) ready for the standard premult+composite path. */
+static GLuint_ gl_fluid_step(RenderGL *r, GLFluid *f, const RSimFluid *sd)
+{
+        GL *g = &r->g;
+        f64 dt = sd->dt;
+        if (dt <= 0)
+                dt = 1.0 / 60.0;
+        if (dt > 0.1)
+                dt = 0.1;
+        const double force = sd->force;
+        const double radius = sd->radius < 0.002 ? 0.002 :
+                              sd->radius > 0.2 ? 0.2 : sd->radius;
+        /* fluid_configure()'s clamps — the CPU solver never sees values
+         * outside these ranges, so the GPU one must not either (an
+         * unclamped ambient over-forces the field and shreds the dye). */
+        const double dissip = sd->dissip < 0.0 ? 0.0 :
+                              sd->dissip > 1.0 ? 1.0 : sd->dissip;
+        const double ambient = sd->ambient < 0.0 ? 0.0 :
+                               sd->ambient > 1.0 ? 1.0 : sd->ambient;
+        const double rad_g = radius * f->gw * 0.5 + 1.5;   /* grid texels */
+        const double rad_d = rad_g * 2.0;                  /* dye texels  */
+
+        /* ---- C-side event bookkeeping (mirrors fluid.c exactly) ---- */
+        f64 amb_t = f->amb_t;
+        if (ambient > 0)
+            amb_t += dt;
+
+        bool wisp_fire = false;
+        f64 wisp_x = 0, wisp_y = 0, wisp_vx = 0, wisp_vy = 0;
+        RColor wisp_c = sd->dye_a;
+        if (ambient > 0) {
+                f->wisp_acc += dt;
+                if (f->wisp_acc > 0.9) {
+                        f->wisp_acc = 0;
+                        wisp_fire = true;
+                        wisp_x = 0.15 + 0.7 * fabs(sin(amb_t * 1.7));
+                        wisp_y = 0.15 + 0.7 * fabs(cos(amb_t * 1.1));
+                        wisp_vx = sin(amb_t * 2.0) * 0.6;
+                        wisp_vy = cos(amb_t * 1.6) * 0.6;
+                        wisp_c = (((int)(amb_t * 3) & 1) != 0) ? sd->dye_a : sd->dye_b;
+                }
+        }
+
+        /* pointer splat. Orientation chain (all top-down consistent): the
+         * present pass flips v so accum row 0 shows at the window TOP; the
+         * composite maps the layer 1:1 (dy from top); the tonemap is
+         * identity — so dye v=0 is the layer's top and pointer py (measured
+         * from the top) maps DIRECTLY onto dye v, +vy moving dye downscreen,
+         * exactly like the CPU solver's row-space. */
+        bool ptr_fire = sd->pressed;
+        f64 ptr_x = sd->px, ptr_y = sd->py;
+        f64 ptr_vx = 0, ptr_vy = 0;
+        RColor ptr_c = sd->dye_a;
+        if (ptr_fire) {
+                ptr_vx = sd->pdx * force;
+                ptr_vy = sd->pdy * force;
+                double speed = hypot(sd->pdx, sd->pdy);
+                if (sd->pdx >= 0)
+                        ptr_c = sd->dye_a;
+                else
+                        ptr_c = sd->dye_b;
+                if (speed < 1e-4)
+                        ptr_c = ((ptr_x * 7.0 + ptr_y * 13.0) > 10.0) ? sd->dye_a : sd->dye_b;
+        }
+
+        /* ---- pass 1: velocity forces (splat + ambient) ---- */
+        {
+                int pi = PROG_F_VELF;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->gw, (float)f->gh);
+                g->glUniform2f(r->fu[pi].posA, (float)ptr_x, (float)ptr_y);
+                g->glUniform2f(r->fu[pi].impA, (float)(ptr_fire ? ptr_vx : 0.0),
+                               (float)(ptr_fire ? ptr_vy : 0.0));
+                g->glUniform1f(r->fu[pi].radA, (float)(ptr_fire ? rad_g : 1.0));
+                g->glUniform2f(r->fu[pi].posB, (float)wisp_x, (float)wisp_y);
+                g->glUniform2f(r->fu[pi].impB, (float)(wisp_fire ? wisp_vx : 0.0),
+                               (float)(wisp_fire ? wisp_vy : 0.0));
+                g->glUniform1f(r->fu[pi].radB, (float)(wisp_fire ? rad_g : 1.0));
+                g->glUniform1f(r->fu[pi].ambient, (float)ambient);
+                g->glUniform1f(r->fu[pi].dt, (float)dt);
+                g->glUniform1f(r->fu[pi].t, (float)amb_t);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+                RTarget t = { f->vel[f->vc ^ 1], f->vel_fbo[f->vc ^ 1], f->gw, f->gh };
+                fluid_pass(r, pi, &t);
+                f->vc ^= 1;
+        }
+
+        /* ---- pass 2: dye forces (splat colors) ---- */
+        if (ptr_fire || wisp_fire) {
+                int pi = PROG_F_DYEF;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->dw, (float)f->dh);
+                g->glUniform2f(r->fu[pi].posA, (float)ptr_x, (float)ptr_y);
+                g->glUniform2f(r->fu[pi].posB, (float)wisp_x, (float)wisp_y);
+                g->glUniform1f(r->fu[pi].radA, (float)(ptr_fire ? rad_d : 1.0));
+                g->glUniform1f(r->fu[pi].radB, (float)(wisp_fire ? rad_d : 1.0));
+                g->glUniform3f(r->fu[pi].colA, ptr_c.r / 255.0f, ptr_c.g / 255.0f,
+                               ptr_c.b / 255.0f);
+                g->glUniform3f(r->fu[pi].colB, wisp_c.r / 255.0f, wisp_c.g / 255.0f,
+                               wisp_c.b / 255.0f);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->dye[f->dc]);
+                RTarget t = { f->dye[f->dc ^ 1], f->dye_fbo[f->dc ^ 1], f->dw, f->dh };
+                fluid_pass(r, pi, &t);
+                f->dc ^= 1;
+        }
+
+        /* ---- vorticity confinement ---- */
+        {
+                int pi = PROG_F_CURL;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->gw, (float)f->gh);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+                RTarget t = { f->curl, f->curl_fbo, f->gw, f->gh };
+                fluid_pass(r, pi, &t);
+        }
+        {
+                int pi = PROG_F_VORT;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->gw, (float)f->gh);
+                g->glUniform1f(r->fu[pi].k, (float)(6.0 * dt));
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+                g->glActiveTexture(GL_TEXTURE1);
+                g->glBindTexture(GL_TEXTURE_2D, f->curl);
+                g->glActiveTexture(GL_TEXTURE0);
+                RTarget t = { f->vel[f->vc ^ 1], f->vel_fbo[f->vc ^ 1], f->gw, f->gh };
+                fluid_pass(r, pi, &t);
+                f->vc ^= 1;
+        }
+
+        fluid_project(r, f);
+
+        /* ---- advect velocity (+ damping folded in) ---- */
+        {
+                int pi = PROG_F_ADV_VEL;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->gw, (float)f->gh);
+                g->glUniform1f(r->fu[pi].dt, (float)dt);
+                g->glUniform1f(r->fu[pi].damp, (float)pow(0.999, dt * 60.0));
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+                RTarget t = { f->vel[f->vc ^ 1], f->vel_fbo[f->vc ^ 1], f->gw, f->gh };
+                fluid_pass(r, pi, &t);
+                f->vc ^= 1;
+        }
+
+        fluid_project(r, f);
+
+        /* ---- advect dye (+ dissipation folded in) ---- */
+        {
+                int pi = PROG_F_ADV_DYE;
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform2f(r->fu[pi].grid, (float)f->gw, (float)f->gh);
+                g->glUniform1f(r->fu[pi].dt, (float)dt);
+                double fade = 1.0 - dissip * 0.35;
+                if (fade < 0)
+                        fade = 0;
+                g->glUniform1f(r->fu[pi].fade, (float)pow(fade, dt * 60.0));
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->dye[f->dc]);
+                g->glActiveTexture(GL_TEXTURE1);
+                g->glBindTexture(GL_TEXTURE_2D, f->vel[f->vc]);
+                g->glActiveTexture(GL_TEXTURE0);
+                RTarget t = { f->dye[f->dc ^ 1], f->dye_fbo[f->dc ^ 1], f->dw, f->dh };
+                fluid_pass(r, pi, &t);
+                f->dc ^= 1;
+        }
+
+        f->amb_t = amb_t;
+
+
+        /* ---- tonemap: dye (float) -> layer texture (straight RGBA8) ---- */
+        {
+                int pi = PROG_F_TONEMAP;
+                g->glUseProgram(r->prog[pi]);
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, f->dye[f->dc]);
+                RTarget t = { f->out8, f->out8_fbo, f->dw, f->dh };
+                fluid_pass(r, pi, &t);
+        }
+        return f->out8;
+}
+
+/* ---- content-addressed upload ---------------------------------------------- */
+static GLuint_ upload_layer_tex(RenderGL *r, const RLayerCmd *cmd)
+{
+        GL *g = &r->g;
+        TexSlot *cache = r->texcache;
+        r->cache_clock++;
+
+        if (cmd->content_id) {
+                for (int i = 0; i < GL_TEX_CACHE; i++) {
+                        if (cache[i].id == cmd->content_id &&
+                            cache[i].tex && cache[i].w == cmd->w && cache[i].h == cmd->h) {
+                                cache[i].stamp = r->cache_clock;
+                                g->glBindTexture(GL_TEXTURE_2D, cache[i].tex);
+                                return cache[i].tex;
+                        }
+                }
+        }
+
+        /* miss: evict the least-recently-used slot */
+        TexSlot *slot = &cache[0];
+        for (int i = 1; i < GL_TEX_CACHE; i++)
+                if (cache[i].stamp < slot->stamp)
+                        slot = &cache[i];
+        if (!slot->tex)
+                g->glGenTextures(1, &slot->tex);
+        if (slot->w != cmd->w || slot->h != cmd->h) {
+                set_tex_params(g, slot->tex, true);
+                g->glBindTexture(GL_TEXTURE_2D, slot->tex);
+                g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (int)cmd->w, (int)cmd->h, 0,
+                                GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                slot->w = cmd->w;
+                slot->h = cmd->h;
+        }
+        g->glBindTexture(GL_TEXTURE_2D, slot->tex);
+        g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cmd->w, (int)cmd->h,
+                           GL_RGBA, GL_UNSIGNED_BYTE, cmd->px);
+        slot->id = cmd->content_id;    /* 0 = never matches a cached lookup */
+        slot->stamp = r->cache_clock;
+        return slot->tex;
 }
 
 /* ---- window surface management -------------------------------------------- */
@@ -475,7 +1162,9 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         r->plat = p;
 
         if (!p->has_gpu) {
-                snprintf(err, errcap, "platform '%s' has no GPU path", p->name);
+                snprintf(err, errcap, "platform '%s' exposes no GPU surface handles"
+                         " (wayland: REV_WAYLAND_GPU=0 or no libwayland-client)",
+                         p->name);
                 return false;
         }
         r->lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
@@ -510,7 +1199,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         if (r->is_wayland) {
                 if (!native_dpy) {
                         snprintf(err, errcap,
-                                 "wayland GPU requires the WSI shim (libwayland-client + REV_WAYLAND_GPU=1)");
+                                 "wayland GPU needs the WSI shim (libwayland-client loadable)");
                         return false;
                 }
                 *(void **)&r->eglGetPlatformDisplay = dlsym(r->lib, "eglGetPlatformDisplay");
@@ -653,6 +1342,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         LOADGL(glUniform1i, "glUniform1i");
         LOADGL(glUniform1f, "glUniform1f");
         LOADGL(glUniform2f, "glUniform2f");
+        LOADGL(glUniform3f, "glUniform3f");
         LOADGL(glUniform1fv, "glUniform1fv");
         LOADGL(glDrawArrays, "glDrawArrays");
         LOADGL(glClearColor, "glClearColor");
@@ -682,9 +1372,56 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
             !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap))
                 return false;
 
+        /* GPU fluid solver: probe RGBA16F renderability by actually building
+         * one (extension strings lie less often than FBO status). Hardware
+         * GL + float targets -> the sim moves off the CPU entirely; software
+         * GL keeps the CPU solver (fragment dispatch overhead loses to tight
+         * C loops on llvmpipe) unless REV_GL_FLUID_SW=1 opts in for testing. */
+        {
+                GLuint_ ft = 0, ff = 0;
+                g->glGenTextures(1, &ft);
+                g->glGenFramebuffers(1, &ff);
+                set_tex_params(g, ft, true);
+                g->glBindTexture(GL_TEXTURE_2D, ft);
+                g->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 4, 4, 0,
+                                GL_RGBA, GL_HALF_FLOAT, NULL);
+                g->glBindFramebuffer(GL_FRAMEBUFFER, ff);
+                g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_TEXTURE_2D, ft, 0);
+                r->fluid_ok = g->glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+                              GL_FRAMEBUFFER_COMPLETE;
+                g->glDeleteTextures(1, &ft);
+                g->glDeleteFramebuffers(1, &ff);
+                if (r->fluid_ok && r->software && !getenv("REV_GL_FLUID_SW"))
+                        r->fluid_ok = false;
+        }
+        if (r->fluid_ok) {
+                char ferr[256] = { 0 };
+                if (!gl_make_program(r, PROG_F_VELF, FS_FLUID_VELF, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_DYEF, FS_FLUID_DYEF, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_CURL, FS_FLUID_CURL, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_VORT, FS_FLUID_VORT, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_DIV, FS_FLUID_DIV, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_JACOBI, FS_FLUID_JACOBI, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_GRADSUB, FS_FLUID_GRADSUB, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_ADV_VEL, FS_FLUID_ADVECT_VEL, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_ADV_DYE, FS_FLUID_ADVECT_DYE, ferr, sizeof ferr) ||
+                    !gl_make_program(r, PROG_F_TONEMAP, FS_FLUID_TONEMAP, ferr, sizeof ferr)) {
+                        LOGW("opengl: fluid shaders failed (%s) — sims stay on CPU", ferr);
+                        r->fluid_ok = false;
+                }
+        }
+        rr->wants_sims = r->fluid_ok;
+        if (r->fluid_ok)
+                LOGI("opengl: fluid solver on GPU (RGBA16F render targets)");
+        else if (!r->software)
+                LOGI("opengl: no float render target — fluid stays on CPU");
+
         /* uniform locations + static sampler bindings */
         for (int i = 0; i < PROG_COUNT; i++) {
                 GLuint_ pg = r->prog[i];
+                if (!pg)
+                        continue;
                 g->glUseProgram(pg);
                 int lt = g->glGetUniformLocation(pg, "u_tex");
                 if (lt >= 0)
@@ -695,12 +1432,51 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 int ld = g->glGetUniformLocation(pg, "u_dst");
                 if (ld >= 0)
                         g->glUniform1i(ld, 1);
+                /* fluid samplers: fields on unit 0, secondary field on 1 */
+                int lv = g->glGetUniformLocation(pg, "u_vel");
+                if (lv >= 0)
+                        g->glUniform1i(lv, 0);
+                int ldy = g->glGetUniformLocation(pg, "u_dye");
+                if (ldy >= 0)
+                        g->glUniform1i(ldy, 0);
+                int lp = g->glGetUniformLocation(pg, "u_press");
+                if (lp >= 0)
+                        g->glUniform1i(lp, 1);
+                int lc = g->glGetUniformLocation(pg, "u_curl");
+                if (lc >= 0)
+                        g->glUniform1i(lc, 1);
                 r->u[i].off = g->glGetUniformLocation(pg, "u_off");
                 r->u[i].scale = g->glGetUniformLocation(pg, "u_scale");
                 r->u[i].dir = g->glGetUniformLocation(pg, "u_dir");
                 r->u[i].weights = g->glGetUniformLocation(pg, "u_w[0]");
                 r->u[i].blend = g->glGetUniformLocation(pg, "u_blend");
                 r->u[i].opacity = g->glGetUniformLocation(pg, "u_opacity");
+                r->u[i].src_premul = g->glGetUniformLocation(pg, "u_src_premul");
+                r->fu[i].grid = g->glGetUniformLocation(pg, "u_grid");
+                r->fu[i].dt = g->glGetUniformLocation(pg, "u_dt");
+                r->fu[i].damp = g->glGetUniformLocation(pg, "u_damp");
+                r->fu[i].fade = g->glGetUniformLocation(pg, "u_fade");
+                r->fu[i].t = g->glGetUniformLocation(pg, "u_t");
+                r->fu[i].k = g->glGetUniformLocation(pg, "u_k");
+                r->fu[i].posA = g->glGetUniformLocation(pg, "u_posA");
+                r->fu[i].posB = g->glGetUniformLocation(pg, "u_posB");
+                r->fu[i].impA = g->glGetUniformLocation(pg, "u_impA");
+                r->fu[i].impB = g->glGetUniformLocation(pg, "u_impB");
+                r->fu[i].radA = g->glGetUniformLocation(pg, "u_radA");
+                r->fu[i].radB = g->glGetUniformLocation(pg, "u_radB");
+                r->fu[i].colA = g->glGetUniformLocation(pg, "u_colA");
+                r->fu[i].colB = g->glGetUniformLocation(pg, "u_colB");
+                r->fu[i].ambient = g->glGetUniformLocation(pg, "u_ambient");
+        }
+        /* PROG_F_ADV_DYE samples BOTH u_dye and u_vel — the generic loop
+         * above bound both to unit 0, so the dye advection read the DYE
+         * texture as its velocity field (dye drifted by its own brightness
+         * instead of following the fluid). Its velocity comes from unit 1. */
+        if (r->prog[PROG_F_ADV_DYE]) {
+                g->glUseProgram(r->prog[PROG_F_ADV_DYE]);
+                int lv = g->glGetUniformLocation(r->prog[PROG_F_ADV_DYE], "u_vel");
+                if (lv >= 0)
+                        g->glUniform1i(lv, 1);
         }
 
         /* create remaining window surfaces */
@@ -808,44 +1584,69 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
 {
         RenderGL *r = (RenderGL *)rr->ctx;
         GL *g = &r->g;
-        if (!cmd || !cmd->px || !cmd->w || !cmd->h)
+        if (!cmd || !cmd->w || !cmd->h)
                 return false;
 
-        /* 1. upload (straight RGBA). Sub-frame-resolution sims come in small
-         *    and let LINEAR sampling do the upscale during placement. */
-        if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cmd->w, cmd->h, cmd->linear))
-                return false;
-        g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
+        /* 1. obtain the layer's source texture:
+         *    - GPU-owned fluid layers are simulated here (no CPU pixels,
+         *      no upload — the whole per-pixel pipeline stays on the GPU)
+         *    - pixel layers go through the content-addressed cache: static
+         *      rasters re-upload ONLY when their content serial changes
+         *      (the old path pushed every cached raster every frame). */
+        GLuint_ src_tex;
+        if (cmd->sim) {
+                if (!r->fluid_ok)
+                        return false;    /* scene should not have offloaded */
+                GLFluid *f = fluid_slot(r, r->cur_win, cmd->sim);
+                if (!f)
+                        return false;
+                src_tex = gl_fluid_step(r, f, cmd->sim);
+                if (!src_tex)
+                        return false;
+                r->src_w = cmd->w;
+                r->src_h = cmd->h;
+        } else {
+                if (!cmd->px)
+                        return false;
+                src_tex = upload_layer_tex(r, cmd);
+                if (!src_tex)
+                        return false;
+        }
+        g->glActiveTexture(GL_TEXTURE0);
+        g->glBindTexture(GL_TEXTURE_2D, src_tex);
         g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
                            cmd->linear ? GL_LINEAR : GL_NEAREST);
         g->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
                            cmd->linear ? GL_LINEAR : GL_NEAREST);
-        g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cmd->w, (int)cmd->h,
-                           GL_RGBA, GL_UNSIGNED_BYTE, cmd->px);
 
-        /* 2. premultiply into tex_a (raster size) */
-        if (!ensure_tex(g, &r->tex_a, &r->a_w, &r->a_h, cmd->w, cmd->h, true))
-                return false;
-        g->glActiveTexture(GL_TEXTURE0);
-        g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
-
-        /* scratch FBOs reuse the a/b/c/d textures */
-        if (!r->fbo_made) {
-                g->glGenFramebuffers(4, r->scratch_fbo);
-                r->fbo_made = true;
-        }
-        /* attach current tex_a to fbo 0 (sizes may have changed) */
-        g->glBindFramebuffer(GL_FRAMEBUFFER, r->scratch_fbo[0]);
-        g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->tex_a, 0);
-        g->glBindFramebuffer(GL_FRAMEBUFFER, r->accum[r->cur_win][r->accum_cur[r->cur_win]].fbo);
-        {
-                RTarget t = { r->tex_a, r->scratch_fbo[0], cmd->w, cmd->h };
-                pass_full(r, PROG_PREMULT, &t);
-        }
-
-        /* 3. blur (downsample + separable 9-tap + upscale) */
-        GLuint_ layer_tex = r->tex_a;
+        /* 2. blur (downsample + separable 9-tap + upscale). The blur chain
+         *    operates on PREMULTIPLIED pixels (gaussian across alpha edges);
+         *    unblurred layers composite directly from their STRAIGHT source
+         *    — no premult round-trip, so faint semi-transparent pixels keep
+         *    their exact 8-bit values like the CPU path. */
+        GLuint_ layer_tex = src_tex;
+        bool src_premul = false;
         if (cmd->blur >= 0.5) {
+                /* premultiply into tex_a (raster size) first */
+                if (!ensure_tex(g, &r->tex_a, &r->a_w, &r->a_h, cmd->w, cmd->h, true))
+                        return false;
+                g->glActiveTexture(GL_TEXTURE0);
+                g->glBindTexture(GL_TEXTURE_2D, src_tex);
+
+                /* scratch FBOs reuse the a/b/c/d textures */
+                if (!r->fbo_made) {
+                        g->glGenFramebuffers(4, r->scratch_fbo);
+                        r->fbo_made = true;
+                }
+                /* attach current tex_a to fbo 0 (sizes may have changed) */
+                g->glBindFramebuffer(GL_FRAMEBUFFER, r->scratch_fbo[0]);
+                g->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->tex_a, 0);
+                g->glBindFramebuffer(GL_FRAMEBUFFER, r->accum[r->cur_win][r->accum_cur[r->cur_win]].fbo);
+                {
+                        RTarget t = { r->tex_a, r->scratch_fbo[0], cmd->w, cmd->h };
+                        pass_full(r, PROG_PREMULT, &t);
+                }
+
                 double sigma = cmd->blur;
                 int k = 0;
                 while (sigma / (double)(1 << k) > 4.0 && k < 6)
@@ -905,11 +1706,19 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
                 draw_full(g);
 
                 layer_tex = r->tex_d;
+                src_premul = true;
         }
 
         /* 4. composite: read accum[cur], write accum[cur^1], flip.
-         * Placement may exceed the texture (sub-frame-res sims stretched
-         * over the frame) — the linear filter upsamples while compositing. */
+         * Inverse placement map — the fragment at accum position s samples
+         * the layer at uvsrc = (s*frame - (dx,dy)) / (pw,ph), so the layer's
+         * [0,1] uv lands exactly on its placed rect (1:1, dy from top) and
+         * everything outside the rect discards. The old forward map
+         * (scale=pw/W, off=dx/W) was only correct for fullscreen layers —
+         * centered/oversize layers rendered zoomed with edge smear instead
+         * of placed. Placement may exceed the frame (sub-frame-res sims
+         * stretched over it): uvsrc stays within [0,1] across the window and
+         * the linear filter upsamples while compositing. */
         u32 pw = cmd->place_w ? cmd->place_w : cmd->w;
         u32 ph = cmd->place_h ? cmd->place_h : cmd->h;
         int wi = r->cur_win;
@@ -925,14 +1734,16 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
         g->glActiveTexture(GL_TEXTURE0);
         if (r->u[PROG_COMPOSITE].off >= 0)
                 g->glUniform2f(r->u[PROG_COMPOSITE].off,
-                               (float)((double)cmd->dx / (double)accum_wr->w),
-                               (float)((double)cmd->dy / (double)accum_wr->h));
+                               (float)(-(double)cmd->dx / (double)pw),
+                               (float)(-(double)cmd->dy / (double)ph));
         if (r->u[PROG_COMPOSITE].scale >= 0)
                 g->glUniform2f(r->u[PROG_COMPOSITE].scale,
-                               (float)((double)pw / (double)accum_wr->w),
-                               (float)((double)ph / (double)accum_wr->h));
+                               (float)((double)accum_wr->w / (double)pw),
+                               (float)((double)accum_wr->h / (double)ph));
         if (r->u[PROG_COMPOSITE].blend >= 0)
                 g->glUniform1i(r->u[PROG_COMPOSITE].blend, cmd->blend);
+        if (r->u[PROG_COMPOSITE].src_premul >= 0)
+                g->glUniform1i(r->u[PROG_COMPOSITE].src_premul, src_premul ? 1 : 0);
         if (r->u[PROG_COMPOSITE].opacity >= 0)
                 g->glUniform1f(r->u[PROG_COMPOSITE].opacity,
                                (float)(cmd->opacity < 0 ? 0 : cmd->opacity > 1 ? 1 : cmd->opacity));
@@ -948,7 +1759,8 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
         int win = r->cur_win;
 
         if (cpu_frame) {
-                /* upload the CPU-composited frame and present it directly */
+                /* upload the CPU-composited straight frame and present it
+                 * directly (the accum/present chain is straight-alpha) */
                 if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cpu_frame->w, cpu_frame->h, false))
                         return false;
                 g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
@@ -959,10 +1771,11 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
                 g->glUseProgram(r->prog[PROG_PRESENT]);
                 g->glActiveTexture(GL_TEXTURE0);
                 g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
+                /* v flip: CPU rasters are top-down, GL window space is y-up */
                 if (r->u[PROG_PRESENT].off >= 0)
-                        g->glUniform2f(r->u[PROG_PRESENT].off, 0, 0);
+                        g->glUniform2f(r->u[PROG_PRESENT].off, 0, 1);
                 if (r->u[PROG_PRESENT].scale >= 0)
-                        g->glUniform2f(r->u[PROG_PRESENT].scale, 1, 1);
+                        g->glUniform2f(r->u[PROG_PRESENT].scale, 1, -1);
                 draw_full(g);
         } else {
                 /* present the latest accum (premul -> straight) */
@@ -972,12 +1785,14 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
                 g->glUseProgram(r->prog[PROG_PRESENT]);
                 g->glActiveTexture(GL_TEXTURE0);
                 g->glBindTexture(GL_TEXTURE_2D, accum->tex);
+                /* v flip — same reason (accum rows follow CPU top-down order) */
                 if (r->u[PROG_PRESENT].off >= 0)
-                        g->glUniform2f(r->u[PROG_PRESENT].off, 0, 0);
+                        g->glUniform2f(r->u[PROG_PRESENT].off, 0, 1);
                 if (r->u[PROG_PRESENT].scale >= 0)
-                        g->glUniform2f(r->u[PROG_PRESENT].scale, 1, 1);
+                        g->glUniform2f(r->u[PROG_PRESENT].scale, 1, -1);
                 draw_full(g);
         }
+        r->frame_no++;
         return r->eglSwapBuffers(r->dpy, r->win[win].surf) != 0;
 }
 
@@ -1038,6 +1853,32 @@ static void gl_fini(RRenderer *rr)
                         g->glDeleteFramebuffers(1, &r->accum[i][0].fbo);
                         g->glDeleteTextures(1, &r->accum[i][1].tex);
                         g->glDeleteFramebuffers(1, &r->accum[i][1].fbo);
+                }
+                /* fluid solver state + upload cache */
+                for (int i = 0; i < REV_PLATFORM_MAX_OUTPUTS; i++) {
+                        for (int j = 0; j < GL_MAX_FLUIDS; j++) {
+                                GLFluid *f = &r->fluids[i][j];
+                                if (!f->key)
+                                        continue;
+                                fluid_free_pair(g, f->vel, f->vel_fbo);
+                                fluid_free_pair(g, f->dye, f->dye_fbo);
+                                fluid_free_pair(g, f->press, f->press_fbo);
+                                if (f->curl) {
+                                        g->glDeleteTextures(1, &f->curl);
+                                        g->glDeleteFramebuffers(1, &f->curl_fbo);
+                                }
+                                if (f->out8) {
+                                        g->glDeleteTextures(1, &f->out8);
+                                        g->glDeleteFramebuffers(1, &f->out8_fbo);
+                                }
+                                f->key = NULL;
+                                f->ok = false;
+                        }
+                }
+                for (int i = 0; i < GL_TEX_CACHE; i++) {
+                        if (r->texcache[i].tex)
+                                g->glDeleteTextures(1, &r->texcache[i].tex);
+                        r->texcache[i].tex = 0;
                 }
         }
         if (r->wegl_lib)
