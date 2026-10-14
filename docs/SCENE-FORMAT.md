@@ -43,7 +43,7 @@ is just a list of `layer` blocks is also valid.
 
 | Property   | Type    | Default  | Meaning                          |
 |------------|---------|----------|----------------------------------|
-| `type`     | ident   | required | `image gradient solid fluid ripple particles` |
+| `type`     | ident   | required | `image gradient solid fluid ripple particles video` |
 | `opacity`  | number  | 1.0      | 0..1, animatable                 |
 | `blur`     | number  | 0        | gaussian-ish blur radius in px, animatable |
 | `blend`    | ident   | normal   | `normal add screen multiply overlay` |
@@ -112,6 +112,35 @@ refracts everything composited *below it* and adds specular glints.
 | `strength` | number | 1.0     | wave + refraction power, animatable |
 | `damping`  | number | 0.12    | how fast ripples die     |
 | `radius`   | number | 0.01    | pointer disturbance size |
+
+## `type = video`
+
+An MP4 (H.264) video layer — looping wallpaper footage that composites
+like any other layer (blend/opacity alongside everything else). Decoding
+is optional: without FFmpeg on the system the layer logs one line and
+renders nothing (see docs/VIDEO.md).
+
+```
+layer loop {
+    type = video
+    src = "videos/loop.mp4"
+    loop = true
+    fit = fill
+    paused = false
+}
+```
+
+| Property  | Kind    | Default    | Meaning                                     |
+|-----------|---------|------------|---------------------------------------------|
+| `src`     | string  | required   | video file, theme-relative                  |
+| `loop`    | bool    | `true`     | restart at EOF                              |
+| `paused`  | bool    | `false`    | hold the current frame (delta-time clock)   |
+| `fit`     | ident   | `fill`     | `fill` / `fit` / `stretch` aspect handling  |
+
+Playback timing is PTS-driven on the layer's own playhead — changing the
+render fps does not change playback speed. Audio tracks are never opened
+(a wallpaper has no business making sound). Packed themes stream the
+video directly out of the container.
 
 ## `type = particles`
 

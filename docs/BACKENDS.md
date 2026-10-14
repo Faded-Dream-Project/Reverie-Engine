@@ -121,7 +121,9 @@ and logged as such.)
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
-| `REV_PROFILE`       | `1` = append a per-frame stage breakdown (`sim / raster / render+present` ms) to the periodic `perf:` line |
+| `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
+| `REV_FAKE_POINTER`  | TEST/BENCH: `<speed>` = synthesize a pressed pointer on a Lissajous path (circuits/s) so interactive scenes benchmark headlessly. Never set by users |
+| `REV_GL_FLUID_SW`   | TEST: force the GPU sim/point/gradient paths on software GL for regression coverage |
 
 ## Troubleshooting
 

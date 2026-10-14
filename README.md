@@ -14,13 +14,15 @@ through a living fluid, trail ripples across water, spark embers with a
 click.
 
 Scenes are described in the `.rev` scene language: layered PNGs, SVGs,
-gradients, fluid/ripple/particle sims, blend modes, blur, opacity, parallax,
-and keyframe animations — all in a small, hand-editable text file, or packed
-into a single self-contained `.revpack` binary for distribution.
+gradients, fluid/ripple/particle simulations, MP4 video, blend modes,
+blur, opacity, parallax, and keyframe animations — all in a small,
+hand-editable text file. Scenes ship as **themes**: self-contained folders
+(`theme.json` + scene + assets) or single-file packed `.revpack` themes
+loaded without extraction — byte-identical renders either way.
 
 ```
  ~ $ reverie scenes/mountain-dusk.rev
- [info] reverie 0.1.0-dev — backend=auto renderer=auto
+ [info] reverie 0.2.0-dev — backend=auto renderer=auto
  [info] backend: x11
  [info] renderer: vulkan (tier 3, CPU compositing)
  [info] vulkan: GPU present capable (queue family 0); presenting via platform SHM path
@@ -53,11 +55,20 @@ Reverie probes, in order, and takes the first that works:
   implementation exactly. Fluid layers run their ENTIRE simulation on the
   GPU — splats, vorticity confinement, Jacobi pressure projection,
   semi-Lagrangian advection and the dye tonemap all execute as fragment
-  shaders over RGBA16F ping-pong textures, so no per-pixel CPU work
-  remains in a fluid scene. Driven by `dlopen("libEGL.so.1")` +
-  `eglGetProcAddress`; on X11 it needs nothing but the raw window ID.
-  When float render targets are unavailable the sim gracefully stays on
-  the CPU solver (the layer/composite pipeline is unaffected).
+  shaders over RGBA16F ping-pong textures. Ripples run their wave equation
+  in shaders and composite their refraction against the accumulation
+  target. Particle layers draw as point sprites (the CPU ships ~128KB of
+  packed floats instead of an 8MB full-frame raster). Gradients are
+  evaluated in shaders, so animated gradients stop paying a per-frame
+  raster + upload. Video layers upload Y/U/V planes (3.1MB/frame at 1080p
+  vs 8.3MB RGBA) and convert BT.601 in the composite pass. Every layer
+  type has a GPU path except rain streaks (documented CPU fallback);
+  software rasterizers keep the CPU paths where they are genuinely faster
+  (the engine measures and chooses at init). Driven by
+  `dlopen("libEGL.so.1")` + `eglGetProcAddress`; on X11 it needs nothing
+  but the raw window ID. When float render targets are unavailable the
+  sims gracefully stay on the CPU solvers (the layer/composite pipeline
+  is unaffected).
 * **opengl on llvmpipe** — not a separate code path: when Mesa reports a
   software rasterizer, the engine logs it and keeps rendering. This is the
   software-GL tier of the chain and works on machines with no GPU at all.
@@ -97,8 +108,9 @@ rules, and per-tier notes.
 | Images              | libpng / libjpeg    | **own PNG codec (all color types, Adam7)** |
 | Vectors             | librsvg / cairo     | **own SVG rasterizer + stroker**      |
 | Shared memory       | Xext wrappers       | **MIT-SHM via sysv shm, hand-encoded** |
-| Scene distribution  | zip / tar           | **own .revpack container (CRC-checked)** |
-| Threads             | pthreads            | **single-threaded, zero locks**       |
+| Scene distribution  | zip / tar           | **own .revpack container (CRC-checked, path-validated)** |
+| Video (optional)    | linked FFmpeg / GStreamer | **dlopen'd libav* — absent = no video, nothing else changes** |
+| Threads             | pthreads            | **one optional decode thread (video); everything else lock-free** |
 
 Everything is C11, compiled with `-Wall -Wextra -Werror -Wpedantic`, and
 verified end-to-end under Xvfb:
@@ -129,11 +141,16 @@ make install    # /usr/local/bin/{reverie,revtool}
 ```
 
 Requirements: a C11 compiler, make, and that's it. No headers beyond libc.
+Video wallpapers are optional and auto-detected: with FFmpeg development
+headers installed (or the vendored `contrib/ffmpeg-headers`), `video.c`
+builds and dlopens the system libraries at runtime; without them a stub
+builds and the engine is exactly the same minus video (see
+[docs/VIDEO.md](docs/VIDEO.md)).
 
 ## Usage
 
 ```sh
-reverie [options] <scene.rev | scene.revpack>
+reverie [options] <scene.rev | theme dir | theme.revpack>
 
   -R, --renderer R    force renderer: auto | vulkan | opengl | cpu
   -B, --backend B     force backend: auto | x11 | wayland
@@ -142,114 +159,71 @@ reverie [options] <scene.rev | scene.revpack>
   -o, --once          render one frame to PNG and exit (no display needed)
   -l, --list          list monitors and exit
 
-revtool validate <scene.rev>          # check a scene
+reverie themes/ripple-lake            # folder theme (hot-reloads)
+reverie ripple-lake.revpack           # packed theme — no extraction
+
+Scene layers: image, gradient, solid, fluid, ripple, particles, video —
+with blend modes, blur, opacity, parallax, monitor selection, and
+keyframe animations. Video layers: `type = video; src = "loop.mp4";
+loop = true; paused = false; fit = fill`.
+
+revtool validate <scene.rev | theme>  # check a scene or theme
 revtool render  <scene.rev> ...       # offline PNG rendering (with simulated
                                       #   pointer drags for testing interactions)
 revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
+revtool theme   list|info|validate|pack|inspect  # theme toolkit
+
+See docs/SCENE-FORMAT.md (the scene language), docs/THEMES.md (theme
+folders + packed themes), and docs/VIDEO.md (video architecture).
 ```
 
-## Status — 0.1.0-dev (development, unstable)
+## Status — 0.2.0-dev (development, unstable)
 
 No release yet: active development, everything unstable, not ready for
-public use — the tree stays a -dev version until it earns a number. The
-current dev cycle fixes the field-reported 0.1.6 GL failure on Wayland —
-`--renderer opengl` behind `REV_WAYLAND_GPU=1` died at window creation
-with `eglCreateWindowSurface failed (0x300b)` — lands the frame-pacing
-and interaction overhaul the fix rode in on, and answers the second
-field report from that machine: the GL renderer was finally running on
-the NVIDIA card yet the scene crawled at ~4 fps with one CPU core
-pinned. That report was correct — the GPU composites, but the *scene*
-work behind it was pure CPU:
+public use — the tree stays a -dev version until it earns a number.
+Still no tags and no GitHub releases. This dev cycle:
 
-* **The fluid layer paid a full-res CPU upscale + `exp()` tonemap every
-  frame.** `fluid_render` walked every output pixel (2M on 1080p) doing
-  three f64 bilinear samples plus an `exp()` and a division each —
-  ~150 ms/frame alone. Three changes: the soft-glow tonemap became a
-  2048-entry LUT (same curve, at most one 8-bit step of difference),
-  the bilinear loop got per-column coordinate/weight tables in f32, and
-  — in GPU compositing mode — the fluid layer is now emitted AT dye
-  resolution with `place_w/place_h` stretching it over the frame while
-  linear texture sampling does the upscale on the GPU. That is the same
-  upscale the CPU was doing (the dye field only exists at that
-  resolution); it just isn't charged to a CPU core anymore.
-* **The pressure solve promoted every cell to f64 and back.** The
-  Gauss-Seidel loop divided by `4.0` (a double literal) — 2 × 16
-  iterations over the velocity grid per step, in the hottest loop the
-  engine has. Multiplication by `0.25f` is bit-identical for powers of
-  two and stays in f32. Advection samples f64 bilinear per channel; the
-  channels now advect in one pass sharing the velocity sample, in f32.
-* **Animated gradients re-rasterized through the polygon scanline
-  machine every frame** — arena, path flatten, 4× supersampled sweep,
-  qsort per sub-row — ~30 ms/frame for what is a full-rect fill.
-  `rev_paint_fill_rect()` (raster.c) writes the gradient directly with
-  the same LUT, spread and geometry. This also fixed a real visual bug:
-  the rebuild used to *blend* over the previous frame's raster, so
-  transparent regions of an animated gradient froze at whatever had
-  been there and the sweep left a permanent smear. Gradients animated
-  only in opacity/blur/parallax no longer rebuild at all — those are
-  composite-time properties.
-* **`REV_PROFILE=1`** appends a stage breakdown to the periodic `perf:`
-  line — `sim=… raster=… render+present=…` ms per frame — so the next
-  "why is my wallpaper slow" report arrives with numbers attached.
-
-Net effect on the reporter's scene (`fluid-aurora.rev`, 1080p): every
-CPU-bound stage measured on the reference box dropped ~4-6×; the GPU
-tier's remaining CPU cost is the simulation itself (the engine is
-single-threaded by design — no pthreads). Truly idle-CPU wallpapers
-mean moving the sims to GPU compute, which is future work, not a bug
-fix. The X11 GL path, CPU tier, and Vulkan tiers all share the same
-scene pipeline and got the same wins; local verification: full build
-`-Werror -Wpedantic`, 7/7 suites (including two new regression tests:
-dye-res emission geometry, and the animated-gradient smear), e2e 4/4,
-e2e-wayland 3/3, ASan+UBSan clean with leak detection on.
-
-The GL fix itself, from the same cycle:
-
-* **The GL renderer handed the raw `wl_surface*` to EGL as a native
-  window.** A wl_surface is *not* an `EGLNativeWindow`: on Wayland, EGL
-  requires a `wl_egl_window` wrapper (from `libwayland-egl.so.1`, dlopen'd
-  like everything else here) and rejects the bare proxy with
-  `EGL_BAD_NATIVE_WINDOW` (0x300b). The renderer now opens the display
-  through `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR)` when the vendor
-  advertises `EGL_EXT_platform_wayland`, wraps each surface in a
-  `wl_egl_window` sized in buffer pixels, creates the EGL window surface on
-  the wrapper, resizes via `wl_egl_window_resize` (the surface survives
-  output geometry changes), and tears it all down cleanly. While a window
-  is EGL-owned the shim's `wl_shm` presenter stays off that surface
-  (`wlshim_set_gl_surface`), so the two present paths can never fight over
-  attach/commit. `scripts/run-egl-probe.sh` reproduces the failure mode
-  against live weston (path A fails — the exact EGL error code varies by
-  driver, the field report was 0x300b — and path B, the fixed sequence,
-  reaches 5 successful swaps with a real GL renderer string).
-* **Frame pacing no longer sleeps blind.** The daemon used a `nanosleep`
-  of whatever the scene fps left over; a slow frame swallowed input that
-  arrived meanwhile, and presentation never aligned with the compositor's
-  repaint cycle. Both Wayland paths now request `wl_surface.frame`
-  callbacks after each present and pace via the new platform
-  `wait_frame()` — sleeping in ≤16 ms slices while dispatching events,
-  waking exactly when the compositor latches the frame. X11 paces on the
-  X connection fd (events keep flowing, no compositor signal exists).
-  Scene fps is additionally capped to the fastest connected display
-  (`wl_output.mode` refresh, new `monitor_refresh()` API) — frames faster
-  than the panel could only ever become compositor drops — and a periodic
-  `perf:` log line reports actual fps plus dropped-frame count for field
-  triage.
-* **Interaction state is consume-on-read.** Pointer deltas now *accumulate*
-  between polls (a drag spanning several motion events used to deliver only
-  the last event's delta), button transitions are latched as edges, and a
-  click whose press **and** release both land between two polls still
-  registers — position captured at the press. Clicks drive the new
-  `rtscene_click()`: ripple layers get a one-shot splash and particle
-  layers a spark burst at the click point.
-* **A fourth opcode near-miss, caught before release this time.** The frame
-  request was initially drafted as `wl_surface` opcode 13; the canonical
-  protocol puts `frame` at opcode 3 (the same hallucinated-table family as
-  0.1.3 and 0.1.6). The strict fake compositors — rebuilt for exactly this
-  after 0.1.6 — rejected it on first run: the regression net did its job.
-  Both fake servers now pin the frame request's target, opcode, wire size
-  and new-id payload, reply `wl_callback.done`, and assert the
-  single-shot wake semantics of `wait_frame()`.
+* **GPU-first rendering, everywhere it belongs.** The maintainer's
+  direction after the 1050 Ti field report (fluid-aurora at 57-59 fps —
+  the GPU tier finally faster than the CPU tier): if the GPU is there,
+  it does the per-pixel work. Every layer type now has a GPU path on
+  the OpenGL tier: fluids (RGBA16F solver, since the last cycle),
+  ripples (wave equation + refraction composite in shaders — ripple
+  scenes used to be locked out of GPU compositing entirely and ran the
+  identical CPU pipeline at 27 vs 28 fps), particles (point sprites:
+  ~128KB of packed floats instead of an 8MB CPU raster + upload),
+  gradients (shader evaluation; animated gradients stop paying a
+  per-frame raster + upload), video (Y/U/V plane upload + BT.601
+  conversion in the composite pass). Software rasterizers keep the CPU
+  path where it genuinely wins (llvmpipe wide points crawl at 6 fps vs
+  60 — measured, and the engine chooses accordingly at init). The CPU
+  renderer remains the untouched reference implementation.
+* **An honest profiler.** `REV_PROFILE=1` reports frame-time percentiles
+  (p50/p95/max — averages hid multi-hundred-ms stalls), splits render
+  wall time from its upload subset, and shows GPU time from async
+  driver timer queries, labeled as such — "gpu timing unavailable" when
+  the driver has none, never a made-up number.
+* **Themes.** Scenes ship as self-contained folders (theme.json +
+  scene + assets) or single-file packed `.revpack` v2 themes, loaded
+  without extraction, byte-identical either way (e2e-verified). Entry
+  names are path-validated (traversal/absolute/control chars rejected);
+  executable content is refused outright. `revtool theme
+  list/info/validate/pack/inspect`.
+* **Video wallpapers.** MP4 loops decode through dlopen'd FFmpeg
+  (optional at build AND run — absent libraries are a non-event), with
+  a bounded frame queue on the engine's only extra thread, PTS-driven
+  playback on a pause-aware delta-time playhead, looping via seek, and
+  GPU color conversion. docs/VIDEO.md records the full decoder
+  architecture assessment (why a from-scratch H.264 decoder is the
+  wrong project, licensing notes, and the phase-2 hardware-decode plan).
+* **Verification.** 8 unit suites (new: theme, video), e2e 11/11 under
+  Xvfb (new legs: GPU ripple, folder/packed theme parity, corrupt-pack
+  rejection, video on CPU and GL tiers), ASan+UBSan clean. Field
+  validation on the 1050 Ti box remains open: the GPU-path performance
+  claims come from paired measurements on this 2-core sandbox plus the
+  user's prior report; the profiler now gives the next field run the
+  numbers to confirm them.
 
 ## Status — 0.1.6 (pre-release)
 
