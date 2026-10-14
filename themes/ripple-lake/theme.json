@@ -1,0 +1,9 @@
+{
+  "id": "ripple-lake",
+  "name": "Ripple Lake",
+  "description": "A calm lake scene: drag the pointer across the water and watch it refract and glint.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0"
+}

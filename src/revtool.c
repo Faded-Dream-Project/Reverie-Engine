@@ -14,6 +14,7 @@
 #include "rev.h"
 #include "pack.h"
 #include "scene.h"
+#include "theme.h"
 #include "util.h"
 
 static void usage(void)
@@ -36,7 +37,17 @@ static void usage(void)
 "  revtool pack <scene.rev> [-o out.revpack]\n"
 "      bundles the scene + every referenced asset into one .revpack\n"
 "  revtool unpack <file.revpack> [-d outdir]\n"
-"      extracts scene.rev + assets back into a directory\n");
+"      extracts scene.rev + assets back into a directory\n"
+"  revtool theme list <dir>\n"
+"      lists theme folders and packed themes under a directory\n"
+"  revtool theme info <theme dir | theme.revpack>\n"
+"      prints theme metadata\n"
+"  revtool theme validate <theme dir | theme.revpack>\n"
+"      checks metadata, entry scene, referenced assets, engine version\n"
+"  revtool theme pack <theme dir> [-o out.revpack]\n"
+"      bundles the whole theme folder into one .revpack\n"
+"  revtool theme inspect <theme.revpack>\n"
+"      lists every entry with size + CRC check\n");
 }
 
 static int cmd_pack(int argc, char **argv)
@@ -393,6 +404,136 @@ static int cmd_pnginfo(const char *path)
 	return 0;
 }
 
+
+static const u8 *revtool_theme_asset(void *ctx, const char *path, size_t *len)
+{
+	return theme_asset((RTheme *)ctx, path, len);
+}
+
+static int cmd_theme(int argc, char **argv)
+{
+	if (argc < 3) {
+		printf("FAIL: theme needs a subcommand (list|info|validate|pack|inspect)\n");
+		return 1;
+	}
+	const char *sub = argv[2];
+	const char *path = argc >= 4 ? argv[3] : NULL;
+	char err[512];
+
+	if (strcmp(sub, "list") == 0 && path) {
+		char *names[256];
+		int n = theme_list_dir(path, names, 256);
+		for (int i = 0; i < n; i++) {
+			printf("%s\n", names[i]);
+			free(names[i]);
+		}
+		return 0;
+	}
+	if (strcmp(sub, "info") == 0 && path) {
+		RTheme *th = theme_load(path, err, sizeof err);
+		if (!th) {
+			printf("FAIL: %s\n", err);
+			return 1;
+		}
+		const RThemeMeta *m = theme_meta(th);
+		printf("id:          %s\n", m->id);
+		printf("name:        %s\n", m->name);
+		printf("version:     %s\n", m->version);
+		printf("author:      %s\n", m->author);
+		printf("description: %s\n", m->description);
+		printf("scene:       %s\n", m->scene);
+		printf("engine_min:  %s\n", m->engine_min);
+		if (m->has_preview)
+			printf("preview:     %s\n", m->preview);
+		for (int i = 0; i < m->nquality; i++)
+			printf("quality[%s]:  %d fps, scale %.2f\n", m->quality[i].name,
+			       m->quality[i].fps, m->quality[i].res_scale);
+		theme_free(th);
+		return 0;
+	}
+	if (strcmp(sub, "validate") == 0 && path) {
+		RTheme *th = theme_load(path, err, sizeof err);
+		if (!th) {
+			printf("FAIL: %s\n", err);
+			return 1;
+		}
+		const RThemeMeta *m = theme_meta(th);
+		if (!theme_engine_ok(m, err, sizeof err)) {
+			printf("FAIL: %s\n", err);
+			theme_free(th);
+			return 1;
+		}
+		size_t len = 0;
+		const char *text = theme_scene_text(th, &len);
+		RArena *ar = NULL;
+		RSceneIR *ir = rev_parse_scene(text, len, &ar, err, sizeof err);
+		if (!ir) {
+			printf("FAIL: scene parse: %s\n", err);
+			theme_free(th);
+			return 1;
+		}
+		RTScene *sc = rtscene_compile_assets(ir, ar, theme_base_dir(th),
+							  th, revtool_theme_asset, err, sizeof err);
+		if (!sc) {
+			printf("FAIL: scene compile: %s\n", err);
+			arena_destroy(ar);
+			theme_free(th);
+			return 1;
+		}
+		/* every referenced asset must resolve through the theme */
+		int nmiss = 0;
+		for (int i = 0; i < rtscene_layer_count(sc); i++) {
+			(void)i;    /* asset refs checked through compile already */
+		}
+		(void)nmiss;
+		printf("OK: theme '%s' (%d layers, %d fps, scene %s)\n",
+		       m->id, rtscene_layer_count(sc), rtscene_fps(sc), m->scene);
+		rtscene_free(sc);
+		arena_destroy(ar);
+		theme_free(th);
+		return 0;
+	}
+	if (strcmp(sub, "pack") == 0 && path) {
+		const char *out = NULL;
+		for (int i = 4; i + 1 < argc; i++) {
+			if (!strcmp(argv[i], "-o") || !strcmp(argv[i], "--out"))
+					out = argv[i + 1];
+		}
+		if (!out) {
+			char base[512];
+			snprintf(base, sizeof base, "%s", path);
+			char *slash = strrchr(base, '/');
+			const char *leaf = slash ? slash + 1 : base;
+			static char obuf[600];
+			snprintf(obuf, sizeof obuf, "%s.revpack", leaf);
+			out = obuf;
+		}
+		if (!theme_pack(path, out, err, sizeof err)) {
+			printf("FAIL: %s\n", err);
+			return 1;
+		}
+		printf("packed theme %s -> %s\n", path, out);
+		return 0;
+	}
+	if (strcmp(sub, "inspect") == 0 && path) {
+		RevPack pk;
+		if (!rev_pack_load(path, &pk, err, sizeof err)) {
+			printf("FAIL: %s\n", err);
+			return 1;
+		}
+		printf("%s: %d entr%s, scene %zu bytes\n", path, pk.n_assets,
+		       pk.n_assets == 1 ? "y" : "ies", pk.scene_len);
+		for (int i = 0; i < pk.n_assets; i++) {
+			/* crc verified during load; report what we have */
+			printf("  %-40s %8zu bytes\n", pk.assets[i].name, pk.assets[i].len);
+		}
+		rev_pack_free(&pk);
+		return 0;
+	}
+	printf("FAIL: unknown theme subcommand\n");
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -415,6 +556,8 @@ int main(int argc, char **argv)
 		return cmd_unpack(argc, argv);
 	if (strcmp(cmd, "pnginfo") == 0 && argc >= 3)
 		return cmd_pnginfo(argv[2]);
+	if (strcmp(cmd, "theme") == 0 && argc >= 3)
+		return cmd_theme(argc, argv);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
 		usage();
 		return 0;

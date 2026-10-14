@@ -38,6 +38,8 @@ typedef struct RTScene RTScene;
  * paths. Returns NULL with a message on validation errors. */
 RTScene *rtscene_compile(const RSceneIR *ir, RArena *ir_arena, const char *base_dir,
                          char *err, size_t errcap);
+
+
 void rtscene_free(RTScene *sc);
 
 const char *rtscene_title(const RTScene *sc);
@@ -113,5 +115,13 @@ void rtscene_flush_caches(RTScene *sc);
  * a pointer to `*len` bytes for `path`, or NULL to fall back to disk. */
 typedef const u8 *(*RTAssetFn)(void *ctx, const char *path, size_t *len);
 void rtscene_set_asset_provider(RTScene *sc, void *ctx, RTAssetFn fn);
+
+/* Same as rtscene_compile, but asset existence may ALSO be satisfied
+ * through a provider (theme folder cache or a packed container) — this is
+ * how packed themes load WITHOUT their assets existing on disk next to
+ * the pack. The provider is stored on the scene for decode-time use. */
+RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
+                                const char *base_dir, void *asset_ctx, RTAssetFn asset_fn,
+                                char *err, size_t errcap);
 
 #endif /* REV_SCENE_H */

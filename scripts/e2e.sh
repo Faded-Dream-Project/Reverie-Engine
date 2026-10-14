@@ -132,6 +132,45 @@ else
 fi
 stop_xvfb
 
+# ---- Themes: folder + packed + hostile rejection -----------------------------
+start_xvfb
+DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/theme" themes/ripple-lake \
+    > "$OUT/theme.log" 2>&1 || true
+if [ -f "$OUT/theme.png" ]; then
+    echo "    theme(folder): PASS (screenshot captured)"
+    PASS=$((PASS+1))
+else
+    echo "    theme(folder): FAIL (no screenshot)"
+    cat "$OUT/theme.log"
+    FAIL=$((FAIL+1))
+fi
+# packed theme — no extraction, byte-identical output expected
+./build/revtool theme pack themes/ripple-lake -o "$OUT/ripple-lake.revpack" \
+    > /dev/null 2>&1
+DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/themep" \
+    "$OUT/ripple-lake.revpack" > "$OUT/themep.log" 2>&1 || true
+if [ -f "$OUT/themep.png" ] && cmp -s "$OUT/themep.png" "$OUT/theme.png"; then
+    echo "    theme(packed): PASS (byte-identical to the folder render)"
+    PASS=$((PASS+1))
+else
+    echo "    theme(packed): FAIL (missing or differing screenshot)"
+    cat "$OUT/themep.log"
+    FAIL=$((FAIL+1))
+fi
+# corrupt pack: must exit with an error, never crash
+head -c 200 "$OUT/ripple-lake.revpack" > "$OUT/corrupt.revpack"
+DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu "$OUT/corrupt.revpack" \
+    > "$OUT/corrupt.log" 2>&1
+if [ $? -ne 0 ] && grep -qE "not a \.revpack|pack truncated|CRC mismatch" "$OUT/corrupt.log"; then
+    echo "    theme(corrupt): PASS (rejected with a clear error)"
+    PASS=$((PASS+1))
+else
+    echo "    theme(corrupt): FAIL (accepted a corrupt pack?)"
+    cat "$OUT/corrupt.log"
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
 # ---- Vulkan tier: default present path (platform SHM) -----------------------
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R vulkan --shot 3 "$OUT/vk" "$SCENE" \

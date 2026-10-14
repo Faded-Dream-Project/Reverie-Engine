@@ -1,0 +1,14 @@
+{
+  "id": "fluid-aurora",
+  "name": "Aurora Fluid",
+  "description": "A pure-geometry aurora: deep radial sky, a slowly rotating screen-blended light band, and a bright interactive fluid on top. No image assets.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0",
+  "quality": [
+    { "name": "low",    "fps": 30, "resolution_scale": 0.75 },
+    { "name": "medium", "fps": 60, "resolution_scale": 1.0 },
+    { "name": "high",   "fps": 60, "resolution_scale": 1.0 }
+  ]
+}

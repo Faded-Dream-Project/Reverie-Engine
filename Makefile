@@ -40,6 +40,8 @@ CORE_SRC = \
 	src/raster.c \
 	src/svg.c \
 	src/rev.c \
+	src/json.c \
+	src/theme.c \
 	src/scene.c \
 	src/composite.c \
 	src/fluid.c \

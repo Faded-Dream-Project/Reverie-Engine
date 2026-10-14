@@ -70,11 +70,12 @@ bool rev_pack_load(const char *path, RevPack *pk, char *err, size_t errcap)
 	const u8 *f = pk->file;
 
 	u32 ver = (u32)f[6] | ((u32)f[7] << 8);
-	if (memcmp(f, REV_PACK_MAGIC, 6) != 0 || ver != REV_PACK_VERSION) {
+	if (memcmp(f, REV_PACK_MAGIC, 6) != 0 || (ver != 1 && ver != 2)) {
 		snprintf(err, errcap, "'%s' is not a .revpack (bad magic/version)", path);
 		rev_pack_free(pk);
 		return false;
 	}
+	u32 max_assets = ver >= 2 ? REV_PACK_MAX_FILES : REV_PACK_MAX_ASSETS;
 
 	u32 scene_off = pk_get32(f + 8);
 	u32 scene_len = pk_get32(f + 12);
@@ -90,7 +91,7 @@ bool rev_pack_load(const char *path, RevPack *pk, char *err, size_t errcap)
 		return false;
 	}
 
-	if (n_assets > REV_PACK_MAX_ASSETS) {
+	if (n_assets > max_assets) {
 		snprintf(err, errcap, "pack has too many assets (%u)", n_assets);
 		rev_pack_free(pk);
 		return false;
@@ -132,6 +133,26 @@ bool rev_pack_load(const char *path, RevPack *pk, char *err, size_t errcap)
 			snprintf(err, errcap, "pack asset %u has a bad name", i);
 			rev_pack_free(pk);
 			return false;
+		}
+		/* entry names are resource paths: reject traversal, absolute
+		 * paths, and control characters outright (a hostile pack must
+		 * never escape its reader) */
+		{
+			const char *nm = (const char *)names + no;
+			bool safe = true;
+			for (const char *c = nm; c < nm + nl - 1; c++) {
+				if ((unsigned char)*c < 0x20 || *c == '\\') {
+					safe = false;
+					break;
+				}
+			}
+			if (nm[0] == '/' || strstr(nm, "..") != NULL)
+				safe = false;
+			if (!safe) {
+				snprintf(err, errcap, "pack entry %u has an unsafe path", i);
+				rev_pack_free(pk);
+				return false;
+			}
 		}
 
 		pk->assets[i].name = (const char *)names + no;

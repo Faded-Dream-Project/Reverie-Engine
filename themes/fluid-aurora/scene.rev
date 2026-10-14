@@ -1,0 +1,45 @@
+/* Reverie Engine — "Aurora Fluid"
+   A pure-geometry aurora: deep radial sky, a slowly rotating screen-blended
+   light band, and a bright interactive fluid on top. No image assets. */
+
+scene "Aurora Fluid" {
+    fps = 60
+
+    layer bg {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.62)
+        radius = 1.2
+        stops = [#040817, (#0c1b3c 0.55), (#0e2449 1.0)]
+    }
+
+    layer band {
+        type = gradient
+        shape = linear
+        angle = 200
+        stops = [#00000000, (#274b8f66 0.42), (#3f6fbf88 0.58), #00000000]
+        blend = screen
+        anim angle { from = 160; to = 300; dur = 44s; ease = sine; mode = pingpong }
+    }
+
+    layer aurora {
+        type = fluid
+        res = 0.5
+        dye = #46f2c8
+        dye2 = #b46bff
+        force = 12
+        radius = 0.012
+        dissipation = 0.05
+        ambient = 0.4
+        blend = screen
+        opacity = 0.9
+    }
+
+    layer vignette {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.5)
+        radius = 1.1
+        stops = [#00000000, (#02040c66 0.72), (#02040ccc 1.0)]
+    }
+}

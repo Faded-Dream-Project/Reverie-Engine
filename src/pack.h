@@ -28,8 +28,13 @@
 #include "rev_types.h"
 
 #define REV_PACK_MAGIC "REVPAK"
-#define REV_PACK_VERSION 1
-#define REV_PACK_MAX_ASSETS 128
+/* v1: scene + flat-ish asset list (written by `revtool pack`).
+ * v2: theme container — the same entry table with nested relative paths,
+ * a theme.json entry, and the entry scene in the scene slot. Readers
+ * accept both; writers emit v2. */
+#define REV_PACK_VERSION 2
+#define REV_PACK_MAX_ASSETS 128      /* v1 cap                                    */
+#define REV_PACK_MAX_FILES 512       /* v2 cap (theme packs)                      */
 
 typedef struct {
 	u8 *file;                    /* whole file in memory (owned)        */

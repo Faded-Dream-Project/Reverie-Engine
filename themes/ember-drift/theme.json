@@ -1,0 +1,9 @@
+{
+  "id": "ember-drift",
+  "name": "Ember Drift",
+  "description": "A dark, warm vignette with rising embers; clicking spawns sparks.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0"
+}

@@ -21,6 +21,7 @@
 #include "render.h"
 #include "rev.h"
 #include "scene.h"
+#include "theme.h"
 #include "util.h"
 
 static volatile sig_atomic_t g_run = 1;
@@ -62,7 +63,7 @@ static void usage(void)
         printf(
 "reverie " REV_VERSION " — interactive wallpaper engine\n"
 "\n"
-"usage: reverie [options] <scene.rev | scene.revpack>\n"
+"usage: reverie [options] <scene.rev | theme dir | theme.revpack>\n"
 "\n"
 "options:\n"
 "  -R, --renderer R    force renderer: auto | vulkan | opengl | cpu\n"
@@ -106,11 +107,19 @@ typedef struct {
         char path[512];
         RevPack pack;        /* valid when loaded from a .revpack */
         bool pack_used;
+        RTheme *theme;       /* valid when loaded as a theme       */
 } SceneFile;
 
 static const u8 *pack_asset_lookup(void *ctx, const char *path, size_t *len)
 {
         return rev_pack_asset((const RevPack *)ctx, path, len);
+}
+
+static const u8 *theme_asset_lookup(void *ctx, const char *path, size_t *len)
+{
+        /* scene asset paths are theme-relative; a leading "assets/" is the
+         * theme convention but scenes may reference any theme resource */
+        return theme_asset((RTheme *)ctx, path, len);
 }
 
 static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
@@ -121,6 +130,70 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
         RArena *ar = NULL;
         RSceneIR *ir = NULL;
         RevPack pk;
+
+        /* theme? (folder with theme.json, or a packed theme .revpack) —
+         * one resource interface serves both; the scene loader never
+         * learns which it is reading from */
+        {
+                RTheme *th = theme_load(path, err, errcap);
+                if (th) {
+                        if (!theme_engine_ok(theme_meta(th), err, errcap)) {
+                                theme_free(th);
+                                return false;
+                        }
+                        const char *stext = theme_scene_text(th, &len);
+                        u8 *scopy = (u8 *)malloc(len + 1);
+                        if (!scopy) {
+                                theme_free(th);
+                                snprintf(err, errcap, "out of memory");
+                                return false;
+                        }
+                        memcpy(scopy, stext, len);
+                        scopy[len] = 0;
+                        ar = NULL;
+                        ir = rev_parse_scene((const char *)scopy, len, &ar, err, errcap);
+                        if (!ir) {
+                                free(scopy);
+                                theme_free(th);
+                                return false;
+                        }
+                        RTScene *sc = rtscene_compile_assets(ir, ar, theme_base_dir(th),
+                                                             th, theme_asset_lookup,
+                                                             err, errcap);
+                        if (!sc) {
+                                arena_destroy(ar);
+                                free(scopy);
+                                theme_free(th);
+                                return false;
+                        }
+                        /* free the previous scene, if any */
+                        if (sf->sc)
+                                rtscene_free(sf->sc);
+                        if (sf->ir_arena)
+                                arena_destroy(sf->ir_arena);
+                        if (sf->pack_used)
+                                rev_pack_free(&sf->pack);
+                        if (sf->theme)
+                                theme_free(sf->theme);
+                        /* packed themes resolve assets through the container;
+                         * folder themes may ALSO use the provider (relative
+                         * paths hit the theme root first, disk second) */
+                        rtscene_set_asset_provider(sc, th, theme_asset_lookup);
+                        sf->theme = th;
+                        sf->sc = sc;
+                        sf->ir_arena = ar;
+                        sf->ir = ir;
+                        sf->pack_used = false;
+                        free(scopy);
+                        snprintf(sf->path, sizeof sf->path, "%s", path);
+                        sf->mtime = rev_file_mtime(path);
+                        return true;
+                }
+                /* not a theme — fall through to the plain scene paths */
+                if (err)
+                        err[0] = 0;
+        }
+
         bool is_pack = rev_pack_probe(path);
 
         if (is_pack) {
@@ -151,7 +224,12 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
                 return false;
         }
 
-        RTScene *sc = rtscene_compile(ir, ar, base_dir, err, errcap);
+        /* packs resolve assets through the container at compile AND decode
+         * time — loading a pack must not require the assets on disk */
+        RTScene *sc = rtscene_compile_assets(ir, ar, base_dir,
+                                             is_pack ? (void *)&pk : NULL,
+                                             is_pack ? pack_asset_lookup : NULL,
+                                             err, errcap);
         if (!sc) {
                 arena_destroy(ar);
                 if (is_pack)
@@ -166,6 +244,9 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
                 arena_destroy(sf->ir_arena);
         if (sf->pack_used)
                 rev_pack_free(&sf->pack);
+        if (sf->theme)
+                theme_free(sf->theme);
+        sf->theme = NULL;
 
         if (is_pack) {
                 /* route asset loads through the pack first, disk second */
@@ -388,6 +469,8 @@ int main(int argc, char **argv)
                 rtscene_free(sf.sc);
                 if (sf.pack_used)
                         rev_pack_free(&sf.pack);
+                if (sf.theme)
+                        theme_free(sf.theme);
                 arena_destroy(sf.ir_arena);
                 free(base_dir);
                 return 1;
@@ -756,6 +839,8 @@ int main(int argc, char **argv)
         rtscene_free(sf.sc);
         if (sf.pack_used)
                 rev_pack_free(&sf.pack);
+        if (sf.theme)
+                theme_free(sf.theme);
         arena_destroy(sf.ir_arena);
         free(base_dir);
         return 0;

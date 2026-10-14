@@ -215,6 +215,13 @@ static bool fail(char *err, size_t cap, const char *fmt, ...)
 RTScene *rtscene_compile(const RSceneIR *ir, RArena *ir_arena, const char *base_dir,
                          char *err, size_t errcap)
 {
+        return rtscene_compile_assets(ir, ir_arena, base_dir, NULL, NULL, err, errcap);
+}
+
+RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
+                                const char *base_dir, void *asset_ctx, RTAssetFn asset_fn,
+                                char *err, size_t errcap)
+{
         if (!ir)
                 return NULL;
 
@@ -222,6 +229,8 @@ RTScene *rtscene_compile(const RSceneIR *ir, RArena *ir_arena, const char *base_
         sc->fps = 30;
         sc->ir_arena = ir_arena;
         sc->base_dir = base_dir ? strdup(base_dir) : strdup(".");
+        sc->asset_ctx = asset_ctx;
+        sc->asset_fn = asset_fn;
 
         const RVal *v;
         if ((v = getp(ir->props, ir->nprops, "fps"))) {
@@ -334,7 +343,18 @@ RTScene *rtscene_compile(const RSceneIR *ir, RArena *ir_arena, const char *base_
                         if (!val_str(getp(L->props, L->nprops, "src"), &s) || !*s)
                                 { fail(err, errcap, "layer '%s': image layers need src = \"file\"", rt->name); goto bad; }
                         char *path = rev_path_join(base_dir, s);
-                        if (!rev_file_exists(path))
+                        /* existence: on disk next to the scene, OR through
+                         * the asset provider (theme folder cache / packed
+                         * container) — packed themes must load without
+                         * extraction */
+                        bool have = rev_file_exists(path);
+                        if (!have && asset_fn && s[0] && s[0] != '/') {
+                                char rel[512];
+                                snprintf(rel, sizeof rel, "%s", s);
+                                if (asset_fn(asset_ctx, rel, NULL))
+                                        have = true;
+                        }
+                        if (!have)
                                 { fail(err, errcap, "layer '%s': asset not found: %s", rt->name, path); goto bad; }
                         rt->src = path;
                         if ((v = getp(L->props, L->nprops, "fit"))) {

@@ -1,0 +1,9 @@
+{
+  "id": "mountain-dusk",
+  "name": "Mountain Dusk",
+  "description": "Hand-drawn SVG ridgeline with stars, a parallax mountain layer, and a soft interactive mist fluid drifting through the valley.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0"
+}
