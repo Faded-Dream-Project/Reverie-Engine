@@ -18,12 +18,14 @@
 #include <string.h>
 
 #include "log.h"
+#include "util.h"
 
 typedef struct {
 	RPlatform *p;
 	RFb fb[REV_PLATFORM_MAX_OUTPUTS];
 	int cur_win;
 	u32 cur_w, cur_h;
+	f64 perf_present_ms;	/* wall time inside present_cpu (read-reset) */
 } RenderCpu;
 
 static bool cpu_init(RRenderer *r, RPlatform *p, char *err, size_t errcap)
@@ -109,7 +111,21 @@ static bool cpu_end(RRenderer *r, const RFb *cpu_frame)
 	const RFb *fb = cpu_frame ? cpu_frame : &c->fb[c->cur_win];
 	if (!fb || !fb->px)
 		return false;
-	return c->p->present_cpu(c->p, c->cur_win, fb->px, fb->w, fb->h);
+	f64 t0 = rev_monotonic();
+	bool ok = c->p->present_cpu(c->p, c->cur_win, fb->px, fb->w, fb->h);
+	c->perf_present_ms += (rev_monotonic() - t0) * 1000.0;
+	return ok;
+}
+
+static bool cpu_perf(RRenderer *r, f64 *cpu_ms, f64 *gpu_ms)
+{
+	RenderCpu *c = (RenderCpu *)r->ctx;
+	if (cpu_ms)
+		*cpu_ms = c->perf_present_ms;
+	if (gpu_ms)
+		*gpu_ms = 0.0;	/* no GPU on this tier */
+	c->perf_present_ms = 0;
+	return true;
 }
 
 static void cpu_resize(RRenderer *r, int win, u32 w, u32 h)
@@ -144,5 +160,6 @@ RRenderer *render_cpu_create(void)
 	r->layer = cpu_layer;
 	r->end = cpu_end;
 	r->resize = cpu_resize;
+	r->perf = cpu_perf;
 	return r;
 }

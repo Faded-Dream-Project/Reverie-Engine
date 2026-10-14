@@ -40,6 +40,7 @@
 
 #include "log.h"
 #include "platform.h"
+#include "util.h"
 #include "wlshim.h"
 
 /* ---- EGL constants (Khronos registry values) ---------------------------- */
@@ -64,6 +65,7 @@
 
 /* ---- GL constants -------------------------------------------------------- */
 #define GL_TRIANGLES 0x0004
+#define GL_POINTS 0x0000
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_NEAREST 0x2600
 #define GL_LINEAR 0x2601
@@ -108,6 +110,15 @@ typedef char GLchar_;
 typedef unsigned int GLenum_;
 typedef unsigned char GLboolean_;
 typedef float GLfloat_;
+typedef unsigned long long GLuint64_;
+
+/* ---- EXT_disjoint_timer_query (optional: real GPU execution timings) ------
+ * Queried through eglGetProcAddress, both EXT-suffixed (the spec name for
+ * ES contexts) and plain desktop names. GPU work is ASYNCHRONOUS: results
+ * are polled one frame late and never force a flush or finish. */
+#define GL_TIME_ELAPSED_Q 0x88BF
+#define GL_QUERY_RESULT_Q 0x8866
+#define GL_QUERY_RESULT_AVAILABLE_Q 0x8867
 
 /* ---- GL function table --------------------------------------------------- */
 typedef struct {
@@ -154,6 +165,12 @@ typedef struct {
         GLenum_ (*glGetError)(void);
         void (*glReadPixels)(GLint_, GLint_, GLsizei_, GLsizei_, GLenum_, GLenum_, void *);
         const GLchar_ *(*glGetString)(GLenum_);
+
+        /* EXT_disjoint_timer_query (optional) */
+        void (*glGenQueriesQ)(GLsizei_, GLuint_ *);
+        void (*glBeginQueryQ)(GLenum_, GLuint_);
+        void (*glEndQueryQ)(GLenum_);
+        void (*glGetQueryObjectu64vQ)(GLuint_, GLenum_, GLuint64_ *);
 } GL;
 
 #define LOADGL(fn, name) \
@@ -610,6 +627,17 @@ typedef struct {
         int cur_win;
         bool software;    /* llvmpipe/softpipe/swrast detected */
         bool gl_loaded;   /* GL function table is valid            */
+
+        /* perf counters (read-and-reset through ->perf):
+         * upload wall time is a SUBSET of the caller's render measurement;
+         * GPU timings come from one GL_TIME_ELAPSED query per window,
+         * polled one frame late — never a glFinish. */
+        f64 perf_upload_ms;
+        f64 perf_gpu_ms_sum;
+        u32 perf_gpu_samples;
+        bool tq_have;
+        GLuint_ tq[REV_PLATFORM_MAX_OUTPUTS];
+        bool tq_active[REV_PLATFORM_MAX_OUTPUTS];
 } RenderGL;
 
 /* ---- small helpers -------------------------------------------------------- */
@@ -1088,8 +1116,10 @@ static GLuint_ upload_layer_tex(RenderGL *r, const RLayerCmd *cmd)
                 slot->h = cmd->h;
         }
         g->glBindTexture(GL_TEXTURE_2D, slot->tex);
+        f64 up_t0 = rev_monotonic();
         g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cmd->w, (int)cmd->h,
                            GL_RGBA, GL_UNSIGNED_BYTE, cmd->px);
+        r->perf_upload_ms += (rev_monotonic() - up_t0) * 1000.0;
         slot->id = cmd->content_id;    /* 0 = never matches a cached lookup */
         slot->stamp = r->cache_clock;
         return slot->tex;
@@ -1356,6 +1386,27 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         g->glDisable(0x0BE2 /* GL_BLEND */);
         r->gl_loaded = true;
 
+        /* GPU timer queries (EXT_disjoint_timer_query): EXT names first —
+         * they are the spec spellings on ES contexts — then the desktop
+         * plain names. Missing any -> GPU timings honestly unavailable. */
+        *(void **)&g->glGenQueriesQ = g->eglGetProcAddress("glGenQueriesEXT");
+        if (!g->glGenQueriesQ)
+                *(void **)&g->glGenQueriesQ = g->eglGetProcAddress("glGenQueries");
+        *(void **)&g->glBeginQueryQ = g->eglGetProcAddress("glBeginQueryEXT");
+        if (!g->glBeginQueryQ)
+                *(void **)&g->glBeginQueryQ = g->eglGetProcAddress("glBeginQuery");
+        *(void **)&g->glEndQueryQ = g->eglGetProcAddress("glEndQueryEXT");
+        if (!g->glEndQueryQ)
+                *(void **)&g->glEndQueryQ = g->eglGetProcAddress("glEndQuery");
+        *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64vEXT");
+        if (!g->glGetQueryObjectu64vQ)
+                *(void **)&g->glGetQueryObjectu64vQ = g->eglGetProcAddress("glGetQueryObjectu64v");
+        r->tq_have = g->glGenQueriesQ && g->glBeginQueryQ && g->glEndQueryQ &&
+                     g->glGetQueryObjectu64vQ;
+        if (r->tq_have)
+                LOGI("opengl: GPU timer queries available (REV_PROFILE reports "
+                     "async GPU timings)");
+
         const char *rend = (const char *)g->glGetString(GL_RENDERER);
         if (rend && (strstr(rend, "llvmpipe") || strstr(rend, "softpipe") || strstr(rend, "swrast"))) {
                 r->software = true;
@@ -1561,6 +1612,29 @@ static bool gl_begin(RRenderer *rr, int win, u32 w, u32 h)
         g->glViewport(0, 0, (int)w, (int)h);
         g->glClearColor(0, 0, 0, 0);
         g->glClear(GL_COLOR_BUFFER_BIT);
+
+        /* GPU frame timing: poll LAST frame's query (non-blocking; results
+         * lag one frame — asynchronous execution, reported as such), then
+         * arm this frame's. One query object per window. */
+        if (r->tq_have) {
+                GLuint_ q = r->tq[win];
+                if (q && r->tq_active[win]) {
+                        GLuint64_ avail = 0, res = 0;
+                        g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_AVAILABLE_Q, &avail);
+                        if (avail) {
+                                g->glGetQueryObjectu64vQ(q, GL_QUERY_RESULT_Q, &res);
+                                r->perf_gpu_ms_sum += (f64)res / 1000000.0;
+                                r->perf_gpu_samples++;
+                        }
+                        r->tq_active[win] = false;
+                }
+                if (!q)
+                        g->glGenQueriesQ(1, &r->tq[win]);
+                if (r->tq[win]) {
+                        g->glBeginQueryQ(GL_TIME_ELAPSED_Q, r->tq[win]);
+                        r->tq_active[win] = true;
+                }
+        }
         return true;
 }
 
@@ -1764,8 +1838,10 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
                 if (!ensure_tex(g, &r->tex_src, &r->src_w, &r->src_h, cpu_frame->w, cpu_frame->h, false))
                         return false;
                 g->glBindTexture(GL_TEXTURE_2D, r->tex_src);
+                f64 up_t0 = rev_monotonic();
                 g->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (int)cpu_frame->w, (int)cpu_frame->h,
                                    GL_RGBA, GL_UNSIGNED_BYTE, cpu_frame->px);
+                r->perf_upload_ms += (rev_monotonic() - up_t0) * 1000.0;
                 g->glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 g->glViewport(0, 0, (int)r->win[win].w, (int)r->win[win].h);
                 g->glUseProgram(r->prog[PROG_PRESENT]);
@@ -1793,7 +1869,24 @@ static bool gl_end(RRenderer *rr, const RFb *cpu_frame)
                 draw_full(g);
         }
         r->frame_no++;
-        return r->eglSwapBuffers(r->dpy, r->win[win].surf) != 0;
+        bool swapped = r->eglSwapBuffers(r->dpy, r->win[win].surf) != 0;
+        if (r->tq_have && r->tq_active[win])
+                g->glEndQueryQ(GL_TIME_ELAPSED_Q);
+        return swapped;
+}
+
+static bool gl_perf(RRenderer *rr, f64 *cpu_ms, f64 *gpu_ms)
+{
+        RenderGL *r = (RenderGL *)rr->ctx;
+        if (cpu_ms)
+                *cpu_ms = r->perf_upload_ms;
+        if (gpu_ms)
+                *gpu_ms = r->perf_gpu_samples ?
+                          r->perf_gpu_ms_sum / (f64)r->perf_gpu_samples : 0.0;
+        r->perf_upload_ms = 0;
+        r->perf_gpu_ms_sum = 0;
+        r->perf_gpu_samples = 0;
+        return true;
 }
 
 static void gl_resize(RRenderer *rr, int win, u32 w, u32 h)
@@ -1907,5 +2000,6 @@ RRenderer *render_gl_create(void)
         rr->layer = gl_layer;
         rr->end = gl_end;
         rr->resize = gl_resize;
+        rr->perf = gl_perf;
         return rr;
 }

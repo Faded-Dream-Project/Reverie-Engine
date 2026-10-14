@@ -6,6 +6,7 @@
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,32 @@ static void on_signal(int sig)
 {
         (void)sig;
         g_run = 0;
+}
+
+/* ---- perf stats helpers ---------------------------------------------------- */
+
+#define PERF_RING 512
+
+static void perf_sort(f64 *a, u32 n)
+{
+        /* insertion sort: n <= 512, called once per 5s window — plenty */
+        for (u32 i = 1; i < n; i++) {
+                f64 v = a[i];
+                i32 j = (i32)i - 1;
+                while (j >= 0 && a[j] > v) {
+                        a[j + 1] = a[j];
+                        j--;
+                }
+                a[j + 1] = v;
+        }
+}
+
+static f64 perf_pct(const f64 *sorted, u32 n, f64 p)
+{
+        if (n == 0)
+                return 0.0;
+        u32 idx = (u32)(p * (f64)(n - 1) + 0.5);
+        return sorted[idx];
 }
 
 static void usage(void)
@@ -401,11 +428,35 @@ int main(int argc, char **argv)
         u64 last_drops = 0;
         bool shot_done = false;
         RTFrameList fl;
-        /* REV_PROFILE=1: stage breakdown appended to the periodic perf line
-         * (sim / raster ms from the scene, render+present wall time) — the
-         * field-triage tool for "why is my wallpaper slow" reports. */
+        /* REV_PROFILE=1: stage breakdown appended to the periodic perf line.
+         * Averages LIE on a contended box (one 300ms stall poisons a 5s
+         * mean while fps barely moves), so frame times ALSO report
+         * p50/p95/max from a ring buffer, and GPU time comes from the
+         * renderer's ASYNC timer queries — labeled as such, never conflated
+         * with CPU wall time. This is the field-triage tool for "why is my
+         * wallpaper slow" reports. */
         const bool prof_on = getenv("REV_PROFILE") != NULL;
         f64 prof_sim = 0, prof_raster = 0, prof_render = 0;
+        f64 prof_upload = 0, prof_gpu = 0;
+        u32 prof_gpu_n = 0;
+        bool gpu_note_shown = false;
+        f64 frame_ms[PERF_RING];
+        u32 nframe_ms = 0;
+
+        /* REV_FAKE_POINTER=<speed>: TEST/ BENCH hook — synthesizes a pressed
+         * pointer moving on a Lissajous path (speed = circuits/s) so
+         * interactive scenes (fluid drag, ripple refraction, spawn=both
+         * particles) can be benchmarked headlessly under Xvfb. Never active
+         * unless the env var is set explicitly. */
+        f64 fake_ptr_speed = 0;
+        {
+                const char *fp = getenv("REV_FAKE_POINTER");
+                if (fp && *fp)
+                        fake_ptr_speed = atof(fp);
+        }
+        f64 fpx = 0.5, fpy = 0.5;
+        if (fake_ptr_speed > 0)
+                LOGI("fake pointer active (test hook): %.2f circuit/s", fake_ptr_speed);
 
         while (g_run) {
                 f64 now = rev_monotonic();
@@ -417,6 +468,8 @@ int main(int argc, char **argv)
                  * effectively froze (only wall-clock-t animations moved). */
                 last_frame = now;
                 f64 t = now - t0;
+                if (prof_on && nframe_ms < PERF_RING)
+                        frame_ms[nframe_ms++] = dt * 1000.0;
 
                 plat->pump(plat);
                 if (plat->should_close(plat))
@@ -459,6 +512,20 @@ int main(int argc, char **argv)
                                                       (ptr.click_x - mons[i].x) * fb_scale[i],
                                                       (ptr.click_y - mons[i].y) * fb_scale[i]);
                         }
+                }
+
+                /* synthetic pointer (test hook): overrides the real one —
+                 * benchmarks need a deterministic drag, not a resting cursor */
+                if (fake_ptr_speed > 0) {
+                        f64 nx = 0.5 + 0.36 * sin(2.0 * M_PI * 0.13 * fake_ptr_speed * t);
+                        f64 ny = 0.5 + 0.30 * sin(2.0 * M_PI * 0.21 * fake_ptr_speed * t);
+                        for (int i = 0; i < nmon; i++) {
+                                rtscene_pointer(sf.sc, i, nx * fbs[i].w, ny * fbs[i].h,
+                                                (nx - fpx) * fbs[i].w,
+                                                (ny - fpy) * fbs[i].h, true);
+                        }
+                        fpx = nx;
+                        fpy = ny;
                 }
 
                 /* render + present */
@@ -506,6 +573,20 @@ int main(int argc, char **argv)
                                 rend->end(rend, &fbs[i]);
                         }
                         prof_render += rev_monotonic() - r_t0;
+                }
+
+                /* renderer-side counters (once per frame, after all windows):
+                 * upload wall time (a SUBSET of render above) and the async
+                 * GPU timer result for the PREVIOUS frame */
+                if (rend->perf) {
+                        f64 up = 0, gp = 0;
+                        if (rend->perf(rend, &up, &gp)) {
+                                prof_upload += up;
+                                if (gp > 0) {
+                                        prof_gpu += gp;
+                                        prof_gpu_n++;
+                                }
+                        }
                 }
 
                 /* test hook: screenshot */
@@ -556,13 +637,43 @@ int main(int argc, char **argv)
                  * still held when the next frame was ready) */
                 if (now - last_stat >= 5.0) {
                         u64 drops = plat->dropped_frames ? plat->dropped_frames(plat) : 0;
-                        LOGI("perf: %.1f fps", (f64)frames / (now - last_stat));
-                        if (prof_on)
-                                LOGI("perf: sim=%.1fms raster=%.1fms render+present=%.1fms"
-                                     " (per frame, avg)",
-                                     prof_sim / (frames ? frames : 1),
-                                     prof_raster / (frames ? frames : 1),
-                                     prof_render / (frames ? frames : 1) * 1000.0);
+                        f64 win = now - last_stat;
+                        f64 fps = (f64)frames / win;
+                        LOGI("perf: %.1f fps", fps);
+                        if (prof_on) {
+                                f64 nf = frames ? (f64)frames : 1;
+                                LOGI("perf: sim=%.1fms raster=%.1fms render=%.1fms "
+                                     "(incl upload=%.1fms) gpu=%.1fms*",
+                                     prof_sim / nf, prof_raster / nf,
+                                     prof_render / nf * 1000.0,
+                                     prof_upload / nf,
+                                     prof_gpu_n ? prof_gpu / (f64)prof_gpu_n : 0.0);
+                                if (!gpu_note_shown) {
+                                        gpu_note_shown = true;
+                                        if (prof_gpu_n == 0)
+                                                LOGI("perf: *gpu timing unavailable "
+                                                     "(renderer/driver lacks timer queries)");
+                                        else
+                                                LOGI("perf: *gpu = async driver timer, "
+                                                     "one frame behind — not CPU wall time");
+                                }
+                                /* frame-time distribution: the avg hides
+                                 * multi-hundred-ms stalls; p95/max expose
+                                 * them, p50 shows the typical frame */
+                                f64 tmp[PERF_RING];
+                                u32 nn = nframe_ms < PERF_RING ? nframe_ms : PERF_RING;
+                                f64 avg = 0;
+                                for (u32 i = 0; i < nn; i++)
+                                        avg += frame_ms[i];
+                                if (nn)
+                                        avg /= (f64)nn;
+                                memcpy(tmp, frame_ms, nn * sizeof *tmp);
+                                perf_sort(tmp, nn);
+                                LOGI("perf: frame avg=%.1f p50=%.1f p95=%.1f max=%.1f ms",
+                                     avg, perf_pct(tmp, nn, 0.50),
+                                     perf_pct(tmp, nn, 0.95),
+                                     nn ? tmp[nn - 1] : 0.0);
+                        }
                         if (drops > last_drops) {
                                 LOGI("perf: %llu frame(s) dropped by the compositor",
                                      (unsigned long long)(drops - last_drops));
@@ -570,6 +681,9 @@ int main(int argc, char **argv)
                         }
                         frames = 0;
                         prof_sim = prof_raster = prof_render = 0;
+                        prof_upload = prof_gpu = 0;
+                        prof_gpu_n = 0;
+                        nframe_ms = 0;
                         last_stat = now;
                 }
 

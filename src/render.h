@@ -91,6 +91,18 @@ struct RRenderer {
         bool (*end)(RRenderer *r, const RFb *cpu_frame);
         void (*resize)(RRenderer *r, int win, u32 w, u32 h);
 
+        /* Optional perf counters (read-and-reset, once per frame):
+         *   cpu_ms — renderer CPU wall time that is a SUBSET of the caller's
+         *            render measurement (GL: texture uploads; CPU tier: the
+         *            present call). Lets REV_PROFILE break render= into its
+         *            expensive parts.
+         *   gpu_ms — ASYNCHRONOUS GPU execution time for the PREVIOUS frame,
+         *            measured with driver timer queries where available.
+         *            GPU work is queued, not synchronous: this number lags
+         *            one frame behind and is 0.0 (not a lie, just unknown)
+         *            on renderers without timer support. NULL = unimplemented. */
+        bool (*perf)(RRenderer *r, f64 *cpu_ms, f64 *gpu_ms);
+
         void *ctx;                 /* implementation-private state       */
 };
 

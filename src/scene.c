@@ -893,6 +893,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                  * polls still makes a splash */
                                 for (u32 c = 0; c < clicks; c++)
                                         ripple_click(in->ripple, click_x, click_y);
+                                f64 ms = rev_monotonic();
                                 ripple_step(in->ripple, dt);
                                 if (!below_snap)
                                         below_snap = (u32 *)malloc((size_t)fb->w * fb->h * 4);
@@ -907,6 +908,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         ripple_apply(in->ripple, below_snap, scratch.px);
                                         srcfb = &scratch;
                                 }
+                                sc->prof_sim_ms += (rev_monotonic() - ms) * 1000.0;
                         }
                 } else if (L->type == LT_FLUID) {
                         if (fl && fl->sim_offload) {
@@ -1029,8 +1031,10 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                         target = &scratch;
                                 }
                                 if (target->px) {
+                                        f64 ms2 = rev_monotonic();
                                         memset(target->px, 0, (size_t)W * H * 4);
                                         particles_render(in->parts, target->px, (u32)W, (u32)H);
+                                        sc->prof_sim_ms += (rev_monotonic() - ms2) * 1000.0;
                                         srcfb = target;
                                 }
                         }
