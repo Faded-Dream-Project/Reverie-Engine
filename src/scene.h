@@ -78,10 +78,15 @@ typedef struct {
         bool point_offload; /* renderer rasterizes particle layers as GPU
                                point sprites (input flag; llvmpipe keeps the
                                CPU sprite raster — wide points crawl there) */
+        bool grad_offload;  /* renderer evaluates gradient layers in shaders
+                               (input flag; only when wants_grads) */
 } RTFrameList;
 
 /* True when the scene contains at least one particle layer. */
 bool rtscene_has_particles(const RTScene *sc);
+
+/* True when the scene contains at least one gradient layer. */
+bool rtscene_has_gradients(const RTScene *sc);
 
 /* True when the frame can be built as an independent layer list for GPU
  * compositing. Ripple layers need the renderer to own simulations (their

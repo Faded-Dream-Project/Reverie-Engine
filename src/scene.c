@@ -101,6 +101,8 @@ struct RTLayerInst {
         RSimParticles pdesc;
         f32 *pband;
         u32 pband_slots;
+        /* GPU gradient offload descriptor (address-stable) */
+        RGradDesc gdesc;
         /* raster content serial — bumped on every (re)build; renderers
          * cache textures against it and skip redundant re-uploads */
         u64 content_id;
@@ -822,6 +824,16 @@ bool rtscene_has_particles(const RTScene *sc)
         return false;
 }
 
+bool rtscene_has_gradients(const RTScene *sc)
+{
+        if (!sc)
+                return false;
+        for (int i = 0; i < sc->n; i++)
+                if (sc->layers[i].type == LT_GRADIENT)
+                        return true;
+        return false;
+}
+
 bool rtscene_gpu_capable(const RTScene *sc, bool sim_offload)
 {
         if (!sc)
@@ -1166,6 +1178,85 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         }
                 } else {
                         /* static content with parallax oversize */
+                        if (L->type == LT_GRADIENT && fl && fl->grad_offload) {
+                                /* GPU gradient evaluation: emit the descriptor
+                                 * instead of rasterizing — the CPU LUT fill
+                                 * (~0.2ms at 1080p) and the full-frame upload
+                                 * (8MB) disappear; the renderer evaluates the
+                                 * gradient in a shader into a cached texture.
+                                 * Geometry mirrors build_gradient_raster() and
+                                 * stops mirror build_lut() (sorted + capped). */
+                                RGradDesc *gd = &in->gdesc;
+                                memset(gd, 0, sizeof *gd);
+                                gd->shape = L->gshape;
+                                gd->nstops = L->ngstops;
+                                for (int s = 0; s < L->ngstops; s++) {
+                                        gd->stops[s] = L->gstops[s];
+                                        gd->offs[s] = L->goffs[s];
+                                }
+                                /* sort stops by offset (insertion, <=16) */
+                                for (int s = 1; s < gd->nstops; s++) {
+                                        RColor c = gd->stops[s];
+                                        f64 o = gd->offs[s];
+                                        int j = s - 1;
+                                        while (j >= 0 && gd->offs[j] > o) {
+                                                gd->stops[j + 1] = gd->stops[j];
+                                                gd->offs[j + 1] = gd->offs[j];
+                                                j--;
+                                        }
+                                        gd->stops[j + 1] = c;
+                                        gd->offs[j + 1] = o;
+                                }
+                                f64 rw_g = (f64)W * (1.0 + e.parallax * 0.08);
+                                f64 rh_g = (f64)H * (1.0 + e.parallax * 0.08);
+                                if (gd->shape == 0) {
+                                        f64 rad = e.angle * M_PI / 180.0;
+                                        f64 dirx = cos(rad), diry = sin(rad);
+                                        f64 hx = fabs(dirx) * rw_g / 2 + fabs(diry) * rh_g / 2;
+                                        gd->p0x = rw_g / 2 - dirx * hx;
+                                        gd->p0y = rh_g / 2 - diry * hx;
+                                        gd->p1x = rw_g / 2 + dirx * hx;
+                                        gd->p1y = rh_g / 2 + diry * hx;
+                                } else {
+                                        gd->cx = L->gcx * rw_g;
+                                        gd->cy = L->gcy * rh_g;
+                                        gd->radius = L->gradius * (rw_g > rh_g ? rw_g : rh_g) * 0.5;
+                                }
+                                gd->frame_w = (u32)rw_g;
+                                gd->frame_h = (u32)rh_g;
+                                /* static gradients keep one stable serial (the
+                                 * renderer renders once); animated angles get
+                                 * a fresh serial per frame */
+                                bool angle_anim = false;
+                                for (int a = 0; a < L->nanims && !angle_anim; a++)
+                                        angle_anim = (L->anims[a].target == AT_ANGLE);
+                                u64 gid = angle_anim ? content_serial_next() : in->content_id;
+                                if (!angle_anim && !gid)
+                                        gid = in->content_id = content_serial_next();
+                                if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                        break;
+                                RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                memset(cmd, 0, sizeof *cmd);
+                                cmd->grad = gd;
+                                cmd->w = gd->frame_w;
+                                cmd->h = gd->frame_h;
+                                cmd->place_w = 0;
+                                cmd->place_h = 0;
+                                /* parallax placement like the raster path */
+                                f64 ox = (W - gd->frame_w) / 2.0 + (px - 0.5) * e.parallax * W * 0.04;
+                                f64 oy = (H - gd->frame_h) / 2.0 + (py - 0.5) * e.parallax * H * 0.04;
+                                cmd->dx = (i32)ox;
+                                cmd->dy = (i32)oy;
+                                cmd->blend = L->blend;
+                                cmd->opacity = e.opacity;
+                                cmd->blur = e.blur;
+                                cmd->linear = false;
+                                cmd->content_id = gid;
+                                cmd->sim = NULL;
+                                cmd->rsim = NULL;
+                                cmd->psim = NULL;
+                                continue;
+                        }
                         if (!in->raster_ok || in->raster.w != rw || in->raster.h != rh) {
                                 free(in->raster.px);
                                         free(in->sim_fb.px);

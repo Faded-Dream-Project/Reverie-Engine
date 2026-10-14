@@ -85,6 +85,24 @@ typedef struct {
         u32 frame_w, frame_h;  /* device-pixel size of the layer         */
 } RSimParticles;
 
+/* Gradient layer descriptor (GPU evaluation). The CPU rasterizes gradient
+ * layers at LUT speed but ANIMATED gradients rebuild a full-resolution
+ * raster every frame and upload it (8MB at 1080p); the renderer can instead
+ * evaluate the gradient directly in a shader into a cached texture — zero
+ * CPU raster, zero per-frame upload for static gradients, one fullscreen
+ * pass when the angle animates. Geometry is pre-resolved to PIXEL space
+ * exactly like build_gradient_raster(); stops are sorted+capped the way
+ * build_lut() does. */
+typedef struct {
+        int shape;             /* 0 linear, 1 radial                    */
+        f64 p0x, p0y, p1x, p1y; /* linear axis, pixels                 */
+        f64 cx, cy, radius;    /* radial center + radius, pixels        */
+        RColor stops[16];      /* sorted, offsets in offs[]             */
+        f64 offs[16];
+        int nstops;
+        u32 frame_w, frame_h;
+} RGradDesc;
+
 /* One layer emission (GPU compositing). Pixels are straight-alpha RGBA8
  * packed u32 — identical to RFb contents — UNLESS sim != NULL, in which case
  * px is NULL and the renderer owns that layer's simulation. */
@@ -110,6 +128,8 @@ typedef struct {
                                   unless this is a GPU ripple layer   */
         const RSimParticles *psim; /* particle layer rasterized on the
                                   GPU as point sprites; NULL otherwise */
+        const RGradDesc *grad;    /* gradient evaluated on the GPU; NULL
+                                  for plain pixel layers             */
 } RLayerCmd;
 
 typedef struct RRenderer RRenderer;
@@ -125,6 +145,10 @@ struct RRenderer {
                                wide-point rendering is pathologically slow
                                (llvmpipe); the CPU sprite raster is faster
                                there. Settled during init(), never after. */
+        bool wants_grads;   /* GPU shader evaluation of gradient layers
+                               (replaces the per-frame CPU raster + full-
+                               frame upload of animated gradients). False
+                               on software rasterizers. Settled at init. */
 
         bool (*init)(RRenderer *r, RPlatform *p, char *err, size_t errcap);
         void (*fini)(RRenderer *r);

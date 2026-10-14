@@ -422,6 +422,11 @@ int main(int argc, char **argv)
                 LOGI("particles: %s",
                      point_offload ? "GPU point sprites"
                                    : "CPU sprite raster");
+        const bool grad_offload = rend->wants_grads;
+        if (gpu_layers && rtscene_has_gradients(sf.sc))
+                LOGI("gradients: %s",
+                     grad_offload ? "GPU shader evaluation"
+                                  : "CPU rasterization");
 
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
@@ -545,6 +550,7 @@ int main(int argc, char **argv)
                                 fl.n = 0;
                                 fl.sim_offload = sim_offload;
                                 fl.point_offload = point_offload;
+                                fl.grad_offload = grad_offload;
                                 rtscene_render_layers(sf.sc, &fl, i, t, dt);
                                 f64 s_ms, ra_ms;
                                 rtscene_profile(sf.sc, &s_ms, &ra_ms);
@@ -569,6 +575,7 @@ int main(int argc, char **argv)
                                         cmd.sim = fl.cmds[k].sim;
                                         cmd.rsim = fl.cmds[k].rsim;
                                         cmd.psim = fl.cmds[k].psim;
+                                        cmd.grad = fl.cmds[k].grad;
                                         rend->layer(rend, &cmd);
                                 }
                                 rend->end(rend, NULL);

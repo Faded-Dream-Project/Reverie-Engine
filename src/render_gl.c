@@ -163,6 +163,7 @@ typedef struct {
         void (*glUniform3f)(GLint_, GLfloat_, GLfloat_, GLfloat_);
         void (*glUniform1fv)(GLint_, GLsizei_, const GLfloat_ *);
         void (*glUniform2fv)(GLint_, GLsizei_, const GLfloat_ *);
+        void (*glUniform4fv)(GLint_, GLsizei_, const GLfloat_ *);
         void (*glDrawArrays)(GLenum_, GLint_, GLsizei_);
         void (*glClearColor)(GLfloat_, GLfloat_, GLfloat_, GLfloat_);
         void (*glClear)(GLenum_);
@@ -666,12 +667,59 @@ static const char *FS_PARTICLES =
         "    fragColor = vec4(v_col, cov);\n"
         "}\n";
 
+/* ---- GPU gradient evaluation (GLSL ES 3.00) --------------------------------
+ * Mirrors build_lut()/paint_t(): linear t = projection onto the axis,
+ * radial t = |P - C| / r (scene radials are concentric), PAD spread, stops
+ * sorted with implicit end caps, straight-RGBA channel lerp. The CPU
+ * quantizes t through a 256-entry LUT; the shader evaluates t continuously
+ * — differences stay under one LUT step. */
+static const char *FS_GRADIENT =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform int u_shape;\n"
+        "uniform vec2 u_p0;\n"              /* linear axis, pixels       */
+        "uniform vec2 u_p1;\n"
+        "uniform vec2 u_rc;\n"              /* radial center, pixels     */
+        "uniform float u_rr;\n"             /* radial radius, pixels     */
+        "uniform vec4 u_cols[17];\n"        /* capped stops (<= 16 + 2)  */
+        "uniform float u_offs[17];\n"
+        "uniform int u_n;\n"
+        "uniform vec2 u_dims;\n"            /* target size, pixels       */
+        "in vec2 v_uvsrc;\n"
+        "in vec2 v_screen;\n"
+        "out vec4 fragColor;\n"
+        "void main() {\n"
+        "    vec2 p = v_screen * u_dims;\n" /* pixel centers via v_screen */
+        "    float t;\n"
+        "    if (u_shape == 0) {\n"
+        "        vec2 d = u_p1 - u_p0;\n"
+        "        float len2 = dot(d, d);\n"
+        "        t = len2 < 1e-18 ? 0.0 : dot(p - u_p0, d) / len2;\n"
+        "    } else {\n"
+        "        t = u_rr < 1e-12 ? 0.0 : length(p - u_rc) / u_rr;\n"
+        "    }\n"
+        "    t = clamp(t, 0.0, 1.0);\n"     /* PAD spread                 */
+        "    vec4 c = u_cols[0];\n"
+        "    for (int k = 1; k < 17; k++) {\n"
+        "        if (k >= u_n) break;\n"
+        "        if (t <= u_offs[k]) {\n"
+        "            float span = u_offs[k] - u_offs[k - 1];\n"
+        "            float f = span > 1e-12 ? (t - u_offs[k - 1]) / span : 1.0;\n"
+        "            f = clamp(f, 0.0, 1.0);\n"
+        "            c = mix(u_cols[k - 1], u_cols[k], f);\n"
+        "            break;\n"
+        "        }\n"
+        "        c = u_cols[k];\n"
+        "    }\n"
+        "    fragColor = c;\n"
+        "}\n";
+
 /* ---- renderer state ------------------------------------------------------- */
 enum { PROG_PREMULT, PROG_COPY, PROG_BLUR, PROG_COMPOSITE, PROG_PRESENT,
        PROG_F_VELF, PROG_F_DYEF, PROG_F_CURL, PROG_F_VORT, PROG_F_DIV,
        PROG_F_JACOBI, PROG_F_GRADSUB, PROG_F_ADV_VEL, PROG_F_ADV_DYE,
        PROG_F_TONEMAP, PROG_R_STEP, PROG_R_COMPOSITE, PROG_PARTICLES,
-       PROG_COUNT };
+       PROG_GRADIENT, PROG_COUNT };
 #define PROG_BASE_COUNT PROG_F_VELF   /* compiled always                 */
 
 typedef struct {
@@ -779,6 +827,15 @@ typedef struct {
         u32 ptex_h;
         RTarget ptarget;
 
+        /* rendered-gradient cache: shader-evaluated gradient textures keyed
+         * by the scene's content serial (static gradients render once) */
+        struct {
+                u64 id;
+                u64 stamp;
+                RTarget t;
+        } rgcache[8];
+        u64 rg_clock;
+
         /* GPU fluid + ripple solvers: enabled when RGBA16F render targets
          * probe OK AND the rasterizer is hardware (llvmpipe sims would be
          * slower than the CPU solvers — fragment dispatch overhead beats
@@ -816,6 +873,10 @@ typedef struct {
         struct {
                 int frame, rows;
         } pu[PROG_COUNT];
+        /* gradient program uniforms */
+        struct {
+                int shape, p0, p1, rc, rr, cols, offs, n, dims;
+        } gu[PROG_COUNT];
 
         RPlatform *plat;
         int cur_win;
@@ -1444,6 +1505,96 @@ static GLuint_ gl_particles_layer(RenderGL *r, const RLayerCmd *cmd)
         return r->ptarget.tex;
 }
 
+/* ---- GPU gradient evaluation ----------------------------------------------- */
+
+/* Renders (or reuses) the gradient texture for a descriptor; keyed by the
+ * layer's content serial — static gradients evaluate once, animated angles
+ * re-evaluate (one fullscreen pass, no CPU raster, no upload). */
+static GLuint_ gl_grad_layer(RenderGL *r, const RLayerCmd *cmd)
+{
+        GL *g = &r->g;
+        const RGradDesc *gd = cmd->grad;
+
+        RTarget *slot = NULL;
+        for (int i = 0; i < 8; i++)
+                if (r->rgcache[i].id == cmd->content_id && cmd->content_id &&
+                    r->rgcache[i].t.tex) {
+                        slot = &r->rgcache[i].t;
+                        r->rgcache[i].stamp = ++r->rg_clock;
+                        break;
+                }
+        if (!slot) {
+                int pick = 0;
+                for (int i = 1; i < 8; i++)
+                        if (r->rgcache[i].stamp < r->rgcache[pick].stamp)
+                                pick = i;
+                if (!ensure_target(g, &r->rgcache[pick].t, cmd->w, cmd->h))
+                        return 0;
+                r->rgcache[pick].id = cmd->content_id;
+                r->rgcache[pick].stamp = ++r->rg_clock;
+                slot = &r->rgcache[pick].t;
+
+                /* evaluate: capped stops like build_lut() */
+                float cols[17 * 4], offs[17];
+                int n = gd->nstops;
+                RColor cst[17];
+                f64 coff[17];
+                for (int i = 0; i < n; i++) {
+                        cst[i] = gd->stops[i];
+                        coff[i] = gd->offs[i];
+                }
+                if (n > 0 && coff[0] > 0) {
+                        for (int i = n; i > 0; i--) {
+                                cst[i] = cst[i - 1];
+                                coff[i] = coff[i - 1];
+                        }
+                        coff[0] = 0.0;
+                        n++;
+                }
+                if (n > 0 && coff[n - 1] < 1) {
+                        cst[n] = cst[n - 1];
+                        coff[n] = 1.0;
+                        n++;
+                }
+                if (n < 2) {
+                        cst[0] = cst[1] = gd->stops[0];
+                        coff[0] = 0.0;
+                        coff[1] = 1.0;
+                        n = 2;
+                }
+                for (int i = 0; i < n; i++) {
+                        cols[i * 4 + 0] = (float)cst[i].r / 255.0f;
+                        cols[i * 4 + 1] = (float)cst[i].g / 255.0f;
+                        cols[i * 4 + 2] = (float)cst[i].b / 255.0f;
+                        cols[i * 4 + 3] = (float)cst[i].a / 255.0f;
+                        offs[i] = (float)coff[i];
+                }
+                for (int i = n; i < 17; i++) {
+                        cols[i * 4 + 0] = cols[(n - 1) * 4 + 0];
+                        cols[i * 4 + 1] = cols[(n - 1) * 4 + 1];
+                        cols[i * 4 + 2] = cols[(n - 1) * 4 + 2];
+                        cols[i * 4 + 3] = cols[(n - 1) * 4 + 3];
+                        offs[i] = 1.0f;
+                }
+
+                int pi = PROG_GRADIENT;
+                g->glBindFramebuffer(GL_FRAMEBUFFER, slot->fbo);
+                g->glViewport(0, 0, (int)slot->w, (int)slot->h);
+                g->glUseProgram(r->prog[pi]);
+                g->glUniform1i(r->gu[pi].shape, gd->shape);
+                g->glUniform2f(r->gu[pi].p0, (float)gd->p0x, (float)gd->p0y);
+                g->glUniform2f(r->gu[pi].p1, (float)gd->p1x, (float)gd->p1y);
+                g->glUniform2f(r->gu[pi].rc, (float)gd->cx, (float)gd->cy);
+                g->glUniform1f(r->gu[pi].rr, (float)gd->radius);
+                g->glUniform4fv(r->gu[pi].cols, 17, cols);
+                g->glUniform1fv(r->gu[pi].offs, 17, offs);
+                g->glUniform1i(r->gu[pi].n, n);
+                g->glUniform2f(r->gu[pi].dims, (float)slot->w, (float)slot->h);
+                draw_full(g);
+        }
+        return slot->tex;
+}
+
 /* ---- content-addressed upload ---------------------------------------------- */
 static GLuint_ upload_layer_tex(RenderGL *r, const RLayerCmd *cmd)
 {
@@ -1737,6 +1888,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         LOADGL(glUniform3f, "glUniform3f");
         LOADGL(glUniform1fv, "glUniform1fv");
         LOADGL(glUniform2fv, "glUniform2fv");
+        LOADGL(glUniform4fv, "glUniform4fv");
         LOADGL(glDrawArrays, "glDrawArrays");
         LOADGL(glClearColor, "glClearColor");
         LOADGL(glClear, "glClear");
@@ -1793,6 +1945,9 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
          * the CPU raster is the right tool there. The REV_GL_FLUID_SW test
          * hook forces the GPU path on so it stays regression-covered. */
         rr->wants_points = !r->software || getenv("REV_GL_FLUID_SW") != NULL;
+        /* Shader-evaluated gradients: hardware only (a fullscreen fragment
+         * pass costs more than the LUT fill it replaces on software GL). */
+        rr->wants_grads = !r->software || getenv("REV_GL_FLUID_SW") != NULL;
 
         /* programs */
         if (!gl_make_program(r, PROG_PREMULT, FS_PREMULT, err, errcap) ||
@@ -1800,6 +1955,7 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
             !gl_make_program(r, PROG_BLUR, FS_BLUR, err, errcap) ||
             !gl_make_program(r, PROG_COMPOSITE, FS_COMPOSITE, err, errcap) ||
             !gl_make_program(r, PROG_PRESENT, FS_PRESENT, err, errcap) ||
+            !gl_make_program(r, PROG_GRADIENT, FS_GRADIENT, err, errcap) ||
             !gl_make_program_vs(r, PROG_PARTICLES, VS_PARTICLES, FS_PARTICLES,
                                 err, errcap))
                 return false;
@@ -1920,6 +2076,15 @@ static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 r->ru[i].opacity = g->glGetUniformLocation(pg, "u_opacity");
                 r->pu[i].frame = g->glGetUniformLocation(pg, "u_frame");
                 r->pu[i].rows = g->glGetUniformLocation(pg, "u_rows");
+                r->gu[i].shape = g->glGetUniformLocation(pg, "u_shape");
+                r->gu[i].p0 = g->glGetUniformLocation(pg, "u_p0");
+                r->gu[i].p1 = g->glGetUniformLocation(pg, "u_p1");
+                r->gu[i].rc = g->glGetUniformLocation(pg, "u_rc");
+                r->gu[i].rr = g->glGetUniformLocation(pg, "u_rr");
+                r->gu[i].cols = g->glGetUniformLocation(pg, "u_cols[0]");
+                r->gu[i].offs = g->glGetUniformLocation(pg, "u_offs[0]");
+                r->gu[i].n = g->glGetUniformLocation(pg, "u_n");
+                r->gu[i].dims = g->glGetUniformLocation(pg, "u_dims");
         }
         /* PROG_F_ADV_DYE samples BOTH u_dye and u_vel — the generic loop
          * above bound both to unit 0, so the dye advection read the DYE
@@ -2121,7 +2286,11 @@ static bool gl_layer(RRenderer *rr, const RLayerCmd *cmd)
          *      rasters re-upload ONLY when their content serial changes
          *      (the old path pushed every cached raster every frame). */
         GLuint_ src_tex;
-        if (cmd->psim) {
+        if (cmd->grad) {
+                src_tex = gl_grad_layer(r, cmd);
+                if (!src_tex)
+                        return false;
+        } else if (cmd->psim) {
                 src_tex = gl_particles_layer(r, cmd);
                 if (!src_tex)
                         return false;
@@ -2444,6 +2613,13 @@ static void gl_fini(RRenderer *rr)
                 if (r->ptarget.tex) {
                         g->glDeleteTextures(1, &r->ptarget.tex);
                         g->glDeleteFramebuffers(1, &r->ptarget.fbo);
+                }
+                /* rendered-gradient cache */
+                for (int i = 0; i < 8; i++) {
+                        if (r->rgcache[i].t.tex) {
+                                g->glDeleteTextures(1, &r->rgcache[i].t.tex);
+                                g->glDeleteFramebuffers(1, &r->rgcache[i].t.fbo);
+                        }
                 }
                 /* pending timer queries need no teardown: the context dies */
         }
