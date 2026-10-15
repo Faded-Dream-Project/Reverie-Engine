@@ -139,7 +139,7 @@ jobs:
             install: "zypper -n install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)'"
           - distro: void
             image: "voidlinux/voidlinux:latest"
-            install: "mkdir -p /etc/xbps.d && cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/ 2>/dev/null; printf 'repository=https://repo-default.voidlinux.org/current\n' > /etc/xbps.d/00-repository-main.conf && xbps-install -Sy git base-devel ffmpeg-devel"
+            install: "mkdir -p /etc/xbps.d && printf 'repository=https://repo-default.voidlinux.org/current\n' > /etc/xbps.d/00-repository-main.conf && xbps-install -Sy xbps && xbps-install -Sy git base-devel ffmpeg-devel"
     name: distro (${{ matrix.distro }})
     container: ${{ matrix.image }}
     steps:
