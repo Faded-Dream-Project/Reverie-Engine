@@ -259,6 +259,15 @@ static bool path_is_live(const char *path)
         return live;
 }
 
+bool ipc_daemon_live(void)
+{
+        char pbuf[384];
+        char err[64];
+        if (!ipc_default_path(pbuf, sizeof pbuf, err, sizeof err))
+                return false;    /* no per-user location: nothing to probe */
+        return path_is_live(pbuf);
+}
+
 IpcServer *ipc_serve_start(const char *path, char *err, size_t errcap)
 {
         char pbuf[384];

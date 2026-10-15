@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "arena.h"
+#include "cli.h"
 #include "ipc.h"
 #include "log.h"
 #include "pack.h"
@@ -73,6 +74,13 @@ static void usage(void)
 "options:\n"
 "  -R, --renderer R    force renderer: auto | vulkan | opengl | cpu\n"
 "  -B, --backend B     force backend: auto | x11 | wayland\n"
+"      --scene PATH    explicit scene/theme path (same slot as the\n"
+"                       positional; giving both is an error)\n"
+"      --exit-if-running\n"
+"                       exit 0 when another daemon already owns the\n"
+"                       control socket — the duplicate-instance guard\n"
+"                       (autostart entries carry it; needs the IPC\n"
+"                       socket, see docs/AUTOSTART.md)\n"
 "  -f, --fps N         override the scene's target fps\n"
 "  -m, --monitor N     render only on monitor N\n"
 "  -o, --once          render one frame to PNG and exit (no display needed)\n"
@@ -579,110 +587,35 @@ static void ipc_handler(void *ctx, const IpcMsg *msg, IpcReply *rep)
 
 int main(int argc, char **argv)
 {
-        const char *scene_path = NULL;
-        const char *renderer_pref = NULL;
-        const char *backend_pref = NULL;
-        int fps_override = 0;
-        int only_monitor = -1;
-        bool once = false, list = false;
-        f64 shot_after = -1;
-        const char *shot_file = NULL;
-        u32 out_w = 1920, out_h = 1080;
-        const char *out_png = "reverie.png";
         char err[512] = { 0 };
-
-        for (int i = 1; i < argc; i++) {
-                if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fps")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        fps_override = atoi(argv[++i]);
-                } else if (!strcmp(argv[i], "-m") || !strcmp(argv[i], "--monitor")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        only_monitor = atoi(argv[++i]);
-                } else if (!strcmp(argv[i], "-o") || !strcmp(argv[i], "--once")) {
-                        once = true;
-                } else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--size")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        if (sscanf(argv[++i], "%ux%u", &out_w, &out_h) != 2) {
-                                fprintf(stderr, "reverie: bad --size (want WxH)\n");
-                                return 1;
-                        }
-                } else if (!strcmp(argv[i], "-O") || !strcmp(argv[i], "--out")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        out_png = argv[++i];
-                } else if (!strcmp(argv[i], "-R") || !strcmp(argv[i], "--renderer")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        renderer_pref = argv[++i];
-                } else if (!strcmp(argv[i], "-B") || !strcmp(argv[i], "--backend")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        backend_pref = argv[++i];
-                } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) {
-                        list = true;
-                } else if (!strcmp(argv[i], "--shot")) {
-                        /* two accepted forms:
-                         *   --shot SECONDS FILE           (legacy, scripts/e2e.sh)
-                         *   --shot FILE [--shot-after N]  (as documented in
-                         *                                 docs/BACKENDS.md) */
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        {
-                                char *end = NULL;
-                                double sec = strtod(argv[i + 1], &end);
-                                if (end && *end == 0 && end != argv[i + 1]) {
-                                        /* numeric first arg: legacy form */
-                                        if (i + 2 >= argc) { usage(); return 1; }
-                                        shot_after = sec;
-                                        shot_file = argv[i + 2];
-                                        i += 2;
-                                } else {
-                                        shot_file = argv[i + 1];
-                                        i += 1;
-                                }
-                        }
-                } else if (!strcmp(argv[i], "--shot-after")) {
-                        if (i + 1 >= argc) { usage(); return 1; }
-                        shot_after = atof(argv[++i]);
-                } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) {
-                        rev_log_set_level(REV_LOG_DEBUG);
-                } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
-                        rev_log_set_level(REV_LOG_ERROR);
-                } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+        RevArgs a;
+        if (!rev_cli_parse(argc, argv, &a, err, sizeof err)) {
+                fprintf(stderr, "reverie: %s\n", err);
+                if (a.show_usage)
                         usage();
-                        return 0;
-                } else if (argv[i][0] == '-' && argv[i][1]) {
-                        fprintf(stderr, "reverie: unknown option '%s'\n", argv[i]);
-                        usage();
-                        return 1;
-                } else if (strchr(argv[i], '=') && argv[i][0] != '-' &&
-                           argv[i][0] != '/') {
-                        /* a NAME=VALUE positional is almost always an env var
-                         * that belongs BEFORE the command (REV_VK_VALIDATE=1
-                         * ./build/reverie ...), never a scene path */
-                        const char *eq = strchr(argv[i], '=');
-                        bool name_ok = eq != argv[i];
-                        for (const char *c = argv[i]; c < eq && name_ok; c++)
-                                if (!((*c >= 'A' && *c <= 'Z') ||
-                                      (*c >= '0' && *c <= '9') || *c == '_'))
-                                        name_ok = false;
-                        if (name_ok) {
-                                fprintf(stderr, "reverie: '%.*s' looks like an "
-                                        "environment variable — put it before the "
-                                        "command, e.g. %s ./build/reverie ...%s\n",
-                                        (int)(eq - argv[i] + 1), argv[i], argv[i],
-                                        scene_path ? " (a scene was already given)" : "");
-                                return 1;
-                        }
-                        if (!scene_path) {
-                                scene_path = argv[i];
-                        } else {
-                                fprintf(stderr, "reverie: multiple scenes given\n");
-                                return 1;
-                        }
-                } else if (!scene_path) {
-                        scene_path = argv[i];
-                } else {
-                        fprintf(stderr, "reverie: multiple scenes given\n");
-                        return 1;
-                }
+                return 1;
         }
+        if (a.want_help) {
+                usage();
+                return 0;
+        }
+        if (a.verbosity > 0)
+                rev_log_set_level(REV_LOG_DEBUG);
+        else if (a.verbosity < 0)
+                rev_log_set_level(REV_LOG_ERROR);
+
+        /* locals carried from the historical parser so the rest of main()
+         * stays untouched; cli.c now owns parsing + validation */
+        const char *scene_path = a.scene_path;
+        const char *renderer_pref = a.renderer_pref;
+        const char *backend_pref = a.backend_pref;
+        int fps_override = a.fps_override;
+        int only_monitor = a.only_monitor;
+        bool once = a.once, list = a.list;
+        f64 shot_after = a.shot_after;
+        const char *shot_file = a.shot_file;
+        u32 out_w = a.out_w, out_h = a.out_h;
+        const char *out_png = a.out_png;
 
         if (!renderer_pref) {
                 renderer_pref = getenv("REV_RENDERER");
@@ -693,6 +626,17 @@ int main(int argc, char **argv)
                 backend_pref = getenv("REV_BACKEND");
                 if (!backend_pref || !*backend_pref)
                         backend_pref = "auto";
+        }
+
+        /* --exit-if-running: the duplicate-instance guard the autostart
+         * entry carries. Probe the per-user control socket BEFORE any
+         * heavy setup — a live daemon means this launch yields cleanly
+         * instead of stacking a second set of wallpaper windows. (The
+         * probe needs the IPC socket; REV_IPC=0 removes the probe point.) */
+        if (a.exit_if_running && ipc_daemon_live()) {
+                LOGI("another reverie daemon owns the control socket — "
+                     "exiting (--exit-if-running)");
+                return 0;
         }
 
         if (list) {

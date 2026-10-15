@@ -174,6 +174,10 @@ reverie [options] <scene.rev | theme dir | theme.revpack>
 
   -R, --renderer R    force renderer: auto | vulkan | opengl | cpu
   -B, --backend B     force backend: auto | x11 | wayland
+      --scene PATH    explicit scene/theme path (same slot as the positional)
+      --exit-if-running
+                      exit 0 when another daemon owns the control socket
+                      (duplicate-instance guard; autostart uses it)
   -f, --fps N         override the scene's target fps
   -m, --monitor N     render only on monitor N
   -o, --once          render one frame to PNG and exit (no display needed)
@@ -181,6 +185,7 @@ reverie [options] <scene.rev | theme dir | theme.revpack>
 
 reverie themes/ripple-lake            # folder theme (hot-reloads)
 reverie ripple-lake.revpack           # packed theme — no extraction
+reverie --scene themes/ripple-lake    # the same, spelled out
 
 Scene layers: image, gradient, solid, fluid, ripple, particles, video —
 with blend modes, blur, opacity, parallax, monitor selection, and

@@ -80,4 +80,9 @@ bool ipc_request(const char *path, const char *cmdline,
  * with a message when no per-user location exists. */
 bool ipc_default_path(char *buf, size_t cap, char *err, size_t errcap);
 
+/* True when a live daemon answers PING on the default (or REV_IPC_SOCK
+ * overridden) path — the single-instance probe behind --exit-if-running.
+ * A stale socket file from a crashed daemon reports false. */
+bool ipc_daemon_live(void);
+
 #endif /* REV_IPC_H */

@@ -48,6 +48,7 @@ endif
 # ---- core engine objects (everything except the X11 backend) ---------------
 CORE_SRC = \
 	src/arena.c \
+	src/cli.c \
 	src/log.c \
 	src/util.c \
 	src/simd.c \
