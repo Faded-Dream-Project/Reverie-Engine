@@ -160,10 +160,21 @@ make install    # /usr/local/bin/{reverie,revtool}
 ```
 
 Requirements: a C11 compiler, make, and that's it. No headers beyond libc.
-Video wallpapers are optional and auto-detected: with FFmpeg development
-headers installed (or the vendored `contrib/ffmpeg-headers`), `video.c`
-builds and dlopens the system libraries at runtime; without them a stub
-builds and the engine is exactly the same minus video (see
+Video wallpapers are optional and controllable:
+
+```sh
+make                      # auto: system FFmpeg headers, else the vendored
+                          # contrib/ffmpeg-headers, else the no-video stub
+make ENABLE_FFMPEG=0      # no-video stub build — no FFmpeg headers needed,
+                          # no FFmpeg linkage, scenes and everything else
+                          # identical; --video refuses with a clear message
+make ENABLE_FFMPEG=1      # video required — a build with no headers at all
+                          # is a hard error naming the packages
+```
+
+The libraries themselves are never linked in any configuration — `video.c`
+dlopens them at runtime with a version guard, so a header/runtime
+mismatch refuses video cleanly instead of corrupting memory (see
 [docs/VIDEO.md](docs/VIDEO.md)).
 
 ## Usage

@@ -28,21 +28,44 @@ LIBS        = -lm -ldl -lpthread
 BUILD   = build
 
 # ---- optional video support (FFmpeg headers at build, dlopen at run) --------
-# System headers first (matches the user's distro exactly); the vendored
-# contrib/ffmpeg-headers (Debian 13 / FFmpeg 7.1) as fallback. Without either,
-# video_stub.c builds and the engine is exactly as before.
-AV_DIRS := /usr/include/x86_64-linux-gnu /usr/include
+# ENABLE_FFMPEG:
+#   auto (default) - system headers when present, else the vendored
+#                    contrib/ffmpeg-headers (Debian 13 / FFmpeg 7.1),
+#                    else video_stub.c (no video, everything else identical)
+#   1              - video REQUIRED: same header search, but finding none
+#                    is a hard error naming the packages (install them or
+#                    build with ENABLE_FFMPEG=0)
+#   0              - always the stub: no FFmpeg headers, no video symbol;
+#                    .rev scenes and every other feature build unchanged
+# The LIBRARIES are still dlopen'd at runtime with an ABI guard in every
+# configuration - nothing is ever linked.
+ENABLE_FFMPEG ?= auto
+
+# Header search order: the compiler's multiarch include directory first
+# (matches the running distro exactly - Debian/Ubuntu multiarch, Fedora/
+# Arch/Alpine/openSUSE plain /usr/include), then the vendored set.
+MULTIARCH := $(shell $(CC) -print-multiarch 2>/dev/null)
+AV_DIRS := /usr/include/$(MULTIARCH) /usr/include/x86_64-linux-gnu /usr/include
 AV_INC  := $(firstword $(foreach d,$(AV_DIRS),$(wildcard $(d)/libavcodec/avcodec.h)))
 ifeq ($(AV_INC),)
 AV_INC  := $(firstword $(wildcard contrib/ffmpeg-headers/libavcodec/avcodec.h))
 endif
-ifneq ($(AV_INC),)
+
+ifeq ($(ENABLE_FFMPEG),0)
+VIDEO_OBJ  = $(BUILD)/video_stub.o
+VIDEO_CPPF =
+else
+ifeq ($(AV_INC),)
+ifeq ($(ENABLE_FFMPEG),1)
+$(error ENABLE_FFMPEG=1 requires FFmpeg headers - install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev (distro names vary) or build with ENABLE_FFMPEG=0)
+endif
+VIDEO_OBJ  = $(BUILD)/video_stub.o
+VIDEO_CPPF =
+else
 AV_DIR  := $(patsubst %/libavcodec/avcodec.h,%,$(AV_INC))
 VIDEO_OBJ  = $(BUILD)/video.o
 VIDEO_CPPF = -DREV_VIDEO=1 -I$(AV_DIR)
-else
-VIDEO_OBJ  = $(BUILD)/video_stub.o
-VIDEO_CPPF =
+endif
 endif
 
 # ---- core engine objects (everything except the X11 backend) ---------------
@@ -113,7 +136,10 @@ $(BUILD):
 $(BUILD)/%.o: src/%.c $(wildcard src/*.h) | $(BUILD)
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
+# delete-then-create: 'ar r' MERGES members, so switching ENABLE_FFMPEG
+# would leave a stale video.o inside the archive next to video_stub.o
 $(LIBREV): $(CORE_OBJ)
+	rm -f $@
 	$(AR) rcs $@ $(CORE_OBJ)
 
 $(BUILD)/reverie: $(BUILD)/main.o $(LIBREV)

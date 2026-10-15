@@ -321,6 +321,11 @@ if command -v ffmpeg >/dev/null 2>&1; then
     mv "$VDIR/loop.mp4" "$VDIR/assets/loop.mp4"
     printf 'scene { layer bg { type = video src = "assets/loop.mp4" loop = true } }\n' > "$VDIR/scene.rev"
     printf '{ "id": "vtest", "name": "vtest", "scene": "scene.rev" }\n' > "$VDIR/theme.json"
+    # can this build decode at all? stub builds (ENABLE_FFMPEG=0) and
+    # ABI-refused builds reject the media probe by design — the scene-video
+    # legs then SKIP instead of failing on undecodable layers
+    if ./build/reverie --video "$VDIR/assets/loop.mp4" -o -s 8x8 \
+            -O "$OUT/vavail.png" >/dev/null 2>&1; then
     # CPU tier: sws path
     start_xvfb
     DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/vid" "$VDIR" \
@@ -348,6 +353,11 @@ if command -v ffmpeg >/dev/null 2>&1; then
     else
         echo "    video(gl):    SKIP (no libEGL / GL vendor on this system)"
         SKIP=$((SKIP+1))
+    fi
+    else
+        echo "    video(cpu):   SKIP (video support refused in this build)"
+        echo "    video(gl):    SKIP (video support refused in this build)"
+        SKIP=$((SKIP+2))
     fi
     rm -rf "$VDIR"
 else

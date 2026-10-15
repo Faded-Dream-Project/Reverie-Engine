@@ -52,3 +52,31 @@ u64 rev_video_dropped(RevVideo *v)
         (void)v;
         return 0;
 }
+
+bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh)
+{
+        (void)f; (void)dst; (void)dw; (void)dh;
+        return false;
+}
+
+bool rev_video_to_rgba_at(const RVideoFrame *f, u32 *dst, u32 dst_stride,
+                          u32 dw, u32 dh)
+{
+        (void)f; (void)dst; (void)dst_stride; (void)dw; (void)dh;
+        return false;
+}
+
+bool rev_video_to_rgba_sub(const RVideoFrame *f, u32 sx, u32 sy,
+                           u32 sw, u32 sh, u32 *dst, u32 dst_stride,
+                           u32 dw, u32 dh)
+{
+        (void)f; (void)sx; (void)sy; (void)sw; (void)sh;
+        (void)dst; (void)dst_stride; (void)dw; (void)dh;
+        return false;
+}
+
+f64 rev_video_fps(const RevVideo *v)
+{
+        (void)v;
+        return 0.0;
+}

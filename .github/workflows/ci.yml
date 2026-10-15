@@ -16,7 +16,11 @@
 #                        vendored: runtime libs only — the build falls back
 #                        to the bundled 7.1 headers, the ABI guard refuses
 #                        video by design, and the stub-refusal contract leg
-#                        plus the e2e SKIP legs cover that configuration)
+#                        plus the e2e SKIP legs cover that configuration;
+#                        off: ENABLE_FFMPEG=0 — no headers, no linkage, no
+#                        video: scenes + CLI + IPC all tested, media mode
+#                        refuses with the standard contract, and the
+#                        no-header ENABLE_FFMPEG=1 error is verified)
 #
 # e2e-wayland.sh requires the local weston test stack (../gpulibs) which is
 # not reproducible on hosted runners; it runs informationally and always
@@ -42,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ff: [system, vendored]
+        ff: [system, vendored, off]
     name: build-test (ffmpeg=${{ matrix.ff }})
     steps:
       - uses: actions/checkout@v4
@@ -65,10 +69,33 @@ jobs:
             ffmpeg
 
       - name: build
-        run: make -j"$(nproc)"
+        run: make -j"$(nproc)" ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
 
       - name: unit tests
-        run: make test
+        run: make test ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
+
+      - name: no-FFmpeg verification (stub leg)
+        if: matrix.ff == 'off'
+        run: |
+          # the stub build must carry zero FFmpeg dependency and refuse
+          # media mode with the standard contract
+          if ldd build/reverie | grep -iE 'libav(codec|format|util)|libswscale'; then
+            echo "FAIL: the ENABLE_FFMPEG=0 build links FFmpeg"; exit 1
+          fi
+          ./build/reverie --scene scenes/mountain-dusk.rev -o -s 64x36 -O stub-scene.png
+          ./build/reverie --video scenes/mountain-dusk.rev 2>&1 | grep -q "no video support" \
+            || { echo "FAIL: media mode did not refuse on the stub build"; exit 1; }
+          # ENABLE_FFMPEG=1 with NO headers anywhere must be a clear error
+          mv contrib /tmp/ff-contrib-hidden
+          set +e
+          make clean >/dev/null
+          ERR=$(make ENABLE_FFMPEG=1 2>&1); RC=$?
+          set -e
+          mv /tmp/ff-contrib-hidden contrib
+          [ "$RC" -ne 0 ] || { echo "FAIL: ENABLE_FFMPEG=1 built without any headers"; exit 1; }
+          echo "$ERR" | grep -q "ENABLE_FFMPEG=1 requires" \
+            || { echo "FAIL: unclear dependency error: $ERR"; exit 1; }
+          make -j"$(nproc)" ENABLE_FFMPEG=0 >/dev/null
 
       - name: e2e (Xvfb + llvmpipe GL + lavapipe Vulkan)
         run: scripts/e2e.sh
@@ -79,5 +106,5 @@ jobs:
       - name: ASan + UBSan unit pass
         run: |
           make clean
-          make -j"$(nproc)" CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
-          make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+          make -j"$(nproc)" CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
+          make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
