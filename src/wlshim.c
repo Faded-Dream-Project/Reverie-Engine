@@ -158,12 +158,17 @@ typedef struct {
         /* visibility (idle power-save): a wl_shm-presented window is
          * "visible" while the compositor keeps latching its frames; the
          * callback timestamps are the evidence. gl_surface / never-presented
-         * windows (WSI swapchains, EGL) are excluded — their own present
-         * calls throttle them. */
+         * windows (WSI swapchains, EGL) are excluded — EXCEPT WSI-owned
+         * windows, which carry their own frame-request evidence through
+         * wlshim_wsi_frame_request(). */
         bool presented;        /* ever presented through wl_shm            */
         f64 last_done;         /* last wl_callback.done (0 = never)        */
         f64 last_present;      /* last wl_shm commit                       */
         f64 last_probe;        /* last idle re-present probe               */
+        bool wsi;              /* WSI swapchain owns this surface: the
+                                 * Vulkan renderer requested frame
+                                 * callbacks on it (wsi_frame_request)   */
+        f64 wsi_since;         /* first frame request — grace window       */
 } ShimWin;
 
 typedef struct {
@@ -1189,9 +1194,18 @@ void wlshim_set_vis_timeout(f64 seconds)
         vis_override = seconds < 0 ? -1 : (seconds < 0.001 ? 0.001 : seconds);
 }
 
-/* True when at least one wl_shm-presented window was latched recently (or
- * no window is wl_shm-presented yet — startup, EGL/WSI surfaces — in which
- * case visibility is not ours to judge and rendering must continue). */
+/* True when at least one wl_shm-presented or WSI-owned window was latched
+ * recently (or no window is ours at all — startup, raw surfaces — in which
+ * case visibility is not ours to judge and rendering must continue).
+ *
+ * WSI-owned windows: the ONLY evidence is wl_callback.done (the shim's own
+ * frame requests committed by the renderer's swapchain presents). Present
+ * timestamps deliberately do NOT refresh a WSI window — backpressure (the
+ * compositor releasing images while never latching, an acquire that stalls)
+ * must not masquerade as visibility, so a WSI surface that stops getting
+ * callbacks goes hidden even mid-presentation. The grace window after the
+ * first frame request (2x the visibility window) bridges the startup gap
+ * where no callback can have fired yet. */
 bool wlshim_surface_visible(void)
 {
         if (!S.active)
@@ -1201,8 +1215,16 @@ bool wlshim_surface_visible(void)
         bool any_ours = false;
         for (int i = 0; i < S.nwins; i++) {
                 ShimWin *w = &S.wins[i];
+                if (w->wsi) {
+                        any_ours = true;
+                        if (now - w->wsi_since < 2.0 * vis)
+                                return true;    /* grace: no callback yet possible */
+                        if (w->last_done > 0 && now - w->last_done < vis)
+                                return true;    /* latched recently */
+                        continue;
+                }
                 if (w->gl_surface || !w->presented)
-                        continue;    /* EGL/WSI swapchain paces itself */
+                        continue;    /* EGL swapchain paces itself */
                 any_ours = true;
                 f64 last = w->last_done > w->last_present ? w->last_done
                                                           : w->last_present;
@@ -1210,6 +1232,65 @@ bool wlshim_surface_visible(void)
                         return true;
         }
         return !any_ours;
+}
+
+/* ---- WSI-present visibility --------------------------------------------- */
+
+/* One frame callback, one at a time — mirrors the wl_shm presenter's
+ * pattern (present_cpu / shim_probe): the slot frees when wait_frame()
+ * destroys the fired callback, and the next request re-arms it. */
+static void shim_request_frame(ShimWin *w)
+{
+        if (w->frame_cb || !S.wl_callback_iface)
+                return;
+        w->frame_cb = S.proxy_marshal_constructor(w->surface, 3,
+                                                  S.wl_callback_iface, NULL);
+        if (!w->frame_cb)
+                return;
+        static void (*const cb_listener[])(void) = {
+                (void (*)(void))on_frame_done,
+        };
+        S.proxy_add_listener(w->frame_cb,
+                             (void (**)(void))cb_listener, w);
+}
+
+bool wlshim_wsi_frame_request(int win)
+{
+        if (!S.active || win < 0 || win >= S.nwins)
+                return false;
+        ShimWin *w = &S.wins[win];
+        if (w->gl_surface || !w->surface)
+                return false;    /* not a WSI-presentable surface */
+        if (!w->wsi) {
+                w->wsi = true;
+                w->wsi_since = rev_monotonic();
+                LOGD("wlshim: window %d now WSI-owned (frame-request "
+                     "visibility armed)", win);
+        }
+        shim_request_frame(w);
+        S.flush(S.display);
+        return true;
+}
+
+bool wlshim_hidden_render_probe(void)
+{
+        if (!S.active)
+                return false;
+        for (int i = 0; i < S.nwins; i++)
+                if (S.wins[i].wsi)
+                        return true;
+        return false;
+}
+
+bool wlshim_wsi_test_commit(int win)
+{
+        if (!S.active || win < 0 || win >= S.nwins)
+                return false;
+        ShimWin *w = &S.wins[win];
+        if (!w->wsi || !w->surface)
+                return false;
+        S.proxy_marshal(w->surface, WL_SURFACE_COMMIT);
+        return S.flush(S.display) >= 0;
 }
 
 /* Idle probe: re-attach the CURRENT buffer with full damage + commit. A

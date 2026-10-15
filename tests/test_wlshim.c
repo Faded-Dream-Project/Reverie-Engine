@@ -932,6 +932,70 @@ int main(void)
                               "consume-on-read: click edge delivered exactly once");
                 }
 
+                /* 5a. WSI-present visibility (v0.2): the Vulkan swapchain path
+                 * arms its OWN latched-frame evidence — wlshim_wsi_frame_request
+                 * keeps one wl_surface.frame pending on the swapchain surface,
+                 * the renderer's present commit carries it, and visibility runs
+                 * on the CALLBACKS alone (presents / backpressure / acquire
+                 * stalls never masquerade as visibility). Drive the whole
+                 * cycle against the strict fake: grace -> latched -> hidden
+                 * (callbacks stop) -> probe present deferred -> compositor
+                 * revives -> probe answered -> visible. Runs BEFORE any wl_shm
+                 * present so the window is purely WSI-owned. */
+                {
+                        int cbs_before = frame_cb_replies;
+                        CHECK(wlshim_wsi_frame_request(win),
+                              "WSI frame request armed on the swapchain surface");
+                        CHECK(wlshim_hidden_render_probe(),
+                              "hidden_render_probe: engine must keep probe-rendering");
+                        CHECK(wlshim_surface_visible(),
+                              "WSI surface visible during the grace window");
+                        /* a second request while one is pending must NOT hit
+                         * the wire — one callback at a time, like present_cpu */
+                        wlshim_wsi_frame_request(win);
+                        usleep(30000);
+                        CHECK(frame_cb_replies == cbs_before + 1,
+                              "exactly one callback armed (dedup while pending)");
+                        wlshim_pump(NULL);           /* dispatch the done event */
+                        CHECK(wlshim_wait_frame(0.05),
+                              "wait_frame consumes the fired WSI callback");
+                        CHECK(wlshim_surface_visible(),
+                              "visible while the compositor latches (last_done fresh)");
+
+                        wlshim_set_vis_timeout(0.08);
+                        hold_frame_cbs = 1;          /* compositor stops latching */
+                        usleep(200000);              /* > grace (2x80ms) and > vis */
+                        CHECK(!wlshim_surface_visible(),
+                              "WSI starvation past the window: hidden — present "
+                              "backpressure would NOT have proven this");
+                        /* the engine's probe response: render_vk arms a fresh
+                         * frame request right before every present; the commit
+                         * is what carries it to the compositor */
+                        CHECK(wlshim_wsi_frame_request(win),
+                              "probe render armed its frame request");
+                        CHECK(wlshim_wsi_test_commit(win),
+                              "probe present committed on the WSI surface");
+                        usleep(50000);
+                        CHECK(!wlshim_surface_visible(),
+                              "probe unanswered while the compositor sleeps");
+                        hold_frame_cbs = 0;          /* compositor comes back */
+                        CHECK(wlshim_wsi_test_commit(win),
+                              "next probe commit lands");
+                        bool wsi_resumed = false;
+                        for (int i = 0; i < 60 && !wsi_resumed; i++) {
+                                wlshim_pump(NULL);
+                                wsi_resumed = wlshim_surface_visible();
+                                if (!wsi_resumed)
+                                        usleep(20000);
+                        }
+                        CHECK(wsi_resumed,
+                              "revived compositor latched the probe — visible again");
+                        CHECK(frame_cb_replies > cbs_before + 1,
+                              "the deferred WSI callback was answered on the wire");
+                        wlshim_set_vis_timeout(-1);
+                        hold_frame_cbs = 0;
+                }
+
                 /* 5b. wl_shm present path (v0.1.5): the shim pools an 800x600
                  * device-pixel frame (logical 400x300 @ scale 2), premultiplies
                  * into the memfd slot, attaches + damages + commits through

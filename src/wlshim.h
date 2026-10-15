@@ -48,11 +48,33 @@ bool wlshim_should_close(void);
  * display asleep) — the caller should stop rendering and pace at a slow
  * probe rate; the shim keeps asking the compositor ~4 Hz and flips back to
  * true on the first latched callback. Surfaces owned by EGL / a Vulkan
- * swapchain are excluded (they throttle through their own present calls). */
+ * swapchain participate through wlshim_wsi_frame_request() below (they
+ * carry the same latched-callback evidence); entirely unmarked surfaces
+ * stay "not ours to judge". */
 bool wlshim_surface_visible(void);
 /* Test/field hook: override the starvation window in seconds (<0 restores
  * the env/default 0.25). */
 void wlshim_set_vis_timeout(f64 seconds);
+
+/* WSI-present visibility (Vulkan swapchain path): the renderer calls this
+ * RIGHT BEFORE every vkQueuePresentKHR on `win` (render_vk.c, through the
+ * platform's wsi_frame_request hook). The first call marks the window as
+ * WSI-owned; every call keeps one wl_surface.frame callback pending on the
+ * surface — the driver's present commit carries it, the compositor fires
+ * it on latch, and wlshim_surface_visible() gains the same callback-
+ * starvation evidence the wl_shm path uses. Multiple pending frame
+ * callbacks on one surface are legal Wayland, so this never fights the
+ * driver's own pacing callbacks. */
+bool wlshim_wsi_frame_request(int win);
+/* True when any window is WSI-owned: the engine must keep rendering at the
+ * idle pace while hidden so its probe presents can carry frame requests
+ * (the shim cannot re-attach swapchain buffers itself). */
+bool wlshim_hidden_render_probe(void);
+/* Test hook: send a bare wl_surface.commit on a WSI-owned window — stands
+ * in for the driver's present commit in the fake-compositor test (a real
+ * probe present comes from render_vk; here the commit is what carries the
+ * pending frame request to the compositor). */
+bool wlshim_wsi_test_commit(int win);
 
 /* Marks a window's wl_surface as owned by EGL (render_gl.c calls this once
  * its wl_egl_window is active). The wl_shm presenter then stays off that

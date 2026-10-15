@@ -2901,9 +2901,20 @@ static bool vk_wsi_present_frame(RenderVK *v, int win, VFrame *fr)
                         f64 now = rev_monotonic();
                         if (now - last_starve > 5.0) {
                                 last_starve = now;
-                                LOGW("vulkan: swapchain starved — the compositor "
-                                     "is not releasing FIFO images fast enough; "
-                                     "dropping frames (acquire timeout)");
+                                /* While the platform reports the surface
+                                 * hidden (idle power-save), a stalled
+                                 * acquire is EXPECTED — the compositor is
+                                 * not consuming. Keep it out of the WARN
+                                 * stream so field logs stay honest. */
+                                const bool hidden = v->plat->surface_visible &&
+                                                    !v->plat->surface_visible(v->plat);
+                                if (hidden)
+                                        LOGD("vulkan: acquire idle (compositor "
+                                             "not consuming — surface hidden)");
+                                else
+                                        LOGW("vulkan: swapchain starved — the compositor "
+                                             "is not releasing FIFO images fast enough; "
+                                             "dropping frames (acquire timeout)");
                         }
                         goto out;
                 }
@@ -3047,6 +3058,15 @@ static bool vk_wsi_present_frame(RenderVK *v, int win, VFrame *fr)
                 pi.swapchainCount = 1;
                 pi.pSwapchains = &w->swapchain;
                 pi.pImageIndices = &img;
+                /* Latched-frame evidence for the idle machinery (Wayland):
+                 * request a wl_surface.frame callback on the very surface
+                 * this present is about to commit. The request rides the
+                 * same client queue, so the driver's commit carries it and
+                 * the compositor fires it on latch — wlshim's visibility
+                 * clock then has the same evidence the wl_shm path uses.
+                 * No-op elsewhere (X11 / raw client: hook is NULL). */
+                if (v->plat->wsi_frame_request)
+                        v->plat->wsi_frame_request(v->plat, win);
                 r = v->vkQueuePresentKHR(v->queue, &pi);
                 if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
                         vkwin_destroy(v, w);
@@ -4320,9 +4340,13 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
 
         LOGI("vulkan: swapchain present path ready (queue family %u, format %s, "
              "%u images, BGRA-first) — acquire is slice-pumped so a slow "
-             "compositor can stall a frame but never wedge the loop",
+             "compositor can stall a frame but never wedge the loop%s",
              v->queue_family,
              v->win[0].format == VK_FORMAT_R8G8B8A8_UNORM_ ? "RGBA8" : "BGRA8",
-             v->win[0].nimages);
+             v->win[0].nimages,
+             p->wsi_frame_request
+                 ? "; every present arms a frame callback so the idle "
+                   "power-save pauses rendering when nothing latches"
+                 : "");
         return true;
 }

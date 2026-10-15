@@ -39,7 +39,7 @@ wallpaper engines cannot exist there without compositor extensions. When
 the global is missing, Reverie exits with an explicit message saying
 exactly that.
 
-### Idle power-save (Wayland, wl_shm present path)
+### Idle power-save
 
 A wallpaper daemon runs all day, and most of that time nobody is looking
 at it. On the wl_shm present path the shim watches `wl_callback.done`
@@ -52,11 +52,38 @@ cheapest unambiguous "are you still there?"), and the first latched
 callback resumes full-rate rendering exactly where the scene froze.
 `REV_WL_VIS_MS` tunes the starvation window.
 
-Limitations, on purpose: EGL and `REV_VK_PRESENT=wsi` surfaces are owned
-by their own swapchains (the shim must not interleave commits with the
-driver's), so they do not idle — their present calls throttle themselves.
-The X11 and raw-Wayland-client paths have no latched-frame evidence and
-always render. The pause/resume transitions are logged (`idle: …`).
+**The WSI swapchain path (`REV_VK_PRESENT=wsi`) idles too.** The shim
+cannot re-attach swapchain buffers (the driver owns the commits), so the
+evidence travels the other way: every `vkQueuePresentKHR` is preceded by
+a `wl_surface.frame` request on the very surface the present commits —
+the callback fires when the compositor latches that present, which gives
+the shim the same callback-starvation clock the wl_shm path uses.
+Multiple pending frame callbacks on one surface are legal Wayland, so
+this never fights the driver's own pacing. While starved the daemon does
+NOT stop outright: it renders one frozen-clock frame per idle tick
+(~4 Hz) and presents it — that probe present is the only thing that can
+carry a frame request to a sleeping compositor. A compositor that
+latches again flips the daemon straight back to full rate. Deliberately,
+present/backpressure evidence (buffer releases, acquire stalls) is NOT
+treated as visibility — only latched callbacks are.
+
+**The idle watchdog** (`REV_IDLE_AUDIT_S`, default 30 s, 0 disables)
+covers every platform and present path: after a long continuous hidden
+period the daemon forces a 1 s full-rate audit burst, whose presents
+re-arm the latching evidence. A wedged idle detector can slow the daemon
+down; it can never put it permanently to sleep. On a genuinely dark
+display the burst costs a few dropped acquires once per interval.
+
+Limitations, on purpose: EGL surfaces are owned by their swapchain
+(`eglSwapBuffers` interleaving is off-limits) so they do not idle yet;
+compositors that answer `wl_surface.frame` "immediately" for hidden
+surfaces (allowed by the spec) keep the daemon at full rate — a
+conservative failure mode; and a surface that is merely OCCLUDED while
+its output keeps repainting (a video fullscreened over the wallpaper)
+still receives callbacks, so it still renders. The raw-Wayland-client
+path has no latched-frame evidence and always renders. The X11 path
+uses DPMS instead (see below). The pause/resume transitions are logged
+(`idle: …`).
 
 ## The renderer policy (2026-10 redesign)
 
@@ -293,6 +320,7 @@ selects.
 | `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 | `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long flips the daemon to paused — see "Idle power-save") |
+| `REV_IDLE_AUDIT_S`  | idle watchdog interval in seconds (default 30, 0 = off): after this long continuously hidden, a 1 s full-rate audit burst guards against a wedged idle detector |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
 | `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |

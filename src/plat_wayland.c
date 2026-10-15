@@ -182,6 +182,24 @@ static bool pw_surface_visible(RPlatform *p)
         return true;
 }
 
+static bool pw_wsi_frame_request(RPlatform *p, int win)
+{
+        (void)p;
+        /* Wayland + shim only: attaches the latched-callback evidence the
+         * Vulkan WSI present path needs (see wlshim.h). */
+        if (wlshim_active())
+                return wlshim_wsi_frame_request(win);
+        return false;
+}
+
+static bool pw_hidden_render_probe(RPlatform *p)
+{
+        (void)p;
+        if (wlshim_active())
+                return wlshim_hidden_render_probe();
+        return false;
+}
+
 static bool pw_win_geometry(RPlatform *p, int win, RRect *geom)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
@@ -261,6 +279,8 @@ RPlatform *plat_wayland_create(void)
         p->wait_frame = pw_wait_frame;
         p->dropped_frames = pw_dropped_frames;
         p->surface_visible = pw_surface_visible;
+        p->wsi_frame_request = pw_wsi_frame_request;
+        p->hidden_render_probe = pw_hidden_render_probe;
         p->win_geometry = pw_win_geometry;
         p->sync = pw_sync;
         p->should_close = pw_should_close;

@@ -126,9 +126,28 @@ struct RPlatform {
          * every wl_shm-presented window went unlatched past the visibility
          * window — fullscreen app on top, display asleep). The daemon then
          * stops rendering and paces at a slow probe rate until the platform
-         * flips back. NULL = platform cannot tell (X11, raw Wayland client)
-         * and the caller must assume always-visible. */
+         * flips back. NULL = platform cannot tell (X11 classic, raw Wayland
+         * client) and the caller must assume always-visible. */
         bool (*surface_visible)(RPlatform *p);
+
+        /* ---- WSI-present visibility support (Wayland shim) -----------------
+         * wsi_frame_request(): called by a renderer RIGHT BEFORE it presents
+         * through its own WSI swapchain on `win`. The platform attaches a
+         * latched-frame signal (Wayland: a wl_surface.frame callback on the
+         * very surface the swapchain commits) so surface_visible() gains the
+         * same callback-starvation evidence the wl_shm path already uses.
+         * The callback request rides the same event queue the driver's
+         * present commit flushes, so the compositor fires it exactly when
+         * that present is latched. NULL = nothing to do (X11, raw client).
+         *
+         * hidden_render_probe(): true when the platform's idle detection
+         * CANNOT probe on its own and needs the engine to keep rendering at
+         * the idle pace while hidden — Vulkan WSI: only a real swapchain
+         * present (buffer attach + commit) can carry the frame request a
+         * sleeping compositor will eventually answer. NULL/false = the old
+         * behavior (skip rendering entirely; wl_shm re-attach probes). */
+        bool (*wsi_frame_request)(RPlatform *p, int win);
+        bool (*hidden_render_probe)(RPlatform *p);
 
         /* ---- tests / tools ---- */
         u32 *(*screenshot)(RPlatform *p, int win, u32 *w, u32 *h);

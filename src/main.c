@@ -102,6 +102,9 @@ static void usage(void)
 "  REV_WL_VIS_MS   idle power-save starvation window in ms (default 250):\n"
 "                  a wl_shm-presented surface unlatched this long pauses\n"
 "                  rendering until the compositor latches the idle probe\n"
+"  REV_IDLE_AUDIT_S idle watchdog interval in seconds (default 30, 0 = off):\n"
+"                  after this long continuously hidden, a 1 s full-rate\n"
+"                  audit burst guards against a wedged idle detector\n"
 "  REV_AUTO_VK     1 = let auto also consider the present-only Vulkan\n"
 "                  tier (off by default: that tier composites on CPU)\n"
 "  REV_AUTO_GL_SW  1 = let auto keep software GL (llvmpipe) instead of\n"
@@ -584,7 +587,26 @@ int main(int argc, char **argv)
         f64 t_vis = 0;
         f64 next_deadline = 0;
         bool prev_visible = true;
+        bool prev_active = true;
         bool idle_note_shown = false;
+        /* idle watchdog (REV_IDLE_AUDIT_S, default 30, 0 = off): after this
+         * many SECONDS of continuous "hidden", force one 1 s full-rate
+         * audit burst. If the visibility evidence ever wedges (a compositor
+         * that never answers probes while actually showing the surface),
+         * the burst's presents re-arm the latching evidence and flip the
+         * daemon back to rendering — no platform's idle detection can
+         * permanently sleep the engine. On a genuinely dark display the
+         * burst costs a handful of dropped acquires, once per interval. */
+        f64 idle_audit_s = 30.0;
+        {
+                const char *e = getenv("REV_IDLE_AUDIT_S");
+                if (e && *e)
+                        idle_audit_s = atof(e);
+                if (idle_audit_s < 0)
+                        idle_audit_s = 0;
+        }
+        f64 hidden_since = 0;
+        f64 audit_until = -1;
         /* REV_PROFILE=1: stage breakdown appended to the periodic perf line.
          * Averages LIE on a contended box (one 300ms stall poisons a 5s
          * mean while fps barely moves), so frame times ALSO report
@@ -682,12 +704,49 @@ int main(int argc, char **argv)
                  * visible, exactly the old behavior. */
                 bool visible = !plat->surface_visible ||
                                plat->surface_visible(plat);
+
+                /* idle watchdog audit bursts (see the comment at the state
+                 * declarations) — never lets a wedged detector sleep us
+                 * forever, on ANY platform. */
+                if (!visible && idle_audit_s > 0) {
+                        if (hidden_since == 0)
+                                hidden_since = now;
+                        if (now - hidden_since >= idle_audit_s) {
+                                hidden_since = now;
+                                audit_until = now + 1.0;
+                                LOGI("idle watchdog: %.0fs hidden — 1s audit "
+                                     "burst (guards against a wedged idle "
+                                     "detector; REV_IDLE_AUDIT_S=0 disables)",
+                                     idle_audit_s);
+                        }
+                } else {
+                        hidden_since = 0;
+                }
+                const bool audit = now < audit_until;
+
+                /* WSI idle probe: when the present path itself must carry
+                 * the compositor probe (Vulkan swapchain on Wayland), keep
+                 * rendering at the idle pace while hidden — each probe
+                 * present arms a fresh frame request the compositor answers
+                 * when it comes back. The scene clock stays frozen (dt=0
+                 * below), so probe frames are pixel-identical. */
+                const bool wsi_probe = !visible && !audit &&
+                                       plat->hidden_render_probe &&
+                                       plat->hidden_render_probe(plat);
+                const bool render_now = visible || wsi_probe || audit;
+
                 if (prof_on && visible && nframe_ms < PERF_RING)
                         frame_ms[nframe_ms++] = dt * 1000.0;
                 if (!visible && !idle_note_shown) {
                         idle_note_shown = true;
-                        LOGI("idle: no surface is being shown — rendering paused "
-                             "(compositor probe ~4 Hz, scene clock frozen)");
+                        if (wsi_probe)
+                                LOGI("idle: no surface is being shown — "
+                                     "rendering at probe rate only (WSI "
+                                     "presents ~4 Hz carry the frame "
+                                     "requests; scene clock frozen)");
+                        else
+                                LOGI("idle: no surface is being shown — rendering paused "
+                                     "(compositor probe ~4 Hz, scene clock frozen)");
                 } else if (visible && idle_note_shown) {
                         idle_note_shown = false;
                         LOGI("idle: surface visible again — rendering resumed");
@@ -778,11 +837,13 @@ int main(int argc, char **argv)
                 }
 
                 /* render + present — skipped entirely while no surface is
-                 * visible (idle power-save): no GPU work, no sims, no
-                 * presents. wlshim's idle probe re-draws when the compositor
+                 * visible (idle power-save), EXCEPT when the present path
+                 * itself must carry the compositor probe (wsi_probe — one
+                 * frozen-clock frame per idle tick) or an audit burst is
+                 * running. wlshim's idle probe re-draws when the compositor
                  * comes back, and the frozen scene clock resumes the scene
                  * exactly where it stopped. */
-                if (visible) {
+                if (render_now) {
                         for (int i = 0; i < nmon; i++) {
                                 if (winidx[i] < 0 || !fbs[i].px)
                                         continue;
@@ -1010,11 +1071,14 @@ int main(int argc, char **argv)
                  * period resyncs (skips the missed slots) instead of letting
                  * the grid drift; so does a visibility flip (idle period ->
                  * frame period). While hidden, pace at the probe cadence. */
-                f64 frame_len = visible ? (1.0 / fps) : IDLE_PACE_S;
-                if (visible != prev_visible || now >= next_deadline + frame_len)
-                        next_deadline = now + frame_len;    /* resync */
-                else
-                        next_deadline += frame_len;        /* keep the grid */
+                f64 frame_len = (visible || audit) ? (1.0 / fps) : IDLE_PACE_S;
+                {
+                        const bool active = visible || audit;
+                        if (active != prev_active || now >= next_deadline + frame_len)
+                                next_deadline = now + frame_len;    /* resync */
+                        else
+                                next_deadline += frame_len;        /* keep the grid */
+                }
                 for (;;) {
                         f64 rem = next_deadline - rev_monotonic();
                         if (rem <= 0.0005)
@@ -1031,7 +1095,8 @@ int main(int argc, char **argv)
                                 break;    /* quit arrived during the wait */
                 }
                 prev_visible = visible;
-                if (visible)
+                prev_active = visible || audit;
+                if (visible || audit)
                         frames++;
         }
 
