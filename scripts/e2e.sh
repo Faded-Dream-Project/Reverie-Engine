@@ -67,8 +67,12 @@ stop_xvfb() {
 }
 
 # ---- CPU tier (always) -------------------------------------------------------
+# timeout 14 (not 8): the FIRST leg after the build also pays the runner's
+# cold start — a hosted run measured 6 s between scene load and X11 connect
+# (page cache / JIT warmup), which ate the whole budget before the 3 s
+# screenshot could happen. The assertion is unchanged: the shot must exist.
 start_xvfb
-DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/cpu" "$SCENE" \
+DISPLAY="$XDISPLAY" timeout 14 ./build/reverie -R cpu --shot 3 "$OUT/cpu" "$SCENE" \
     > "$OUT/cpu.log" 2>&1 || true
 if [ -f "$OUT/cpu.png" ]; then
     echo "    cpu:          PASS (screenshot captured)"

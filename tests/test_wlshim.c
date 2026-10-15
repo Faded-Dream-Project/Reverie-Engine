@@ -42,6 +42,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -79,10 +80,15 @@ static void s_send(u32 obj, u32 opcode, const u8 *payload, size_t plen)
         u32 size = (u32)(8 + plen);
         s_put32(hdr, obj);
         s_put32(hdr + 4, ((u32)size << 16) | (opcode & 0xffffu));
+        /* A failed write means the client is gone (teardown race: the
+         * main thread disconnects its display while the server still has
+         * an event in flight). That is a normal shutdown, not a failure —
+         * return quietly; anything important is caught by the post-join
+         * checks. SIGPIPE is ignored in main for the same reason. */
         if (write(cli_fd, hdr, 8) != 8)
-                exit(2);
+                return;
         if (plen && write(cli_fd, payload, plen) != (ssize_t)plen)
-                exit(2);
+                return;
 }
 
 static void s_send_str_event(u32 obj, u32 opcode, u32 a, const char *s, u32 b)
@@ -806,6 +812,10 @@ static void *server(void *arg)
 
 int main(void)
 {
+        /* the fake compositor writes from its thread; a write racing the
+         * client's disconnect must not kill the whole process (the silent
+         * CI crashes on fast runners were exactly this) */
+        signal(SIGPIPE, SIG_IGN);
         setvbuf(stdout, NULL, _IOLBF, 0);   /* failures stay visible if we die */
         alarm(30);                          /* hang guard: real libwayland may
                                              * block in dispatch if our metadata
