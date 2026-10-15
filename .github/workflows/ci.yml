@@ -130,16 +130,16 @@ jobs:
             install: "pacman -Sy --noconfirm git base-devel ffmpeg"
           - distro: debian
             image: "debian:latest"
-            install: "apt-get update && apt-get install -y --no-install-recommends git build-essential libavcodec-dev libavformat-dev libavutil-dev libswscale-dev"
+            install: "apt-get update && apt-get install -y --no-install-recommends ca-certificates git build-essential libavcodec-dev libavformat-dev libavutil-dev libswscale-dev"
           - distro: fedora
             image: "fedora:latest"
-            install: "dnf -y install git gcc make ffmpeg-devel"
+            install: "dnf -y install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)' || { dnf -y install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm && dnf -y install git gcc make ffmpeg-devel; }"
           - distro: opensuse-tumbleweed
             image: "opensuse/tumbleweed:latest"
             install: "zypper -n install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)'"
           - distro: void
             image: "voidlinux/voidlinux:latest"
-            install: "xbps-install -Sy git base-devel ffmpeg-devel"
+            install: "mkdir -p /etc/xbps.d && cp /usr/share/xbps.d/*-repository-*.conf /etc/xbps.d/ 2>/dev/null; printf 'repository=https://repo-default.voidlinux.org/current\n' > /etc/xbps.d/00-repository-main.conf && xbps-install -Sy git base-devel ffmpeg-devel"
     name: distro (${{ matrix.distro }})
     container: ${{ matrix.image }}
     steps:

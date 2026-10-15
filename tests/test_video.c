@@ -271,7 +271,7 @@ int main(int argc, char **argv)
 		if (nself <= 0 || !mkdtemp(dir)) {
 			CHECK(false, "stub leg setup (readlink/mkdtemp)");
 		} else {
-			char scmd[768];
+			char scmd[1100];
 			int rc;
 			self[nself] = '\0';
 			snprintf(scmd, sizeof scmd,
@@ -281,7 +281,17 @@ int main(int argc, char **argv)
 				 "libavformat.so.59 libavformat.so.58 libavformat.so libavutil.so.59 "
 				 "libavutil.so.58 libavutil.so.57 libavutil.so.56 libavutil.so "
 				 "libswscale.so.8 libswscale.so.7 libswscale.so.6 libswscale.so.5 "
-				 "libswscale.so; do ln -sf libstub.so \"$n\"; done",
+				 "libswscale.so "
+				 "libavcodec.so.62 libavcodec.so.63 libavcodec.so.64 libavcodec.so.65 "
+				 "libavcodec.so.66 libavcodec.so.67 libavcodec.so.68 libavcodec.so.69 "
+				 "libavcodec.so.70 "
+				 "libavformat.so.62 libavformat.so.63 libavformat.so.64 libavformat.so.65 "
+				 "libavformat.so.66 libavformat.so.67 libavformat.so.68 libavformat.so.69 "
+				 "libavformat.so.70 "
+				 "libavutil.so.60 libavutil.so.61 libavutil.so.62 libavutil.so.63 "
+				 "libavutil.so.64 libavutil.so.65 libavutil.so.66 "
+				 "libswscale.so.9 libswscale.so.10 "
+				 "; do ln -sf libstub.so \"$n\"; done",
 				 dir);
 			rc = system(scmd);
 			CHECK(rc == 0, "stub leg: loader sonames shadowed with empty .so");
