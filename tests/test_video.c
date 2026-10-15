@@ -101,16 +101,20 @@ int main(int argc, char **argv)
 			 * queue; the daemon's frame pacing provides it) */
 			int frames_seen = 0;
 			u32 last_w = 0;
+			bool saw_rgb = false;
 			for (int i = 0; i < 90; i++) {
 				f = rev_video_display(v, 1.0 / 30.0);
 				if (f && f->w) {
 					frames_seen++;
 					last_w = f->w;
+					if (f->rgb)
+						saw_rgb = true;
 				}
 				usleep(1000);
 			}
 			CHECK(frames_seen > 30, "playback advances (%d display frames)",
 			      frames_seen);
+			CHECK(!saw_rgb, "h264 fixture stays on the YUV plane path");
 			CHECK(last_w == 320, "frame descriptor stays valid");
 
 			/* loop past EOF: playhead 2s video + more steps still yields frames */
@@ -165,6 +169,93 @@ int main(int argc, char **argv)
 					rev_video_close(mv);
 				}
 				free(data);
+			}
+		}
+	}
+
+	/* ---- RGB-family sources: animated GIF, transparency, stride --------- *
+	 * Fixture: a hand-crafted 80x60 two-frame GIF — frame 0 fully
+	 * transparent, frame 1 opaque red, 0.5 s delays (regenerate with
+	 * scripts/mk_gif_fixture.py). Real-world decoders may hand us PAL8,
+	 * BGRA, or RGBA depending on the FFmpeg build — normalize_rgb must
+	 * turn every one of those into packed engine-order RGBA with the
+	 * transparency intact. */
+	{
+		const char *gif = "tests/fixtures/gif_anim_transparent.gif";
+		if (access(gif, R_OK) != 0) {
+			CHECK(false, "gif fixture present (scripts/mk_gif_fixture.py)");
+		} else if (!have_video) {
+			printf("  ok: gif fixture present, no libraries - gif legs skipped\n");
+		} else {
+			RVideoSource src = { .path = gif };
+			RevVideo *v = rev_video_open(&src, true, err, sizeof err);
+			CHECK(v != NULL, "gif opens (%s)", v ? "" : err);
+			if (v) {
+				/* frame 0: the transparent one, on the rgb path */
+				const RVideoFrame *f = NULL;
+				for (int i = 0; i < 40 && !f; i++) {
+					f = rev_video_display(v, 0.016);
+					usleep(2000);
+				}
+				CHECK(f != NULL && f->rgb && f->w == 80 && f->h == 60,
+				      "gif frame arrives as rgb (%ux%u)",
+				      f ? f->w : 0, f ? f->h : 0);
+				if (f && f->rgb) {
+					static u32 px[80 * 60];
+					CHECK(rev_video_to_rgba(f, px, 80, 60),
+					      "gif converts to rgba");
+					bool all_trans = true;
+					for (int i = 0; i < 80 * 60; i++)
+						if (px[i] & 0xFF000000u)
+							all_trans = false;
+					CHECK(all_trans, "gif frame 0 is fully transparent");
+				}
+
+				/* frame 1: opaque red — pts must honor the 0.5 s delays, and
+				 * the channel order must be the engine's (0xFF0000FF) */
+				static u32 px2[80 * 60];
+				bool red = false;
+				bool all_red = false;
+				for (int i = 0; i < 100 && !red; i++) {
+					f = rev_video_display(v, 0.016);
+					if (f && f->rgb && rev_video_to_rgba(f, px2, 80, 60) &&
+					    (px2[80 * 30 + 40] & 0xFF000000u) != 0) {
+						red = px2[80 * 30 + 40] == 0xFF0000FFu;
+						all_red = true;
+						for (int k = 0; k < 80 * 60; k++)
+							if (px2[k] != 0xFF0000FFu)
+								all_red = false;
+					}
+					usleep(2000);
+				}
+				CHECK(red && all_red,
+				      "gif frame 1 is opaque red in engine byte order");
+
+				/* stride placement: convert into an offset rect of a wider
+				 * buffer — the letterbox path depends on it */
+				if (f && f->rgb) {
+					static u32 wide[100 * 60];
+					memset(wide, 0xCD, sizeof wide);
+					bool ok = rev_video_to_rgba_at(f, wide + 5, 100, 80, 60);
+					CHECK(ok && wide[0] == 0xCDCDCDCDu,
+					      "to_rgba_at leaves the left margin untouched");
+					CHECK(ok && wide[100 * 59 + 5] == 0xFF0000FFu,
+					      "to_rgba_at writes with dst_stride rows");
+				}
+
+				/* looping: the gif demuxer has no seek support — the reopen
+				 * fallback must wrap playback back to frame 0 */
+				int seen = 0;
+				for (int i = 0; i < 120; i++) {
+					const RVideoFrame *lf = rev_video_display(v, 0.016);
+					if (lf && lf->w)
+						seen++;
+					usleep(2000);
+				}
+				CHECK(seen > 60, "gif loops past EOF (%d frames)", seen);
+
+				rev_video_close(v);
+				printf("  ok: gif clean close\n");
 			}
 		}
 	}

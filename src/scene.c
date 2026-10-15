@@ -1328,6 +1328,30 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 }
                                 i32 dx = (i32)((W - pw) / 2.0), dy = (i32)((H - ph) / 2.0);
 
+                                if (fl && fl->video_offload && vf->rgb) {
+                                        /* GPU: RGB-family frames (animated
+                                         * GIF etc.) are already packed
+                                         * straight-alpha RGBA rasters with
+                                         * tight rows — the standard pixel
+                                         * layer path, placed like an image */
+                                        if (fl->n >= RT_FRAME_MAX_LAYERS)
+                                                break;
+                                        RTLayerCmd *cmd = &fl->cmds[fl->n++];
+                                        memset(cmd, 0, sizeof *cmd);
+                                        cmd->px = (const u32 *)vf->rgba;
+                                        cmd->w = vf->w;
+                                        cmd->h = vf->h;
+                                        cmd->place_w = pw;
+                                        cmd->place_h = ph;
+                                        cmd->dx = dx;
+                                        cmd->dy = dy;
+                                        cmd->blend = L->blend;
+                                        cmd->opacity = e.opacity;
+                                        cmd->blur = 0.0;
+                                        cmd->linear = true;
+                                        cmd->content_id = 0;
+                                        continue;
+                                }
                                 if (fl && fl->video_offload) {
                                         /* GPU: hand the YUV planes over — the
                                          * renderer uploads them (3.1MB at

@@ -78,6 +78,7 @@ typedef struct {
 
         void *(*av_malloc)(size_t size);
         void (*av_free)(void *ptr);
+        AVBufferRef *(*av_buffer_alloc)(int size);
 
         struct SwsContext *(*sws_getContext)(int srcW, int srcH, enum AVPixelFormat srcFormat,
                                              int dstW, int dstH, enum AVPixelFormat dstFormat,
@@ -155,6 +156,7 @@ static bool ff_load(void)
         LOAD(avformat, avformat_version);
         LOAD(avutil, av_malloc);
         LOAD(avutil, av_free);
+        LOAD(avutil, av_buffer_alloc);
         LOAD(avformat, avformat_alloc_context);
         LOAD(avformat, avio_alloc_context);
         LOAD(avformat, avformat_open_input);
@@ -245,11 +247,27 @@ struct RevVideo {
         /* shared (lock-guarded) */
         AVFrame *q[VQ_MAX];
         int qn;
+        int qcap;           /* effective queue depth: VQ_MAX for plane
+                             * sources, memory-bounded for RGB sources  */
         AVFrame *cur;         /* frame being displayed (ref'd)            */
         f64 cur_pts;
         bool dead;            /* irrecoverable error / shutdown           */
         bool ended;           /* stream ended (non-loop)                  */
+        bool wrap_pending;    /* loop mode: decoder hit EOF and waits for
+                               * the consumer to drain the queue and wrap
+                               * the playhead (consumer-driven wrap — a
+                               * decoder-side reset fast-forwards or, on
+                               * files shorter than the queue, resets the
+                               * playhead before the frames ever show)    */
         u64 dropped;
+
+        /* RGB normalization (decode thread only): non-YUV420P frames are
+         * converted to packed RGBA right where they decode, so the render
+         * thread only ever grabs pointers. The sws context is keyed on
+         * srcW/srcH/srcFormat; GIFs may change palette mid-stream without
+         * changing the format key (the palette travels per-frame). */
+        struct SwsContext *rgb_sws;
+        int rgb_sws_w, rgb_sws_h, rgb_sws_fmt;
 
         /* display side (render thread) */
         f64 playhead;
@@ -303,13 +321,181 @@ static f64 pts_seconds(int64_t pts, AVRational tb)
         return (f64)pts * (f64)tb.num / (f64)tb.den;
 }
 
+/* Non-YUV420P frames (animated GIF/PAL8, RGBA MOVs, PNG streams...) are
+ * normalized HERE, on the decode thread, into a synthetic AVFrame that
+ * owns one refcounted RGBA buffer:
+ *   - format AV_PIX_FMT_RGBA — byte order R,G,B,A, which is exactly the
+ *     engine's native 0xAABBGGRR u32 packing in little-endian memory;
+ *   - data[0] tight rows (linesize == w*4) so the buffer can serve as a
+ *     plain cmd.px raster without any re-pack;
+ *   - pts/duration copied from the source frame.
+ * YUV420P (and the full-range YUVJ420P alias) passes through unchanged —
+ * the GPU tiers' plane-upload path keeps its 2.7x bandwidth advantage.
+ * Returns the replacement frame (the caller frees the original). */
+static AVFrame *normalize_rgb(RevVideo *v, AVFrame *f)
+{
+        if (f->format == AV_PIX_FMT_YUV420P ||
+            f->format == AV_PIX_FMT_YUVJ420P)
+                return f;
+
+        if (v->rgb_sws &&
+            (v->rgb_sws_w != f->width || v->rgb_sws_h != f->height ||
+             v->rgb_sws_fmt != f->format)) {
+                g_ff.sws_freeContext(v->rgb_sws);
+                v->rgb_sws = NULL;
+        }
+        if (!v->rgb_sws) {
+                v->rgb_sws = g_ff.sws_getContext(f->width, f->height,
+                                                 (enum AVPixelFormat)f->format,
+                                                 f->width, f->height,
+                                                 AV_PIX_FMT_RGBA,
+                                                 SWS_BILINEAR, NULL, NULL, NULL);
+                v->rgb_sws_w = f->width;
+                v->rgb_sws_h = f->height;
+                v->rgb_sws_fmt = f->format;
+                if (!v->rgb_sws)
+                        return f;    /* cannot convert: show planes (best effort) */
+        }
+
+        AVFrame *o = g_ff.av_frame_alloc();
+        if (!o)
+                return f;
+        const int ls = f->width * 4;
+        o->buf[0] = g_ff.av_buffer_alloc((size_t)ls * f->height);
+        if (!o->buf[0]) {
+                g_ff.av_frame_free(&o);
+                return f;
+        }
+        o->data[0] = o->buf[0]->data;
+        o->linesize[0] = ls;
+        o->format = AV_PIX_FMT_RGBA;
+        o->width = f->width;
+        o->height = f->height;
+        o->pts = f->pts;
+        o->duration = f->duration;
+
+        /* PAL8 carries its palette in data[1]; every other format is a
+         * plain plane list. sws reads the palette per call, so mid-stream
+         * palette changes (GIF local color tables) need no re-keying. */
+        const uint8_t *src[4] = { f->data[0], f->data[1], NULL, NULL };
+        const int src_ls[4] = { f->linesize[0], f->linesize[1], 0, 0 };
+        uint8_t *dst[1] = { o->data[0] };
+        const int dst_ls[1] = { ls };
+        if (g_ff.sws_scale(v->rgb_sws, src, src_ls, 0, f->height,
+                           dst, dst_ls) != f->height) {
+                g_ff.av_frame_free(&o);
+                return f;
+        }
+        g_ff.av_frame_free(&f);
+        return o;
+}
+
+/* Reopens the demuxer + decoder from byte zero (decode thread). Used by
+ * looping when the demuxer has no seek support — the animated-GIF
+ * demuxer is the notable member of that family. Swaps the new contexts
+ * in under the lock (rev_video_display reads fmt->streams[] under the
+ * same lock) and resets the playback state. Returns false when even the
+ * reopen fails (treated as end-of-stream). */
+static bool reopen_input(RevVideo *v)
+{
+        AVFormatContext *fmt = NULL;
+        AVCodecContext *cdc = NULL;
+        AVIOContext *avio = NULL;
+        AVIOBox *box = NULL;
+        int vstream = -1;
+
+        fmt = g_ff.avformat_alloc_context();
+        if (!fmt)
+                return false;
+        if (v->src.path) {
+                if (g_ff.avformat_open_input(&fmt, v->src.path, NULL, NULL) < 0)
+                        goto fail;
+        } else {
+                box = (AVIOBox *)calloc(1, sizeof *box);
+                unsigned char *buf = (unsigned char *)g_ff.av_malloc(64 * 1024);
+                if (!box || !buf)
+                        goto fail;
+                box->data = v->src.data;
+                box->len = v->src.len;
+                avio = g_ff.avio_alloc_context(buf, 64 * 1024, 0, box,
+                                               avio_read_box, NULL, avio_seek_box);
+                if (!avio) {
+                        g_ff.av_free(buf);
+                        goto fail;
+                }
+                fmt->pb = avio;
+                if (g_ff.avformat_open_input(&fmt, "packed.mp4", NULL, NULL) < 0)
+                        goto fail;
+        }
+        if (g_ff.avformat_find_stream_info(fmt, NULL) < 0)
+                goto fail;
+        {
+                const AVCodec *dec = NULL;
+                vstream = g_ff.av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO,
+                                                   -1, -1, &dec, 0);
+                if (vstream < 0 || !dec)
+                        goto fail;
+                cdc = g_ff.avcodec_alloc_context3(dec);
+                if (!cdc)
+                        goto fail;
+                cdc->thread_count = 1;
+                if (g_ff.avcodec_parameters_to_context(
+                            cdc, fmt->streams[vstream]->codecpar) < 0 ||
+                    g_ff.avcodec_open2(cdc, dec, NULL) < 0)
+                        goto fail;
+        }
+
+        /* swap under the lock: display reads the old stream's time base
+         * through v->fmt; frames it still holds are refcounted and safe.
+         * (The queue is empty and the playhead already wrapped — the
+         * consumer-driven protocol guarantees both before we get here.) */
+        pthread_mutex_lock(&v->mu);
+        AVFormatContext *of = v->fmt;
+        AVCodecContext *oc = v->cdc;
+        AVIOContext *oa = v->avio;
+        AVIOBox *ob = v->avio_box;
+        v->fmt = fmt;
+        v->cdc = cdc;
+        v->vstream = vstream;
+        v->avio = avio;
+        v->avio_box = box;
+        pthread_cond_broadcast(&v->cv);
+        pthread_mutex_unlock(&v->mu);
+
+        /* free the replaced contexts OUTSIDE the lock */
+        if (oc)
+                g_ff.avcodec_free_context(&oc);
+        if (of)
+                g_ff.avformat_close_input(&of);
+        if (oa) {
+                if (oa->buffer)
+                        g_ff.av_free(oa->buffer);
+                g_ff.av_free(oa);
+        }
+        free(ob);
+        return true;
+
+fail:
+        if (cdc)
+                g_ff.avcodec_free_context(&cdc);
+        if (fmt)
+                g_ff.avformat_close_input(&fmt);
+        if (avio) {
+                if (avio->buffer)
+                        g_ff.av_free(avio->buffer);
+                g_ff.av_free(avio);
+        }
+        free(box);
+        return false;
+}
+
 static void *decode_thread(void *arg)
 {
         RevVideo *v = (RevVideo *)arg;
 
         for (;;) {
                 pthread_mutex_lock(&v->mu);
-                while (!v->dead && v->qn == VQ_MAX)
+                while (!v->dead && v->qn == v->qcap)
                         pthread_cond_wait(&v->cv, &v->mu);
                 bool dead = v->dead;
                 pthread_mutex_unlock(&v->mu);
@@ -318,21 +504,43 @@ static void *decode_thread(void *arg)
 
                 int rc = g_ff.av_read_frame(v->fmt, v->pkt);
                 if (rc < 0) {
-                        /* EOF or read error: loop or finish */
-                        if (v->loop &&
-                            g_ff.av_seek_frame(v->fmt, -1, 0, AVSEEK_FLAG_BACKWARD) >= 0) {
-                                g_ff.avcodec_flush_buffers(v->cdc);
-                                g_ff.av_packet_unref(v->pkt);
+                        /* EOF or read error: loop or finish.
+                         *
+                         * Looping is CONSUMER-DRIVEN: mark wrap_pending
+                         * and sleep until the render side drains the
+                         * queue and resets the playhead itself. A
+                         * decoder-side playhead reset races the consumer
+                         * — on files shorter than the queue depth (a
+                         * 2-frame GIF) the decoder wraps so fast the
+                         * playhead never advances past frame 0, and on
+                         * longer files the still-queued tail of cycle N
+                         * plays during cycle N+1. Sleeping here also
+                         * means a paused/hidden daemon stops decoding
+                         * entirely instead of spinning through EOF. */
+                        bool looped = false;
+                        if (v->loop) {
                                 pthread_mutex_lock(&v->mu);
-                                v->playhead = 0;
-                                v->ended = false;
-                                for (int i = 0; i < v->qn; i++) {
-                                        g_ff.av_frame_free(&v->q[i]);
-                                        v->q[i] = NULL;
-                                }
-                                v->qn = 0;
+                                v->wrap_pending = true;
                                 pthread_cond_broadcast(&v->cv);
+                                while (v->wrap_pending && !v->dead)
+                                        pthread_cond_wait(&v->cv, &v->mu);
+                                const bool dead2 = v->dead;
                                 pthread_mutex_unlock(&v->mu);
+                                if (!dead2) {
+                                        if (g_ff.av_seek_frame(v->fmt, -1, 0,
+                                                               AVSEEK_FLAG_BACKWARD) >= 0) {
+                                                g_ff.avcodec_flush_buffers(v->cdc);
+                                                looped = true;
+                                        } else {
+                                                /* no seek support in this
+                                                 * demuxer (animated GIF):
+                                                 * reopen from zero */
+                                                looped = reopen_input(v);
+                                        }
+                                }
+                        }
+                        if (looped) {
+                                g_ff.av_packet_unref(v->pkt);
                                 continue;
                         }
                         pthread_mutex_lock(&v->mu);
@@ -357,18 +565,19 @@ static void *decode_thread(void *arg)
                                 g_ff.av_frame_free(&f);
                                 break;
                         }
+                        f = normalize_rgb(v, f);
                         pthread_mutex_lock(&v->mu);
                         if (v->dead) {
                                 g_ff.av_frame_free(&f);
                                 pthread_mutex_unlock(&v->mu);
                                 break;
                         }
-                        if (v->qn == VQ_MAX) {
+                        if (v->qn == v->qcap) {
                                 /* consumer fell behind: drop the oldest */
                                 g_ff.av_frame_free(&v->q[0]);
                                 memmove(&v->q[0], &v->q[1],
-                                        sizeof(AVFrame *) * (VQ_MAX - 1));
-                                v->q[VQ_MAX - 1] = f;
+                                        sizeof(AVFrame *) * (size_t)(v->qcap - 1));
+                                v->q[v->qcap - 1] = f;
                                 v->dropped++;
                         } else {
                                 v->q[v->qn++] = f;
@@ -481,6 +690,20 @@ RevVideo *rev_video_open(const RVideoSource *src, bool loop,
                 goto out;
         }
 
+        /* queue depth: plane frames are refcounted (cheap), but RGB-family
+         * sources hold full RGBA copies — bound the run-ahead memory so a
+         * 4K RGBA stream cannot queue 200 MB. 48 MB / frame bytes, clamped
+         * to [2, VQ_MAX]. */
+        v->qcap = VQ_MAX;
+        const bool rgb_family =
+                v->cdc->pix_fmt != AV_PIX_FMT_YUV420P &&
+                v->cdc->pix_fmt != AV_PIX_FMT_YUVJ420P;
+        if (rgb_family) {
+                size_t bytes = (size_t)v->cdc->width * v->cdc->height * 4 + 4096;
+                int by_mem = (int)(48u << 20) / (int)(bytes > INT_MAX ? INT_MAX : bytes);
+                v->qcap = by_mem < 2 ? 2 : (by_mem > VQ_MAX ? VQ_MAX : by_mem);
+        }
+
         v->pkt = g_ff.av_packet_alloc();
         if (!v->pkt) {
                 snprintf(err, errcap, "video: packet alloc failed");
@@ -500,8 +723,10 @@ RevVideo *rev_video_open(const RVideoSource *src, bool loop,
         }
         v->thread_started = true;
         ok = true;
-        LOGI("video: %dx%d (%s), loop=%s", v->cdc->width, v->cdc->height,
-             dec->name, loop ? "yes" : "no");
+        LOGI("video: %dx%d (%s, %s, queue %d), loop=%s",
+             v->cdc->width, v->cdc->height, dec->name,
+             rgb_family ? "rgb frames" : "yuv420p planes", v->qcap,
+             loop ? "yes" : "no");
 
 out:
         if (!ok) {
@@ -551,6 +776,8 @@ void rev_video_close(RevVideo *v)
                 g_ff.avcodec_free_context(&v->cdc);
         if (v->fmt)
                 g_ff.avformat_close_input(&v->fmt);
+        if (v->rgb_sws)
+                g_ff.sws_freeContext(v->rgb_sws);
         if (v->avio) {
                 /* custom IO: the format context never owned fmt->pb */
                 if (v->avio->buffer)
@@ -593,12 +820,26 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
                                 g_ff.av_frame_unref(v->cur);
                                 g_ff.av_frame_ref(v->cur, f);
                                 v->cur_pts = pts;
-                                v->disp.y = v->cur->data[0];
-                                v->disp.u = v->cur->data[1];
-                                v->disp.v = v->cur->data[2];
-                                v->disp.ls_y = v->cur->linesize[0];
-                                v->disp.ls_u = v->cur->linesize[1];
-                                v->disp.ls_v = v->cur->linesize[2];
+                                if (v->cur->format == AV_PIX_FMT_RGBA) {
+                                        /* normalized RGB-family frame:
+                                         * packed straight-alpha RGBA8,
+                                         * tight rows, engine byte order */
+                                        v->disp.rgb = true;
+                                        v->disp.rgba = v->cur->data[0];
+                                        v->disp.ls_rgba = v->cur->linesize[0];
+                                        v->disp.y = v->disp.u = v->disp.v = NULL;
+                                        v->disp.ls_y = v->disp.ls_u = v->disp.ls_v = 0;
+                                } else {
+                                        v->disp.rgb = false;
+                                        v->disp.rgba = NULL;
+                                        v->disp.ls_rgba = 0;
+                                        v->disp.y = v->cur->data[0];
+                                        v->disp.u = v->cur->data[1];
+                                        v->disp.v = v->cur->data[2];
+                                        v->disp.ls_y = v->cur->linesize[0];
+                                        v->disp.ls_u = v->cur->linesize[1];
+                                        v->disp.ls_v = v->cur->linesize[2];
+                                }
                                 v->disp.w = (u32)v->cur->width;
                                 v->disp.h = (u32)v->cur->height;
                                 v->disp.ended = v->ended && v->qn == 0;
@@ -618,6 +859,19 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
          * frames while the decode thread slept forever) */
         if (v->qn < before || v->qn < VQ_MAX)
                 pthread_cond_broadcast(&v->cv);
+
+        /* loop wrap (consumer side): the decoder hit EOF and is asleep on
+         * wrap_pending. Once the queue is drained, the playhead is OURS
+         * to reset — this is the only place playback time wraps, so the
+         * decoder can never fast-forward or reset it mid-cycle. cur_pts
+         * resets too: the no-timestamp fallback derives the next pts
+         * from it and would otherwise start the new cycle 2 s in. */
+        if (v->wrap_pending && v->qn == 0) {
+                v->playhead = 0;
+                v->cur_pts = -1e18;
+                v->wrap_pending = false;
+                pthread_cond_broadcast(&v->cv);
+        }
         const RVideoFrame *out = (v->cur && v->disp.w) ? &v->disp : NULL;
         pthread_mutex_unlock(&v->mu);
         return out;
@@ -628,12 +882,39 @@ u64 rev_video_dropped(RevVideo *v)
         return v ? v->dropped : 0;
 }
 
-/* CPU-tier fallback: YUV420P -> straight-alpha RGBA8 at (dw x dh) through
- * swscale. Returns false when the frame format is not what we expect (the
- * caller just skips the layer for that frame). */
-bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh)
+/* CPU-tier conversion: either frame family -> straight-alpha RGBA8,
+ * scaled to (dw x dh), written into a caller-placed rectangle whose row
+ * length is `dst_stride` u32 elements (dw <= dst_stride). One sws pass,
+ * no intermediate blit. Returns false when the frame is malformed. */
+bool rev_video_to_rgba_at(const RVideoFrame *f, u32 *dst, u32 dst_stride,
+                          u32 dw, u32 dh)
 {
         if (!f || !dst || !dw || !dh || !g_ff_ok)
+                return false;
+        if (dst_stride < dw)
+                return false;
+        if (f->rgb) {
+                if (!f->rgba || f->ls_rgba < (int)(f->w * 4))
+                        return false;
+                /* RGBA -> RGBA (scale + copy): alpha survives; the source
+                 * is already in engine byte order (R,G,B,A in memory) */
+                struct SwsContext *sws = g_ff.sws_getContext(
+                        (int)f->w, (int)f->h, AV_PIX_FMT_RGBA,
+                        (int)dw, (int)dh, AV_PIX_FMT_RGBA,
+                        2 /* SWS_BILINEAR */, NULL, NULL, NULL);
+                if (!sws)
+                        return false;
+                const uint8_t *planes[1] = { f->rgba };
+                const int strides[1] = { f->ls_rgba };
+                uint8_t *dstp = (uint8_t *)dst;
+                int dst_ls = (int)dst_stride * 4;
+                g_ff.sws_scale(sws, planes, strides, 0, (int)f->h,
+                               &dstp, &dst_ls);
+                g_ff.sws_freeContext(sws);
+                return true;
+        }
+        /* YUV420P (BT.601) with any destination stride */
+        if (!f->y || !f->u || !f->v)
                 return false;
         struct SwsContext *sws = g_ff.sws_getContext((int)f->w, (int)f->h,
                                                      AV_PIX_FMT_YUV420P,
@@ -646,8 +927,14 @@ bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh)
         const uint8_t *planes[3] = { f->y, f->u, f->v };
         const int strides[3] = { f->ls_y, f->ls_u, f->ls_v };
         uint8_t *dstp = (uint8_t *)dst;
-        int dst_stride = (int)dw * 4;
-        g_ff.sws_scale(sws, planes, strides, 0, (int)f->h, &dstp, &dst_stride);
+        int dst_ls = (int)dst_stride * 4;
+        g_ff.sws_scale(sws, planes, strides, 0, (int)f->h, &dstp, &dst_ls);
         g_ff.sws_freeContext(sws);
         return true;
+}
+
+/* Tight-buffer convenience wrapper (scene layers, tests). */
+bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh)
+{
+        return rev_video_to_rgba_at(f, dst, dw, dw, dh);
 }

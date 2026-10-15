@@ -49,12 +49,25 @@ void rev_video_close(RevVideo *v);
 /* Advances the playhead (seconds) — pause = dt 0. Selects the frame to
  * display; returns its plane description or NULL while nothing is ready
  * (the caller keeps showing whatever it had). Plane pointers stay valid
- * until the NEXT advance/display call. */
+ * until the NEXT advance/display call.
+ *
+ * Two frame families (set by the decoder, checked via `rgb`):
+ *   rgb == false  YUV420P planes (y/u/v + line sizes) — the common video
+ *                 case; GPU tiers upload them as R8 textures.
+ *   rgb == true   packed straight-alpha RGBA8 in `rgba` (line size
+ *                 ls_rgba == w*4, tight rows) — RGB-family sources
+ *                 (animated GIF/PAL8, PNG-frame streams, RGBA MOVs),
+ *                 normalized by the decode thread. Byte order is the
+ *                 engine's native 0xAABBGGRR packing (R,G,B,A in memory
+ *                 on little-endian), identical to RFb/cmd.px pixels. */
 typedef struct {
-        const u8 *y, *u, *v;      /* YUV420P planes                     */
-        int ls_y, ls_u, ls_v;     /* line sizes (bytes)                */
-        u32 w, h;                 /* coded size                        */
-        bool ended;               /* stream ended (last frame held)    */
+        const u8 *y, *u, *v;      /* YUV420P planes (when !rgb)         */
+        int ls_y, ls_u, ls_v;     /* line sizes (bytes)                 */
+        bool rgb;                 /* true: rgba[] is the frame          */
+        const u8 *rgba;
+        int ls_rgba;              /* bytes per line (== w*4, tight)     */
+        u32 w, h;                 /* coded size                         */
+        bool ended;               /* stream ended (last frame held)     */
 } RVideoFrame;
 
 const RVideoFrame *rev_video_display(RevVideo *v, f64 dt);
@@ -62,9 +75,17 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt);
 /* Diagnostics for the perf/stats path. */
 u64 rev_video_dropped(RevVideo *v);
 
-/* CPU-tier fallback: convert the current frame to straight-alpha RGBA8 at
- * (dw x dh) via swscale (BT.601). False when video is unavailable or the
- * frame format is unexpected. */
+/* CPU-tier conversion: any frame family -> straight-alpha RGBA8 at
+ * (dw x dh) through swscale (BT.601 for YUV sources; RGBA sources keep
+ * their alpha). False when video is unavailable or the frame format is
+ * unexpected. */
 bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh);
+
+/* The same, into a caller-placed rectangle: `dst` may sit at an offset
+ * inside a larger buffer whose row length is `dst_stride` u32 ELEMENTS
+ * (dst_stride >= dw). One conversion, no intermediate blit — the media
+ * mode letterboxes straight into the framebuffer. */
+bool rev_video_to_rgba_at(const RVideoFrame *f, u32 *dst, u32 dst_stride,
+                          u32 dw, u32 dh);
 
 #endif /* REV_VIDEO_H */

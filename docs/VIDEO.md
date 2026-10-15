@@ -96,18 +96,45 @@ every GPU. The upload itself is bounded: 1080p YUV420P = 3.1 MB/frame
   bounded queue (~6 frames), never blocks the render loop; the render
   thread only ever locks briefly to read the current frame's plane
   pointers.
-* **Looping** via seek-to-zero + codec flush; clean EOF holds the last
-  frame. Playback timing is driven by the layer's own playhead
+* **Two frame families**, selected by what the decoder actually emits:
+  - YUV420P stays on the plane path (Y/U/V borrowed pointers) — the
+    GPU tiers upload them as R8 textures and convert in the composite
+    shader (2.7x less bandwidth than RGBA).
+  - everything else (animated GIF — PAL8 **or** BGRA depending on the
+    FFmpeg build — PNG streams, RGBA MOVs) is normalized to packed
+    straight-alpha RGBA **on the decode thread**, into a synthetic
+    refcounted AVFrame with tight rows (linesize == w*4). The buffer is
+    already in the engine's native 0xAABBGGRR packing on little-endian
+    (sws `AV_PIX_FMT_RGBA` writes R,G,B,A bytes), so it doubles as a
+    plain pixel layer — the CPU tier converts once via
+    `rev_video_to_rgba_at()` straight into a placed rectangle
+    (destination stride supported, no intermediate blit).
+* **Looping is consumer-driven**: at EOF the decoder sleeps on a
+  `wrap_pending` flag until the render side drains the queue and resets
+  its own playhead. A decoder-side reset races the consumer — on files
+  shorter than the queue depth (a 2-frame GIF) the decoder wrapped so
+  fast the playhead never reached frame 1; on longer files the queued
+  tail of cycle N played during cycle N+1. Demuxers without seek
+  support (the GIF demuxer) reopen the input from byte zero instead of
+  seeking; the swap happens under the queue lock. A paused or hidden
+  daemon now stops decoding entirely instead of spinning through EOF.
+* **Memory bound**: plane frames are refcounted (queue depth 6 is
+  cheap); RGB-family sources hold full RGBA copies, so their queue
+  depth is `48 MB / frame bytes`, clamped to [2, 6] — a 4K RGBA stream
+  cannot queue 200 MB.
+* **Playback timing** is driven by the layer's own playhead
   (delta-time, pause-aware) — rendering FPS does not change playback
-  speed.
-* **Audio: not opened.** The video stream is selected explicitly; audio
+  speed; GIF frame delays arrive as normal PTS and are honored exactly.
+  **Audio: not opened.** The video stream is selected explicitly; audio
   tracks are ignored (a wallpaper has no business making sound).
 * Scene language: `layer v { type = video; src = "videos/loop.mp4";
   loop = true; fit = fill; paused = false }` — a normal layer that
-  composites with blend/opacity alongside everything else.
+  composites with blend/opacity alongside everything else (animated
+  GIFs work here too).
 * **GL tier**: Y/U/V planes uploaded as R8 textures, BT.601
   limited-range YUV→RGB in a fragment shader during the standard
-  composite pass (placement/blend/opacity shared with image layers).
+  composite pass (placement/blend/opacity shared with image layers);
+  RGBA frames take the standard pixel-layer path.
 * **CPU tier**: `sws_scale` straight into the placed rectangle —
   functional fallback, identical visual result.
 * Resource safety: videos > 8192×8192 or broken streams are refused with
