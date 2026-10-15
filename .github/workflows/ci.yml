@@ -133,7 +133,9 @@ jobs:
             install: "apt-get update && apt-get install -y --no-install-recommends ca-certificates git build-essential libavcodec-dev libavformat-dev libavutil-dev libswscale-dev"
           - distro: fedora
             image: "fedora:latest"
-            install: "dnf -y install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)' || { dnf -y install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm && dnf -y install git gcc make ffmpeg-devel; }"
+            # pkgconfig() resolves to runtime-only packages on Fedora; the
+            # development headers (full FFmpeg) come from RPM Fusion free
+            install: "dnf -y install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm && dnf -y install git gcc make ffmpeg-devel"
           - distro: opensuse-tumbleweed
             image: "opensuse/tumbleweed:latest"
             install: "zypper -n install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)'"
@@ -155,3 +157,22 @@ jobs:
           make clean
           make -j"$(nproc)" ENABLE_FFMPEG=0
           make test ENABLE_FFMPEG=0
+
+      - name: diagnose signal deaths (informational)
+        if: always()
+        run: |
+          # make reports "FAIL build/test_X" without saying WHY; a suite
+          # killed by a signal exits 128+N. Re-run each suite once with the
+          # exit code visible so hosted-runner crashes classify themselves.
+          for t in build/test_*; do
+            [ -x "$t" ] || continue
+            sh -c "ulimit -c 0; '$t' >/tmp/diag.out 2>&1"
+            rc=$?
+            if [ "$rc" -gt 128 ]; then
+              echo "SUITE $t died by signal $((rc-128)); last output:"
+              tail -8 /tmp/diag.out
+            elif [ "$rc" -ne 0 ]; then
+              echo "SUITE $t exited $rc; last output:"
+              tail -8 /tmp/diag.out
+            fi
+          done

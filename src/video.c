@@ -30,6 +30,16 @@
 #include <libavutil/avutil.h>
 #include <libswscale/swscale.h>
 
+/* AVFrame gained `duration` in FFmpeg 6.1 (libavutil 58.30); older
+ * toolchains (Void's FFmpeg 6.0 era headers) still name it pkt_duration.
+ * One accessor, chosen at compile time — the value means the same thing. */
+#if LIBAVUTIL_VERSION_MAJOR > 58 || \
+    (LIBAVUTIL_VERSION_MAJOR == 58 && LIBAVUTIL_VERSION_MINOR >= 30)
+#define REV_FRAME_DURATION(f) ((f)->duration)
+#else
+#define REV_FRAME_DURATION(f) ((f)->pkt_duration)
+#endif
+
 /* ---- the dlopen'd function table (signatures from the headers) ------------- */
 
 typedef struct {
@@ -377,7 +387,7 @@ static AVFrame *normalize_rgb(RevVideo *v, AVFrame *f)
         o->width = f->width;
         o->height = f->height;
         o->pts = f->pts;
-        o->duration = f->duration;
+        o->duration = REV_FRAME_DURATION(f);
 
         /* PAL8 carries its palette in data[1]; every other format is a
          * plain plane list. sws reads the palette per call, so mid-stream
@@ -845,8 +855,8 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
                                  * duration metadata when present, else one
                                  * average frame period */
                                 {
-                                        f64 dur = f->duration > 0
-                                                ? pts_seconds(f->duration,
+                                        f64 dur = REV_FRAME_DURATION(f) > 0
+                                                ? pts_seconds(REV_FRAME_DURATION(f),
                                                               st->time_base)
                                                 : -1.0;
                                         if (dur <= 0.0 || dur > 10.0)
