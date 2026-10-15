@@ -81,9 +81,29 @@ surfaces (allowed by the spec) keep the daemon at full rate — a
 conservative failure mode; and a surface that is merely OCCLUDED while
 its output keeps repainting (a video fullscreened over the wallpaper)
 still receives callbacks, so it still renders. The raw-Wayland-client
-path has no latched-frame evidence and always renders. The X11 path
-uses DPMS instead (see below). The pause/resume transitions are logged
-(`idle: …`).
+path has no latched-frame evidence and always renders. The pause/resume
+transitions are logged (`idle: …`).
+
+### Idle power-save on X11 (DPMS)
+
+Core X11 has no compositor feedback, so the signal is the DISPLAY POWER
+STATE: the raw-wire client queries the DPMS extension's `DPMSGetInfo`
+(`x11.c`, no Xlib) and treats standby/suspend/off as hidden — rendering
+pauses and the animation clock freezes exactly like the Wayland paths;
+the first "on" answer resumes it. MIT-SCREEN-SAVER's `QueryInfo`
+(screensaver active) is the fallback signal when the server has no DPMS;
+with neither extension the platform keeps the documented "cannot tell —
+always render" contract. The answer is cached 0.5 s (power transitions
+are slow; the frame loop is not), and a server that errors three times
+in a row disables the check with a logged warning instead of wedging
+the loop. `REV_X11_DPMS_FILE=<path>` is a test hook that overrides the
+wire query with a file reading `on`/`standby`/`suspend`/`off` — e2e
+drives the idle machinery through the same code path a real power
+transition takes, on servers without any power extension.
+
+Note on XWayland: an X11-backend session inside Wayland reports DPMS
+from the X server, which may not track the Wayland display's actual
+power state — run the native Wayland backend there for accurate idling.
 
 ## The renderer policy (2026-10 redesign)
 
@@ -321,6 +341,7 @@ selects.
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
 | `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long flips the daemon to paused — see "Idle power-save") |
 | `REV_IDLE_AUDIT_S`  | idle watchdog interval in seconds (default 30, 0 = off): after this long continuously hidden, a 1 s full-rate audit burst guards against a wedged idle detector |
+| `REV_X11_DPMS_FILE` | TEST hook: a file naming the display level (`on`/`standby`/`suspend`/`off`) that overrides the X11 DPMS wire query — drives the idle machinery deterministically on any server |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
 | `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |

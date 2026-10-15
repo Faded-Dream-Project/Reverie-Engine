@@ -20,13 +20,28 @@ typedef struct {
         RRect mons[REV_PLATFORM_MAX_OUTPUTS];
         int nmons;
         int winidx[REV_PLATFORM_MAX_OUTPUTS];
+        /* idle power-save: cached display-power answer — the DPMS query is
+         * a round trip, and power transitions are slow; re-ask at most every
+         * 0.5 s while the frame loop polls every 16 ms */
+        bool vis_last;
+        bool vis_ok;            /* a successful answer is cached          */
+        f64 vis_check;          /* last time we asked the server          */
+        int vis_errors;         /* consecutive cannot-tell answers        */
+        bool vis_broken;        /* gave up after repeated query errors    */
 } PlatX11;
 
 static bool px_init(RPlatform *p, char *err, size_t errcap)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
         c->x = x11_connect(err, errcap);
-        return c->x != NULL;
+        if (!c->x)
+                return false;
+        /* surface_visible only exists when the server can actually answer
+         * a display-state question; otherwise NULL keeps the documented
+         * "cannot tell — always render" contract */
+        if (!x11_display_state_available(c->x))
+                p->surface_visible = NULL;
+        return true;
 }
 
 static void px_fini(RPlatform *p)
@@ -121,6 +136,37 @@ static u64 px_dropped_frames(RPlatform *p)
         return 0;    /* MIT-SHM double-buffer presents are never dropped */
 }
 
+/* Idle power-save: the X11 signal is the DISPLAY POWER STATE, not frame
+ * latching (there is no compositor feedback on core X11). DPMS level
+ * on = visible; standby/suspend/off or an active screensaver = hidden —
+ * rendering pauses exactly like the Wayland paths, and the first "on"
+ * answer resumes it. The answer is cached 0.5 s; a server that errors on
+ * the query three times in a row disables the check (always visible). */
+static bool px_surface_visible(RPlatform *p)
+{
+        PlatX11 *c = (PlatX11 *)p->ctx;
+        f64 now = rev_monotonic();
+        if (c->vis_broken)
+                return true;
+        if (c->vis_ok && now - c->vis_check < 0.5)
+                return c->vis_last;
+        c->vis_check = now;
+        int active = x11_display_active(c->x);
+        if (active < 0) {
+                if (++c->vis_errors >= 3 && !c->vis_broken) {
+                        c->vis_broken = true;
+                        LOGW("x11: display-state queries keep failing — "
+                             "idle power-save disabled (always rendering)");
+                        return true;
+                }
+                return c->vis_ok ? c->vis_last : true;   /* cannot tell */
+        }
+        c->vis_errors = 0;
+        c->vis_ok = true;
+        c->vis_last = active != 0;
+        return c->vis_last;
+}
+
 static bool px_win_geometry(RPlatform *p, int win, RRect *geom)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
@@ -187,6 +233,8 @@ RPlatform *plat_x11_create(void)
         p->pointer = px_pointer;
         p->wait_frame = px_wait_frame;
         p->dropped_frames = px_dropped_frames;
+        p->surface_visible = px_surface_visible;    /* NULLed by init when the
+                                                     * server cannot answer */
         p->win_geometry = px_win_geometry;
         p->sync = px_sync;
         p->should_close = px_should_close;

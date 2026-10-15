@@ -56,6 +56,17 @@ void x11_sync(X11 *x);
 /* Root geometry (screen size). */
 void x11_root_size(X11 *x, u32 *w, u32 *h);
 
+/* Display power state (idle power-save). x11_display_active returns:
+ *   1 = display active (DPMS level on / screensaver off)
+ *   0 = powered down or screensaver on
+ *  -1 = cannot tell (no DPMS/SCREEN-SAVER extension, or a failed query)
+ * REV_X11_DPMS_FILE=<path> overrides the wire query with a file whose text
+ * is "on" / "standby" / "suspend" / "off" (e2e test hook — same code path
+ * a real power transition takes). x11_dpms_file_level is the pure parser. */
+int  x11_display_active(X11 *x);
+bool x11_display_state_available(X11 *x);   /* any signal source at all */
+int  x11_dpms_file_level(const char *text); /* -1, or 0..3 (on..off)     */
+
 /* Grabs a window's contents as RGBA8 straight-alpha (for tests/tools).
  * Returns a malloc'd buffer of w*h pixels, NULL on failure. */
 u32 *x11_screenshot(X11 *x, int win, u32 *w, u32 *h);

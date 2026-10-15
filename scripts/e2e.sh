@@ -422,6 +422,74 @@ else
 fi
 stop_xvfb
 
+# ---- X11 idle power-save: real DPMS transitions (if Xvfb has DPMS) ----------
+# dpmsctl is a raw-wire stand-in for `xset dpms force` (absent in minimal
+# test environments). Force off -> the daemon must pause rendering; force
+# on -> it must resume. Servers without the extension SKIP (the deterministic
+# file-hook leg below carries the coverage there).
+start_xvfb
+cc -O2 -o "$OUT/dpmsctl" scripts/dpmsctl.c 2>/dev/null || true
+DPMSCTL_OK=0
+if [ -x "$OUT/dpmsctl" ]; then
+    DISPLAY="$XDISPLAY" "$OUT/dpmsctl" info > "$OUT/dpmsctl.log" 2>&1 \
+        && DPMSCTL_OK=1
+fi
+if [ "$DPMSCTL_OK" = 1 ]; then
+    DISPLAY="$XDISPLAY" timeout 10 ./build/reverie -R cpu "$SCENE" \
+        > "$OUT/dpms.log" 2>&1 &
+    DPID=$!
+    sleep 2
+    DISPLAY="$XDISPLAY" "$OUT/dpmsctl" force off >> "$OUT/dpmsctl.log" 2>&1
+    sleep 2.5
+    DISPLAY="$XDISPLAY" "$OUT/dpmsctl" force on >> "$OUT/dpmsctl.log" 2>&1
+    sleep 2
+    kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+    if grep -q "idle: no surface" "$OUT/dpms.log" 2>/dev/null \
+       && grep -q "idle: surface visible again" "$OUT/dpms.log" 2>/dev/null; then
+        echo "    x11(dpms):    PASS (display off pauses rendering; on resumes)"
+        PASS=$((PASS+1))
+    else
+        echo "    x11(dpms):    FAIL (idle cycle did not follow DPMS transitions)"
+        cat "$OUT/dpms.log"
+        cat "$OUT/dpmsctl.log"
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    x11(dpms):    SKIP (Xvfb without the DPMS extension)"
+    SKIP=$((SKIP+1))
+fi
+stop_xvfb
+
+# ---- X11 idle power-save: deterministic file-hook cycle + idle watchdog ------
+# REV_X11_DPMS_FILE drives the same query path a real power transition takes,
+# on any server. REV_IDLE_AUDIT_S=2 shrinks the watchdog so the audit burst
+# (full-rate rendering while hidden, escapes a wedged detector) is observable.
+start_xvfb
+DPMSF="$OUT/dpms-state"
+echo on > "$DPMSF"
+DISPLAY="$XDISPLAY" REV_X11_DPMS_FILE="$DPMSF" REV_IDLE_AUDIT_S=2 \
+    timeout 12 ./build/reverie -R cpu "$SCENE" > "$OUT/dpmsf.log" 2>&1 &
+DPID=$!
+sleep 2
+echo off > "$DPMSF"
+sleep 3              # hidden: idle pause + (t>=2s) watchdog audit burst
+echo on > "$DPMSF"
+sleep 2
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+ok=1
+grep -q "idle: no surface" "$OUT/dpmsf.log" 2>/dev/null || ok=0
+grep -q "idle watchdog" "$OUT/dpmsf.log" 2>/dev/null || ok=0
+grep -q "idle: surface visible again" "$OUT/dpmsf.log" 2>/dev/null || ok=0
+if [ "$ok" = 1 ]; then
+    echo "    x11(idle):    PASS (hook-driven pause + watchdog audit + resume)"
+    PASS=$((PASS+1))
+else
+    echo "    x11(idle):    FAIL (idle cycle incomplete)"
+    cat "$OUT/dpmsf.log"
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
 echo "==================================================="
 echo "e2e: $PASS passed, $SKIP skipped (no driver), $FAIL failed"
 echo "logs: $OUT"

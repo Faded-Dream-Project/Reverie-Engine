@@ -49,6 +49,8 @@ struct X11 {
         int rloss, gloss, bloss;
         u16 ext_shm, ext_xinerama;      /* major opcodes, 0 = absent */
         u16 ext_shm_ev;                 /* first event of MIT-SHM    */
+        u16 ext_dpms;                   /* DPMS opcode, 0 = absent (idle power-save) */
+        u16 ext_ss;                     /* MIT-SCREEN-SAVER opcode, 0 = absent      */
         bool is_xwayland;               /* "XWAYLAND" extension present */
         XWin wins[X11_MAX_WINS];
         int nwins;
@@ -467,10 +469,12 @@ X11 *x11_connect(char *err, size_t errcap)
         x->rid_next = 1;
 
         /* extensions */
-        const char *exts[] = { "MIT-SHM", "XINERAMA", "XWAYLAND" };
-        u16 *bases[] = { &x->ext_shm, &x->ext_xinerama, NULL };
-        u16 *firsts[] = { &x->ext_shm_ev, NULL, NULL };
-        for (int e = 0; e < 3; e++) {
+        const char *exts[] = { "MIT-SHM", "XINERAMA", "XWAYLAND", "DPMS",
+                               "MIT-SCREEN-SAVER" };
+        u16 *bases[] = { &x->ext_shm, &x->ext_xinerama, NULL, &x->ext_dpms,
+                         &x->ext_ss };
+        u16 *firsts[] = { &x->ext_shm_ev, NULL, NULL, NULL, NULL };
+        for (int e = 0; e < 5; e++) {
                 u8 q[32];
                 memset(q, 0, sizeof q);
                 u16 nlen = (u16)strlen(exts[e]);
@@ -516,6 +520,30 @@ X11 *x11_connect(char *err, size_t errcap)
                                      get16(rep + 8), get16(rep + 10));
                 }
         }
+
+        /* DPMS handshake — the display-power queries the idle power-save
+         * runs on. MIT-SCREEN-SAVER is the fallback signal when the server
+         * has no DPMS. Their absence is normal (Xvfb builds vary) and only
+         * means "cannot tell" — the platform then reports always-visible. */
+        if (x->ext_dpms) {
+                u8 q[8];
+                memset(q, 0, sizeof q);
+                q[0] = (u8)x->ext_dpms;       /* major = extension base */
+                q[1] = 0;                     /* minor = QueryVersion   */
+                put16(q + 2, 2);
+                put16(q + 4, 2);              /* client version 2.0 */
+                put16(q + 6, 0);
+                if (send_req(x, q, 8)) {
+                        u8 *rep = read_reply(x, false);
+                        if (rep)
+                                LOGI("x11: DPMS server version %u.%u — idle "
+                                     "power-save will follow the display "
+                                     "power level",
+                                     get16(rep + 8), get16(rep + 10));
+                }
+        }
+        if (x->ext_ss)
+                LOGI("x11: MIT-SCREEN-SAVER present (DPMS fallback signal)");
 
         free(body);
         return x;
@@ -1050,6 +1078,115 @@ bool x11_win_geometry(X11 *x, int win, RRect *geom)
                 geom->h = (i32)w->h;
         }
         return true;
+}
+
+/* --------------------------------------------------------------------------
+ * display power state (idle power-save)
+ * ------------------------------------------------------------------------ */
+
+/* REV_X11_DPMS_FILE test hook parser (also pure-unit-tested): a short text
+ * naming the level. Returns the DPMS level number (0=on, 1=standby,
+ * 2=suspend, 3=off) or -1 when the text names none. Whitespace/newlines
+ * tolerated so shell `echo off > file` works. */
+int x11_dpms_file_level(const char *text)
+{
+        if (!text)
+                return -1;
+        /* skip leading whitespace */
+        while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+                text++;
+        static const struct { const char *name; int level; } tab[] = {
+                { "on", 0 }, { "standby", 1 }, { "suspend", 2 }, { "off", 3 },
+        };
+        for (size_t i = 0; i < sizeof tab / sizeof tab[0]; i++) {
+                size_t n = strlen(tab[i].name);
+                if (strncmp(text, tab[i].name, n) == 0) {
+                        const char *rest = text + n;
+                        while (*rest == ' ' || *rest == '\t' ||
+                               *rest == '\r' || *rest == '\n')
+                                rest++;
+                        if (*rest == 0)
+                                return tab[i].level;
+                }
+        }
+        return -1;
+}
+
+/* True when x11_display_active() has any signal to read at all: the DPMS or
+ * MIT-SCREEN-SAVER extension answered at connect, or the test-hook file is
+ * configured. False = "cannot tell" (the platform reports always-visible). */
+bool x11_display_state_available(X11 *x)
+{
+        if (!x)
+                return false;
+        if (x->ext_dpms || x->ext_ss)
+                return true;
+        const char *f = getenv("REV_X11_DPMS_FILE");
+        return f && *f;
+}
+
+/* 1 = display active, 0 = powered down / screensaver on, -1 = cannot tell
+ * (no extension, hook file unreadable, or the server answered an error —
+ * the caller should treat repeated -1s as "stop asking"). */
+int x11_display_active(X11 *x)
+{
+        if (!x)
+                return -1;
+
+        /* test hook first: a deterministic override that works even against
+         * servers without any power extension (e2e drives the idle machinery
+         * through exactly the same code path a real DPMS event would) */
+        const char *f = getenv("REV_X11_DPMS_FILE");
+        if (f && *f) {
+                char buf[32];
+                FILE *fh = fopen(f, "r");
+                if (!fh)
+                        return -1;
+                size_t n = fread(buf, 1, sizeof buf - 1, fh);
+                fclose(fh);
+                buf[n] = 0;
+                int lvl = x11_dpms_file_level(buf);
+                if (lvl < 0)
+                        return -1;
+                return lvl == 0 ? 1 : 0;
+        }
+
+        if (x->ext_dpms) {
+                /* DPMSGetInfo: reply carries state (BOOL, byte 1) and
+                 * power_level (CARD16, offset 8). DPMS disabled (state 0)
+                 * means the display can never power down — active. */
+                u8 q[8];
+                memset(q, 0, sizeof q);
+                q[0] = (u8)x->ext_dpms;
+                q[1] = 7;             /* DPMSGetInfo */
+                put16(q + 2, 2);
+                if (!send_req(x, q, 8))
+                        return -1;
+                u8 *rep = read_reply(x, false);
+                if (!rep)
+                        return -1;
+                if (rep[1] == 0)      /* DPMS disabled */
+                        return 1;
+                return get16(rep + 8) == 0 ? 1 : 0;
+        }
+
+        if (x->ext_ss) {
+                /* ScreenSaverQueryInfo(drawable=root): reply byte 1 is the
+                 * state (0=Off, 1=On). Saver On = the session is hidden. */
+                u8 q[8];
+                memset(q, 0, sizeof q);
+                q[0] = (u8)x->ext_ss;
+                q[1] = 0;             /* ScreenSaverQueryInfo */
+                put16(q + 2, 2);
+                put32(q + 4, x->root);
+                if (!send_req(x, q, 8))
+                        return -1;
+                u8 *rep = read_reply(x, false);
+                if (!rep)
+                        return -1;
+                return rep[1] ? 0 : 1;
+        }
+        return -1;
 }
 
 void x11_pump_events(X11 *x)
