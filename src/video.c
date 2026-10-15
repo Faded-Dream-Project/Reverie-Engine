@@ -30,11 +30,11 @@
 #include <libavutil/avutil.h>
 #include <libswscale/swscale.h>
 
-/* AVFrame gained `duration` in FFmpeg 6.1 (libavutil 58.30); older
- * toolchains (Void's FFmpeg 6.0 era headers) still name it pkt_duration.
- * One accessor, chosen at compile time — the value means the same thing. */
-#if LIBAVUTIL_VERSION_MAJOR > 58 || \
-    (LIBAVUTIL_VERSION_MAJOR == 58 && LIBAVUTIL_VERSION_MINOR >= 30)
+/* AVFrame gained `duration` in FFmpeg 6.1 (libavutil 58.29.100); older
+ * toolchains (Void's FFmpeg 6.0 era headers) only have pkt_duration,
+ * and 6.1-7.x deprecate it. Version-gate on the exact introduction so
+ * every supported header set compiles warning-free either way. */
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 29, 100)
 #define REV_FRAME_DURATION(f) ((f)->duration)
 #else
 #define REV_FRAME_DURATION(f) ((f)->pkt_duration)

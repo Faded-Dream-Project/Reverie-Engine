@@ -166,8 +166,8 @@ jobs:
           # exit code visible so hosted-runner crashes classify themselves.
           for t in build/test_*; do
             [ -x "$t" ] || continue
-            sh -c "ulimit -c 0; '$t' >/tmp/diag.out 2>&1"
-            rc=$?
+            rc=0
+            sh -c "ulimit -c 0; '$t' >/tmp/diag.out 2>&1" || rc=$?
             if [ "$rc" -gt 128 ]; then
               echo "SUITE $t died by signal $((rc-128)); last output:"
               tail -8 /tmp/diag.out
