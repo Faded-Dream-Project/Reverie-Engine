@@ -1,0 +1,64 @@
+# ============================================================================
+# Reverie Engine — CI.
+#
+# Runs the full verification chain on every push / PR:
+#   1. build            (the only toolchain requirement is cc + make)
+#   2. unit tests       (12 suites — display-free; the Wayland suites build
+#                        their own fake compositor sockets)
+#   3. e2e under Xvfb   (CPU tier always; OpenGL on llvmpipe and Vulkan on
+#                        lavapipe when the Mesa packages are installed —
+#                        GPU legs SKIP gracefully otherwise)
+#   4. ASan + UBSan     (rebuild + unit suite under sanitizers, leak
+#                        detection on — catches what -O2 hides)
+#
+# e2e-wayland.sh requires the local weston test stack (../gpulibs) which is
+# not reproducible on hosted runners; it runs informationally and always
+# exits 0 there (SKIP when the stack is absent).
+#
+# What CI deliberately does NOT claim: success here is software-renderer
+# success. NVIDIA hardware behavior (real WSI FIFO timing, the frame-
+# callback starvation characteristics of the maintainer's compositor,
+# hardware GPU timer queries) is validated by field runs — see the
+# "manual verification" notes in docs/BACKENDS.md.
+# ============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb \
+            mesa-vulkan-drivers \
+            libegl1 libegl-mesa0 libgl1-mesa-dri \
+            libwayland-client0 \
+            libavcodec60 libavformat60 libavutil58 libswscale7
+
+      - name: build
+        run: make -j"$(nproc)"
+
+      - name: unit tests
+        run: make test
+
+      - name: e2e (Xvfb + llvmpipe GL + lavapipe Vulkan)
+        run: scripts/e2e.sh
+
+      - name: e2e-wayland (informational; skips without the weston stack)
+        run: scripts/e2e-wayland.sh || true
+
+      - name: ASan + UBSan unit pass
+        run: |
+          make clean
+          make -j"$(nproc)" CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+          make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
