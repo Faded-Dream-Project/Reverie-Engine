@@ -193,6 +193,25 @@ int main(void)
               strstr(err, "a video was already given"),
               "env-var guard notes the earlier video");
 
+        /* ---- renderer/backend vocabulary ---------------------------------- */
+
+        CHECK(!parse("-R bogus a.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "bad --renderer 'bogus'") &&
+              strstr(err, "vulkan | opengl | cpu"),
+              "unknown renderer name rejected (was a silent auto before)");
+        CHECK(!parse("--backend waylandd a.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "bad --backend 'waylandd'"),
+              "unknown backend name rejected");
+        CHECK(parse("-R gl a.rev", &a, err, sizeof err, &usage_hint) &&
+              !strcmp(a.renderer_pref, "gl"),
+              "'gl' stays accepted (historical opengl alias)");
+        CHECK(parse("-R auto -B x11 a.rev", &a, err, sizeof err, &usage_hint),
+              "auto/x11 parse");
+        CHECK(rev_cli_canon_renderer("vulkan") && rev_cli_canon_renderer("gl") &&
+              !rev_cli_canon_renderer("Vk") && !rev_cli_canon_renderer(NULL) &&
+              rev_cli_canon_backend("wayland") && !rev_cli_canon_backend("waylands"),
+              "canon validators: exact vocabulary, case-sensitive");
+
         printf(failures ? "cli: %d FAILURE(S)\n" : "cli: OK\n", failures);
         return failures ? 1 : 0;
 }

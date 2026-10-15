@@ -61,6 +61,27 @@ int rev_scale_mode(const char *name)
         return -1;
 }
 
+const char *rev_cli_canon_renderer(const char *name)
+{
+        if (!name)
+                return NULL;
+        if (!strcmp(name, "auto") || !strcmp(name, "vulkan") ||
+            !strcmp(name, "opengl") || !strcmp(name, "gl") ||
+            !strcmp(name, "cpu"))
+                return name;
+        return NULL;
+}
+
+const char *rev_cli_canon_backend(const char *name)
+{
+        if (!name)
+                return NULL;
+        if (!strcmp(name, "auto") || !strcmp(name, "x11") ||
+            !strcmp(name, "wayland"))
+                return name;
+        return NULL;
+}
+
 bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
 {
         memset(a, 0, sizeof *a);
@@ -101,9 +122,23 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                 } else if (!strcmp(argv[i], "-R") || !strcmp(argv[i], "--renderer")) {
                         NEED_VALUE(argv[i]);
                         a->renderer_pref = argv[++i];
+                        if (!rev_cli_canon_renderer(a->renderer_pref)) {
+                                snprintf(err, errcap,
+                                         "bad --renderer '%s' (want auto | "
+                                         "vulkan | opengl | cpu)",
+                                         a->renderer_pref);
+                                return false;
+                        }
                 } else if (!strcmp(argv[i], "-B") || !strcmp(argv[i], "--backend")) {
                         NEED_VALUE(argv[i]);
                         a->backend_pref = argv[++i];
+                        if (!rev_cli_canon_backend(a->backend_pref)) {
+                                snprintf(err, errcap,
+                                         "bad --backend '%s' (want auto | "
+                                         "x11 | wayland)",
+                                         a->backend_pref);
+                                return false;
+                        }
                 } else if (!strcmp(argv[i], "--scene")) {
                         NEED_VALUE(argv[i]);
                         set_scene(a, argv[++i], err, errcap);

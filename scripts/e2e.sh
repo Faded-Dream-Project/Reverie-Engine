@@ -80,6 +80,53 @@ else
 fi
 stop_xvfb
 
+# ---- Renderer auto-selection: order + vocabulary --------------------------
+# auto with only software stacks (the llvmpipe/lavapipe test env) must land
+# on the native CPU renderer; with BOTH software stacks admitted via the
+# compatibility overrides, the probe ORDER decides — Vulkan leads auto, so
+# software Vulkan beats software GL. A bad renderer name is a hard error,
+# never a silent fall-back into auto.
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV timeout 6 ./build/reverie --shot 3 "$OUT/autoc" "$SCENE" \
+    > "$OUT/autoc.log" 2>&1 || true
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_AUTO_VK=1 REV_AUTO_GL_SW=1 timeout 6 \
+    ./build/reverie --shot 3 "$OUT/autov" "$SCENE" > "$OUT/autov.log" 2>&1 || true
+stop_xvfb
+if grep -q "renderer: cpu" "$OUT/autoc.log" 2>/dev/null; then
+    echo "    auto(cpu):    PASS (software stacks stay out of auto)"
+    PASS=$((PASS+1))
+elif grep -qE "renderer: (vulkan|opengl) \(tier" "$OUT/autoc.log" 2>/dev/null; then
+    echo "    auto(hw):     PASS (a hardware renderer was selected)"
+    PASS=$((PASS+1))
+else
+    echo "    auto(cpu):    FAIL (auto produced no renderer)"
+    cat "$OUT/autoc.log"
+    FAIL=$((FAIL+1))
+fi
+if grep -q "renderer: vulkan" "$OUT/autov.log" 2>/dev/null; then
+    echo "    auto(order):  PASS (Vulkan is probed before OpenGL)"
+    PASS=$((PASS+1))
+elif grep -q "renderer: opengl" "$OUT/autov.log" 2>/dev/null \
+     && grep -q "Vulkan unavailable" "$OUT/autov.log" 2>/dev/null; then
+    echo "    auto(order):  SKIP (no Vulkan implementation on this system)"
+    SKIP=$((SKIP+1))
+elif grep -q "renderer: opengl" "$OUT/autov.log" 2>/dev/null; then
+    echo "    auto(order):  FAIL (OpenGL won although Vulkan was available)"
+    cat "$OUT/autov.log"
+    FAIL=$((FAIL+1))
+else
+    echo "    auto(order):  SKIP (no GPU stacks on this system)"
+    SKIP=$((SKIP+1))
+fi
+./build/reverie -R bogus "$SCENE" > "$OUT/badr.log" 2>&1
+if [ $? -ne 0 ] && grep -q "bad --renderer 'bogus'" "$OUT/badr.log" 2>/dev/null; then
+    echo "    renderer(bad):PASS (unknown renderer name rejected)"
+    PASS=$((PASS+1))
+else
+    echo "    renderer(bad):FAIL (unknown renderer slipped into auto)"
+    FAIL=$((FAIL+1))
+fi
+
 # ---- OpenGL tier -------------------------------------------------------------
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R opengl --shot 3 "$OUT/gl" "$SCENE" \

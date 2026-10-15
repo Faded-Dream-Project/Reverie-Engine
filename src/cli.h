@@ -75,4 +75,12 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap);
 /* "fill" | "fit" | "stretch" | "center" -> REV_SCALE_*; -1 when unknown. */
 int rev_scale_mode(const char *name);
 
+/* Validates the --renderer / --backend value vocabulary. Returns the
+ * canonical spelling (static storage, do not free) or NULL when the
+ * name is unknown — an unknown request is a hard error, never a silent
+ * fall-back into auto. "gl" stays accepted as the historical opengl
+ * alias. */
+const char *rev_cli_canon_renderer(const char *name);
+const char *rev_cli_canon_backend(const char *name);
+
 #endif /* REV_CLI_H */

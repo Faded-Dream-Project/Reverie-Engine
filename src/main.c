@@ -132,16 +132,17 @@ static void usage(void)
 "                  $XDG_RUNTIME_DIR/reverie.sock)\n"
 "  REV_FADE_MS      default theme-switch fade duration in ms (default 400,\n"
 "                  0 = hard cut)\n"
-"  REV_AUTO_VK     1 = let auto also consider the present-only Vulkan\n"
-"                  tier (off by default: that tier composites on CPU)\n"
+"  REV_AUTO_VK     1 = let auto also keep SOFTWARE Vulkan (lavapipe)\n"
+"                  (off by default: a software stack delivers what the\n"
+"                  CPU renderer does natively)\n"
 "  REV_AUTO_GL_SW  1 = let auto keep software GL (llvmpipe) instead of\n"
 "                  falling back to the native CPU renderer\n"
 "\n"
 "renderer policy: explicit requests are honored exactly and never fall\n"
 "back silently (init failure exits with the reason). auto = hardware\n"
-"OpenGL, else native CPU (software GL/Vulkan initialize a whole software\n"
-"stack to do what the CPU renderer does natively — opt in via the env\n"
-"vars above; see docs/BACKENDS.md for the measured rationale).\n");
+"Vulkan, else hardware OpenGL, else the native CPU renderer (software\n"
+"Vulkan/GL stay opt-in via the env vars above; see docs/BACKENDS.md\n"
+"for the measured rationale).\n");
 }
 
 typedef struct {
@@ -880,6 +881,18 @@ int main(int argc, char **argv)
                 backend_pref = getenv("REV_BACKEND");
                 if (!backend_pref || !*backend_pref)
                         backend_pref = "auto";
+        }
+        /* the env vars bypass the parser's vocabulary check — validate here
+         * so a typo is a hard error, not a silent fall-back into auto */
+        if (!rev_cli_canon_renderer(renderer_pref)) {
+                fprintf(stderr, "reverie: bad REV_RENDERER '%s' (want auto | "
+                                "vulkan | opengl | cpu)\n", renderer_pref);
+                return 1;
+        }
+        if (!rev_cli_canon_backend(backend_pref)) {
+                fprintf(stderr, "reverie: bad REV_BACKEND '%s' (want auto | "
+                                "x11 | wayland)\n", backend_pref);
+                return 1;
         }
 
         /* --exit-if-running: the duplicate-instance guard the autostart

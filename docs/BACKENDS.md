@@ -118,19 +118,32 @@ on software (lavapipe Vulkan, llvmpipe GL), it RUNS, and the log says
 never confused with "hardware accelerated": every tier reports its device
 name, device type, and hardware/software classification at init.
 
-**Automatic selection is deterministic** (render.c, documented + measured):
+**Automatic selection is deterministic** (render.c, documented +
+measured; 2026-10 second revision — hardware Vulkan now leads, a
+hardware-GL-first order preceded it for most of the month):
 
-1. **OpenGL with a hardware context** — the only tier that actually renders
-   and simulates on the GPU today, so it is the first and only GPU probe.
-2. **The native CPU renderer** when GL initializes as software — llvmpipe
-   would boot an entire software GL stack to do what the CPU renderer does
-   natively (and on llvmpipe the GL tier itself keeps sims, point sprites
-   and gradients on the CPU for speed). Override with `REV_AUTO_GL_SW=1`.
-3. **The Vulkan tier (hardware devices only)** — the GPU compute
-   compositing tier (see below): every layer op and the fluid/ripple
-   solvers run as compute kernels. A software Vulkan device (lavapipe)
-   boots a whole software stack to do what the CPU renderer does natively,
-   so software Vulkan stays out of auto. Override with `REV_AUTO_VK=1`.
+1. **The Vulkan tier on a hardware device** — the GPU compute compositing
+   tier (see below): every layer op and the fluid/ripple solvers run as
+   compute kernels, and the engine's CPU compositor is never in the frame
+   path. Its surface and swapchain initialization (per window) happen
+   inside init(), so a driver that cannot build them feeds the fallback
+   instead of producing a half-initialized daemon — every skip is logged
+   with the failing call.
+2. **OpenGL with a hardware context** — renders and simulates on the GPU;
+   the long-proven tier, and the fallback when no Vulkan implementation
+   (or no usable swapchain) exists.
+3. **The native CPU renderer** when the GPU tiers only come up as software
+   — llvmpipe or lavapipe would boot an entire software stack to do what
+   the CPU renderer does natively (and on llvmpipe the GL tier itself
+   keeps sims, point sprites and gradients on the CPU for speed).
+   Override with `REV_AUTO_GL_SW=1` / `REV_AUTO_VK=1`.
+
+Renderer *availability* is distinct from renderer *capability*: a scene
+that needs features a renderer declined (GPU ripple sims on llvmpipe)
+logs `scene needs CPU compositing` and composites on the CPU instead of
+erroring — the tier runs, the scene just routes its heavy parts. An
+explicit `--renderer` request that cannot initialize at all is fatal,
+with the reason.
 
 ### why auto does not probe software stacks — the measurements
 
@@ -343,7 +356,7 @@ selects.
 | `REV_IDLE_AUDIT_S`  | idle watchdog interval in seconds (default 30, 0 = off): after this long continuously hidden, a 1 s full-rate audit burst guards against a wedged idle detector |
 | `REV_X11_DPMS_FILE` | TEST hook: a file naming the display level (`on`/`standby`/`suspend`/`off`) that overrides the X11 DPMS wire query — drives the idle machinery deterministically on any server |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
-| `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
+| `REV_AUTO_VK`       | `1` = let auto keep SOFTWARE Vulkan (lavapipe) — hardware Vulkan already leads auto; the override only admits the software device |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |
 | `REV_FAKE_POINTER`  | TEST/BENCH: `<speed>` = synthesize a pressed pointer on a Lissajous path (circuits/s) so interactive scenes benchmark headlessly. Never set by users |
 | `REV_FAKE_CLICK`    | TEST: `"x,y[@t][;x,y@t ...]"` = synthesize clicks at normalized positions, each at its own @t seconds (default 0.3 s + 0.2 s spacing) so click-driven interaction (ripple splashes, click-after-calm) is regression-testable headlessly. Never set by users |

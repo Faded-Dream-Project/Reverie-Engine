@@ -13,11 +13,11 @@
  *
  * Automatic selection (documented, measured, no software layers without
  * benefit — see docs/BACKENDS.md for the rationale and benchmarks):
- *     1. OpenGL with a HARDWARE context — renders and simulates on the
- *        GPU; the long-proven tier, so it keeps first place in auto
- *     2. the Vulkan tier on a HARDWARE device — the GPU compute
+ *     1. the Vulkan tier on a HARDWARE device — the GPU compute
  *        compositing tier (every layer op and the fluid/ripple solvers
  *        run as compute kernels)
+ *     2. OpenGL with a HARDWARE context — renders and simulates on the
+ *        GPU; the long-proven tier
  *     3. the native CPU renderer otherwise (a software GL or lavapipe
  *        stack would initialize an entire software pipeline to deliver
  *        what the CPU renderer does natively; REV_AUTO_GL_SW /

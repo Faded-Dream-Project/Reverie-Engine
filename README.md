@@ -40,15 +40,14 @@ instead of silently substituting a different renderer. Software devices
 (lavapipe Vulkan, llvmpipe GL) are used when explicitly requested and
 reported as `SOFTWARE` in every log line.
 
-**Auto is deterministic** (2026-10 redesign — the old
-`vulkan → opengl → llvmpipe → cpu` cascade initialized a present-only
-Vulkan tier ahead of the actually-accelerated GL tier and, on fallback
-machines, booted an entire software GL stack to avoid the native CPU
-renderer):
+**Auto is deterministic** (2026-10 — second revision: the first redesign
+of the month fixed a cascade that initialized a present-only Vulkan tier
+ahead of the actually-accelerated GL tier; the mature compute tier now
+takes the lead it earned):
 
 ```
- hardware opengl ──► reverie's own CPU engine
-        (llvmpipe and the present-only vulkan tier are opt-in:
+ hardware vulkan ──► hardware opengl ──► reverie's own CPU engine
+        (llvmpipe and lavapipe are opt-in:
          REV_AUTO_GL_SW=1 / REV_AUTO_VK=1 — measured rationale in
          docs/BACKENDS.md: neither software path is uniformly faster)
 ```

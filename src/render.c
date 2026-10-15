@@ -4,14 +4,13 @@
  *
  *   explicit request -> that renderer only; failure is FATAL (no silent
  *                        substitution — the log shows which tier failed)
- *   auto             -> opengl-hardware, else vulkan-hardware (the GPU
- *                        compute compositing tier), else native CPU
- *                        (software GL / software Vulkan initialize an
- *                        entire software stack to deliver what the CPU
- *                        renderer already does natively — see
- *                        docs/BACKENDS.md for the measured rationale;
- *                        REV_AUTO_VK / REV_AUTO_GL_SW override for
- *                        compatibility testing)
+ *   auto             -> vulkan-hardware, else opengl-hardware, else the
+ *                        native CPU renderer (software GL / software
+ *                        Vulkan initialize an entire software stack to
+ *                        deliver what the CPU renderer already does
+ *                        natively — see docs/BACKENDS.md for the measured
+ *                        rationale; REV_AUTO_VK / REV_AUTO_GL_SW override
+ *                        for compatibility testing)
  *
  * Every selection and every skip logs its reason, so the daemon log is a
  * complete audit trail of the decision.
@@ -107,12 +106,48 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
                 return NULL;
         }
 
-        /* ---- automatic selection (deterministic) ------------------------ */
+        /* ---- automatic selection (deterministic) ------------------------
+         * Order (2026-10 second revision): vulkan -> opengl -> cpu.
+         * The Vulkan tier is the most capable — full GPU compute
+         * compositing AND GPU sims — so a hardware device takes it first;
+         * hardware OpenGL follows as the long-proven tier; the native CPU
+         * renderer is the universal floor. Software stacks (llvmpipe,
+         * lavapipe) boot an entire software pipeline to deliver what the
+         * CPU renderer does natively, so they stay opt-in via the env
+         * overrides — order between them only matters when both are
+         * admitted, and then Vulkan wins (it is the higher tier). */
         const char *sw_gl_env = getenv("REV_AUTO_GL_SW");
         const char *auto_vk_env = getenv("REV_AUTO_VK");
 
-        /* 1. hardware OpenGL — renders and simulates on the GPU; the
-         *    long-proven tier, so it keeps first place in auto. */
+        /* 1. hardware Vulkan — the GPU compute compositing tier (every
+         *    layer op and the fluid/ripple solvers run as compute kernels) */
+        {
+                RRenderer *vk = render_vk_create();
+                if (vk) {
+                        if (try_init(vk, p, why, sizeof why)) {
+                                if (!vk->software) {
+                                        log_selected(vk, "auto: hardware Vulkan");
+                                        return vk;
+                                }
+                                if (auto_vk_env && *auto_vk_env) {
+                                        LOGI("renderer: auto — software Vulkan "
+                                             "kept (REV_AUTO_VK=1)");
+                                        log_selected(vk, "auto: software Vulkan (override)");
+                                        return vk;
+                                }
+                                LOGI("renderer: auto — Vulkan initialized as SOFTWARE "
+                                     "(%s); skipping it for the next tier "
+                                     "(set REV_AUTO_VK=1 to keep software Vulkan)",
+                                     vk->device_desc[0] ? vk->device_desc : "lavapipe");
+                        } else {
+                                LOGI("renderer: auto — Vulkan unavailable (%s)", why);
+                        }
+                        renderer_destroy(vk);
+                }
+        }
+
+        /* 2. hardware OpenGL — renders and simulates on the GPU; the
+         *    long-proven tier. */
         r = render_gl_create();
         if (r) {
                 if (try_init(r, p, why, sizeof why)) {
@@ -139,35 +174,6 @@ RRenderer *renderer_create(const char *pref, RPlatform *p, char *err, size_t err
                         LOGI("renderer: auto — OpenGL unavailable (%s)", why);
                         renderer_destroy(r);
                         r = NULL;
-                }
-        }
-
-        /* 2. hardware Vulkan — the GPU compute compositing tier (every
-         *    layer op and the fluid/ripple solvers run as compute kernels).
-         *    Software Vulkan (lavapipe) stays out of auto unless the
-         *    compatibility override asks for it. */
-        {
-                RRenderer *vk = render_vk_create();
-                if (vk) {
-                        if (try_init(vk, p, why, sizeof why)) {
-                                if (!vk->software) {
-                                        log_selected(vk, "auto: hardware Vulkan");
-                                        return vk;
-                                }
-                                if (auto_vk_env && *auto_vk_env) {
-                                        LOGI("renderer: auto — software Vulkan "
-                                             "kept (REV_AUTO_VK=1)");
-                                        log_selected(vk, "auto: software Vulkan (override)");
-                                        return vk;
-                                }
-                                LOGI("renderer: auto — Vulkan initialized as SOFTWARE "
-                                     "(%s); skipping it for the native CPU renderer "
-                                     "(set REV_AUTO_VK=1 to keep software Vulkan)",
-                                     vk->device_desc[0] ? vk->device_desc : "lavapipe");
-                        } else {
-                                LOGI("renderer: auto — Vulkan unavailable (%s)", why);
-                        }
-                        renderer_destroy(vk);
                 }
         }
 
