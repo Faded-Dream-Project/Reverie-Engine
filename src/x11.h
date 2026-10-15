@@ -22,12 +22,25 @@ typedef struct X11 X11;
 X11 *x11_connect(char *err, size_t errcap);
 void x11_disconnect(X11 *x);
 
-/* Monitor list via Xinerama (falls back to the full root window). */
+/* Monitor list via Xinerama (falls back to the full root window). The list
+ * is re-queried on every call — runtime changes (hotplug) surface here.
+ * REV_X11_MON_FILE=<path> overrides the query with a deterministic text
+ * file ("x y w h" per line, # comments) for hotplug e2e under Xvfb;
+ * malformed files fall back to the server with a warning.
+ * x11_mon_file_parse is the pure parser (unit-tested). */
 int  x11_monitors(X11 *x, RRect *out, int max);
+int  x11_mon_file_parse(const char *path, RRect *out, int max);
+/* Stable hotplug identity of monitor `mon` in the LAST x11_monitors() list:
+ * a key derived from the Xinerama origin (see x11.c for the tradeoffs). */
+u64  x11_monitor_id(X11 *x, int mon);
 
 /* Creates a desktop-type wallpaper window covering `geom`. Returns the
- * window index or -1. */
+ * window index or -1. Indices are SLOTS: x11_remove_window frees them and
+ * a later add reuses the number (renderer per-window state relies on it). */
 int  x11_add_window(X11 *x, RRect geom);
+/* Destroys a window (XID, GC, SHM segments) and frees its slot. The caller
+ * must have released renderer-owned surfaces for the XID first. */
+bool x11_remove_window(X11 *x, int win);
 
 /* Presents an RGBA8 (straight alpha) buffer of exactly the window size. */
 bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h);

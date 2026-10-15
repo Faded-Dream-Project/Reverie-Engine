@@ -28,6 +28,7 @@
 typedef struct {
         u32 wid, gc;
         u32 w, h;
+        bool in_use;       /* slot occupied — freed by x11_remove_window */
         bool use_shm;
         int cur_seg;
         struct {
@@ -54,6 +55,11 @@ struct X11 {
         bool is_xwayland;               /* "XWAYLAND" extension present */
         XWin wins[X11_MAX_WINS];
         int nwins;
+        /* monitor list as reported by the LAST x11_monitors() call — the
+         * hotplug identity (x11_monitor_id) derives from it, so both views
+         * always agree even if the server reorders between queries */
+        RRect mons[8];
+        int nmons;
         /* event queue (events drained while waiting for replies) */
         u8 evq[X11_MAX_WINS * 16][32];
         int evq_n;
@@ -641,9 +647,72 @@ void x11_root_size(X11 *x, u32 *w, u32 *h)
         *h = get16(rep + 18);
 }
 
+/* REV_X11_MON_FILE test hook: parse a monitor list from a text file instead
+ * of querying the server. One monitor per line: "x y w h" (any whitespace
+ * separation; # comments; blank lines skipped). Deterministic hotplug e2e
+ * under Xvfb — servers there cannot re-order Xinerama screens at runtime.
+ * Returns -1 on any problem (missing file, malformed line) so the caller
+ * falls back to the real query; NEVER hard-fails the daemon over a test
+ * hook. Exposed for unit tests. */
+int x11_mon_file_parse(const char *path, RRect *out, int max)
+{
+        if (!path || !*path || !out || max < 1)
+                return -1;
+        FILE *f = fopen(path, "r");
+        if (!f)
+                return -1;
+        int n = 0;
+        char line[256];
+        while (n < max && fgets(line, sizeof line, f)) {
+                char *h = line;
+                while (*h == ' ' || *h == '\t')
+                        h++;
+                if (*h == '#' || *h == '\n' || *h == '\r' || *h == 0)
+                        continue;
+                long v[4];
+                int got = 0;
+                const char *p = h;
+                while (got < 4) {
+                        char *end = NULL;
+                        v[got] = strtol(p, &end, 10);
+                        if (end == p)
+                                break;
+                        got++;
+                        p = end;
+                        while (*p == ' ' || *p == '\t')
+                                p++;
+                }
+                if (got != 4 || v[2] < 1 || v[3] < 1 ||
+                    v[0] < 0 || v[1] < 0 || v[0] > 65535 || v[1] > 65535 ||
+                    v[2] > 65535 || v[3] > 65535) {
+                        fclose(f);
+                        return -1;
+                }
+                out[n].x = (i32)v[0];
+                out[n].y = (i32)v[1];
+                out[n].w = (i32)v[2];
+                out[n].h = (i32)v[3];
+                n++;
+        }
+        fclose(f);
+        return n < 1 ? -1 : n;    /* an empty-but-valid file is malformed too */
+}
+
 int x11_monitors(X11 *x, RRect *out, int max)
 {
-        if (x->ext_xinerama) {
+        int n = -1;
+
+        /* test hook first: deterministic hotplug e2e drives the monitor set
+         * through this file instead of server-side Xinerama changes */
+        const char *mf = getenv("REV_X11_MON_FILE");
+        if (mf && *mf) {
+                n = x11_mon_file_parse(mf, out, max);
+                if (n < 0)
+                        LOGW("x11: REV_X11_MON_FILE unreadable/malformed — "
+                             "falling back to the server query");
+        }
+
+        if (n < 0 && x->ext_xinerama) {
                 u8 q[8];
                 memset(q, 0, sizeof q);
                 q[0] = (u8)x->ext_xinerama;   /* major = extension base */
@@ -652,32 +721,53 @@ int x11_monitors(X11 *x, RRect *out, int max)
                 if (send_req(x, q, 4)) {
                         u8 *rep = read_reply(x, true);
                         if (rep) {
-                                u32 n = get32(rep + 8);
-                                if (n > (u32)max)
-                                        n = (u32)max;
+                                u32 cnt = get32(rep + 8);
+                                if (cnt > (u32)max)
+                                        cnt = (u32)max;
                                 u8 *p = rep + 32;
-                                for (u32 i = 0; i < n; i++) {
+                                for (u32 i = 0; i < cnt; i++) {
                                         out[i].x = get16(p);
                                         out[i].y = get16(p + 2);
                                         out[i].w = get16(p + 4);
                                         out[i].h = get16(p + 6);
                                         p += 8;
                                 }
-                                if (n > 0)
-                                        return (int)n;
+                                if (cnt > 0)
+                                        n = (int)cnt;
                         }
                 }
         }
-        /* fallback: whole root */
-        u32 w = 1920, h = 1080;
-        x11_root_size(x, &w, &h);
-        if (max < 1)
+        if (n < 0) {
+                /* fallback: whole root */
+                u32 w = 1920, h = 1080;
+                x11_root_size(x, &w, &h);
+                if (max < 1)
+                        return 0;
+                out[0].x = 0;
+                out[0].y = 0;
+                out[0].w = (i32)w;
+                out[0].h = (i32)h;
+                n = 1;
+        }
+
+        /* cache for x11_monitor_id — identity must describe exactly the
+         * list this call returned, not whatever a re-query would say now */
+        x->nmons = n < (int)(sizeof x->mons / sizeof x->mons[0])
+                       ? n : (int)(sizeof x->mons / sizeof x->mons[0]);
+        memcpy(x->mons, out, (size_t)x->nmons * sizeof *out);
+        return n;
+}
+
+u64 x11_monitor_id(X11 *x, int mon)
+{
+        if (!x || mon < 0 || mon >= x->nmons)
                 return 0;
-        out[0].x = 0;
-        out[0].y = 0;
-        out[0].w = (i32)w;
-        out[0].h = (i32)h;
-        return 1;
+        /* Xinerama exposes no stable output ids — the screen ORIGIN is the
+         * only persistent key core X11 offers. Same origin = same monitor
+         * (a monitor MOVED therefore matches as remove+add, which correctly
+         * recreates the window at the new position; a monitor REPLACED at
+         * the same origin is an in-place geometry update). */
+        return ((u64)(u32)x->mons[mon].x << 32) | (u32)x->mons[mon].y;
 }
 
 /* --------------------------------------------------------------------------
@@ -818,28 +908,45 @@ static bool xwin_create(X11 *x, XWin *w, RRect geom)
 
 int x11_add_window(X11 *x, RRect geom)
 {
-        if (x->nwins >= X11_MAX_WINS)
-                return -1;
-        XWin *w = &x->wins[x->nwins];
+        /* slot reuse: window indices are renderer-visible; a removed window's
+         * number must be handed out again, never renumbered */
+        int slot = -1;
+        for (int i = 0; i < x->nwins; i++) {
+                if (!x->wins[i].in_use) {
+                        slot = i;
+                        break;
+                }
+        }
+        if (slot < 0) {
+                if (x->nwins >= X11_MAX_WINS)
+                        return -1;
+                slot = x->nwins++;
+        }
+        XWin *w = &x->wins[slot];
         if (!xwin_create(x, w, geom))
                 return -1;
-        return x->nwins++;
+        w->in_use = true;
+        return slot;
 }
 
-/* Destroy + re-create the window in slot `win` (new XID, same index). */
-bool x11_resize_window(X11 *x, int win, RRect geom)
+/* Releases the server resources of a window slot (XID, GC, SHM segments,
+ * fallback buffer). Shared by resize (recreate in place) and remove. */
+static void xwin_destroy_resources(X11 *x, XWin *w)
 {
-        if (!x || win < 0 || win >= x->nwins)
-                return false;
-        XWin *w = &x->wins[win];
-
-        /* destroy the old server window */
         if (w->wid) {
                 u8 q[8];
                 memset(q, 0, sizeof q);
                 q[0] = 4;            /* DestroyWindow */
                 put16(q + 2, 2);
                 put32(q + 4, w->wid);
+                send_req(x, q, 8);
+        }
+        if (w->gc) {
+                u8 q[8];
+                memset(q, 0, sizeof q);
+                q[0] = 56;           /* FreeGC */
+                put16(q + 2, 2);
+                put32(q + 4, w->gc);
                 send_req(x, q, 8);
         }
         /* detach shm segments */
@@ -857,8 +964,40 @@ bool x11_resize_window(X11 *x, int win, RRect geom)
                         shmdt(w->shm[s].mem);
         }
         free(w->fallback);
-        w->fallback = NULL;
-        return xwin_create(x, w, geom);
+        memset(w, 0, sizeof *w);
+        w->in_use = false;
+}
+
+/* Destroy + re-create the window in slot `win` (new XID, same index). */
+bool x11_resize_window(X11 *x, int win, RRect geom)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return false;
+        XWin *w = &x->wins[win];
+        if (!w->in_use)
+                return false;
+
+        xwin_destroy_resources(x, w);
+        if (!xwin_create(x, w, geom))
+                return false;
+        w->in_use = true;
+        return true;
+}
+
+/* Destroy a window and free its slot for reuse (hotplug monitor removal).
+ * The caller must have released any renderer-owned surface for the XID
+ * first. Unknown/already-free indices return false. */
+bool x11_remove_window(X11 *x, int win)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return false;
+        XWin *w = &x->wins[win];
+        if (!w->in_use)
+                return false;
+
+        xwin_destroy_resources(x, w);
+        x11_sync(x);
+        return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -902,7 +1041,7 @@ bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h)
         if (!x || win < 0 || win >= x->nwins)
                 return false;
         XWin *wd = &x->wins[win];
-        if (w != wd->w || h != wd->h || !rgba)
+        if (!wd->in_use || w != wd->w || h != wd->h || !rgba)
                 return false;
         size_t n = (size_t)w * h;
 
@@ -1071,6 +1210,8 @@ bool x11_win_geometry(X11 *x, int win, RRect *geom)
         if (!x || win < 0 || win >= x->nwins)
                 return false;
         XWin *w = &x->wins[win];
+        if (!w->in_use)
+                return false;
         if (geom) {
                 geom->x = 0;
                 geom->y = 0;
@@ -1268,6 +1409,8 @@ u32 *x11_screenshot(X11 *x, int win, u32 *w, u32 *h)
         if (!x || win < 0 || win >= x->nwins)
                 return NULL;
         XWin *wd = &x->wins[win];
+        if (!wd->in_use)
+                return NULL;
 
         u8 q[20];
         memset(q, 0, sizeof q);

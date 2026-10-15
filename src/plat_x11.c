@@ -79,6 +79,12 @@ static int px_monitor_refresh(RPlatform *p, int mon)
         return 0;    /* X11 core protocol has no refresh rate; pacing uses scene fps */
 }
 
+static u64 px_monitor_id(RPlatform *p, int mon)
+{
+        PlatX11 *c = (PlatX11 *)p->ctx;
+        return x11_monitor_id(c->x, mon);
+}
+
 static int px_add_window(RPlatform *p, RRect geom)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
@@ -192,6 +198,12 @@ static bool px_resize_window(RPlatform *p, int win, RRect geom)
         return x11_resize_window(c->x, win, geom);
 }
 
+static bool px_remove_window(RPlatform *p, int win)
+{
+        PlatX11 *c = (PlatX11 *)p->ctx;
+        return x11_remove_window(c->x, win);
+}
+
 static bool px_should_close(RPlatform *p)
 {
         (void)p;
@@ -220,6 +232,7 @@ RPlatform *plat_x11_create(void)
         p->monitors = px_monitors;
         p->monitor_scale = px_monitor_scale;
         p->monitor_refresh = px_monitor_refresh;
+        p->monitor_id = px_monitor_id;
         p->add_window = px_add_window;
         p->present_cpu = px_present_cpu;
         p->present_premul = false;    /* no premul convention on X11 presents */
@@ -229,6 +242,7 @@ RPlatform *plat_x11_create(void)
         p->native_handle = px_native_handle;
         p->native_display = px_native_display;
         p->resize_window = px_resize_window;
+        p->remove_window = px_remove_window;
         p->pump = px_pump;
         p->pointer = px_pointer;
         p->wait_frame = px_wait_frame;

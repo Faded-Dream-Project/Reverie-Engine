@@ -88,6 +88,14 @@ static int pw_monitor_refresh(RPlatform *p, int mon)
         return wl_monitor_refresh(c->wl, mon);
 }
 
+static u64 pw_monitor_id(RPlatform *p, int mon)
+{
+        PlatWayland *c = (PlatWayland *)p->ctx;
+        if (wlshim_active())
+                return wlshim_monitor_id(mon);
+        return wl_monitor_id(c->wl, mon);
+}
+
 static int pw_add_window(RPlatform *p, RRect geom)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
@@ -236,6 +244,14 @@ static bool pw_resize_window(RPlatform *p, int win, RRect geom)
         return true;
 }
 
+static bool pw_remove_window(RPlatform *p, int win)
+{
+        PlatWayland *c = (PlatWayland *)p->ctx;
+        if (wlshim_active())
+                return wlshim_destroy_window(win);
+        return wl_remove_window(c->wl, win);
+}
+
 static u32 *pw_screenshot(RPlatform *p, int win, u32 *w, u32 *h)
 {
         (void)p;
@@ -263,6 +279,7 @@ RPlatform *plat_wayland_create(void)
         p->monitors = pw_monitors;
         p->monitor_scale = pw_monitor_scale;
         p->monitor_refresh = pw_monitor_refresh;
+        p->monitor_id = pw_monitor_id;
         p->add_window = pw_add_window;
         p->present_cpu = pw_present_cpu;
         /* wl_shm ARGB8888 is a premultiplied format AND packs the u32 as
@@ -274,6 +291,7 @@ RPlatform *plat_wayland_create(void)
         p->native_handle = pw_native_handle;
         p->native_display = pw_native_display;
         p->resize_window = pw_resize_window;
+        p->remove_window = pw_remove_window;
         p->pump = pw_pump;
         p->pointer = pw_pointer;
         p->wait_frame = pw_wait_frame;

@@ -131,9 +131,10 @@ const struct wl_interface_ *zwlr_layer_surface_v1_iface = &zwlr_layer_surface_v1
 
 /* ---- shim state ----------------------------------------------------------- */
 typedef struct {
-        int out;            /* monitor index */
+        int out;            /* output SLOT (raw, not packed) */
         wl_proxy_ *layer_surface;
         wl_proxy_ *surface;
+        bool in_use;        /* slot occupied — freed by wlshim_destroy_window */
         bool configured;
         bool closed;
         u32 cfg_serial;
@@ -179,9 +180,11 @@ typedef struct {
 
 typedef struct {
         wl_proxy_ *output;
+        u32 global_name;    /* registry name — stable hotplug identity */
         i32 lx, ly, pw, ph, scale;
         i32 refresh_mhz;   /* mode refresh (mHz; 0 = unreported) */
         bool have_mode;
+        bool removed;      /* global_remove seen — filtered from the list */
         int win;
 } ShimOutput;
 
@@ -292,7 +295,24 @@ static void on_global_remove(void *data, wl_registry_ *reg, u32 name)
 {
         (void)data;
         (void)reg;
-        (void)name;
+        /* an unplugged output arrives here — tombstone it (its window, if
+         * any, is torn down by the hotplug reconciler via
+         * wlshim_destroy_window) and drop the global so the late-bind scan
+         * does not rebind it */
+        for (int i = 0; i < S.noutputs; i++) {
+                if (!S.outputs[i].removed && S.outputs[i].global_name == name) {
+                        S.outputs[i].removed = true;
+                        LOGI("wlshim: output gone (registry name %u)", name);
+                        break;
+                }
+        }
+        for (int i = 0; i < S.nglobals; i++) {
+                if (S.globals[i].name == name) {
+                        S.globals[i] = S.globals[S.nglobals - 1];
+                        S.nglobals--;
+                        break;
+                }
+        }
 }
 
 static void on_seat_caps(void *data, wl_proxy_ *seat, u32 caps)
@@ -536,6 +556,34 @@ static void on_frame_done(void *data, wl_proxy_ *cb, u32 time)
 
 static void shim_pool_destroy(ShimWin *win);    /* fwd: fini tears pools down */
 
+/* Binds a wl_output global into the next free output slot (idempotent by
+ * global name — both the init scan and the runtime late-bind call this).
+ * Returns the new slot or -1. */
+static int shim_bind_output(const ShimGlobal *g)
+{
+        if (S.noutputs >= 8)
+                return -1;
+        wl_output_ *out = (wl_output_ *)bind_global(g->name, S.wl_output_iface,
+                                                  g->version < 4 ? g->version : 4);
+        if (!out)
+                return -1;
+        static void (*const output_listener[])(void) = {
+                (void (*)(void))on_output_geometry,
+                (void (*)(void))on_output_mode,
+                (void (*)(void))on_output_done,
+                (void (*)(void))on_output_scale,
+                (void (*)(void))on_output_name,        /* v4 */
+                (void (*)(void))on_output_description, /* v4 */
+        };
+        S.proxy_add_listener((wl_proxy_ *)out, (void (**)(void))output_listener, NULL);
+        S.outputs[S.noutputs].output = (wl_proxy_ *)out;
+        S.outputs[S.noutputs].global_name = g->name;
+        S.outputs[S.noutputs].scale = 1;
+        S.outputs[S.noutputs].win = -1;
+        S.noutputs++;
+        return S.noutputs - 1;
+}
+
 bool wlshim_active(void)
 {
         if (!S.tried) {
@@ -682,23 +730,7 @@ static bool wlshim_init_inner(RPlatform *p, char *err, size_t errcap)
                                 (const struct wl_interface_ *)dlsym(S.lib, "wl_seat_interface");
                         S.seat = si ? bind_global(g->name, si, g->version < 5 ? g->version : 5) : NULL;
                 } else if (strcmp(g->iface, "wl_output") == 0 && S.noutputs < 8) {
-                        wl_output_ *out = (wl_output_ *)bind_global(g->name, S.wl_output_iface,
-                                                                  g->version < 4 ? g->version : 4);
-                        if (out) {
-                                static void (*const output_listener[])(void) = {
-                                        (void (*)(void))on_output_geometry,
-                                        (void (*)(void))on_output_mode,
-                                        (void (*)(void))on_output_done,
-                                        (void (*)(void))on_output_scale,
-                                        (void (*)(void))on_output_name,        /* v4 */
-                                        (void (*)(void))on_output_description, /* v4 */
-                                };
-                                S.proxy_add_listener((wl_proxy_ *)out, (void (**)(void))output_listener, NULL);
-                                S.outputs[S.noutputs].output = (wl_proxy_ *)out;
-                                S.outputs[S.noutputs].scale = 1;
-                                S.outputs[S.noutputs].win = -1;
-                                S.noutputs++;
-                        }
+                        shim_bind_output(g);
                 }
         }
 
@@ -829,45 +861,97 @@ void wlshim_platform_fini(RPlatform *p)
         S.tried = true;
 }
 
+/* packed monitor index -> raw output slot (removed outputs are skipped) */
+static int shim_out_slot(int mon)
+{
+        if (mon < 0)
+                return -1;
+        for (int i = 0; i < S.noutputs; i++) {
+                if (S.outputs[i].removed)
+                        continue;
+                if (mon-- == 0)
+                        return i;
+        }
+        return -1;
+}
+
 int wlshim_monitors(RRect *out, int max)
 {
-        int n = S.noutputs < max ? S.noutputs : max;
-        for (int i = 0; i < n; i++) {
+        /* packed: removed outputs are filtered, so monitor N = the (N+1)-th
+         * output still present — indices stay meaningful after unplug events
+         * without compacting slots (window records reference raw slots) */
+        int n = 0;
+        for (int i = 0; i < S.noutputs && n < max; i++) {
+                if (S.outputs[i].removed)
+                        continue;
                 i32 s = S.outputs[i].scale < 1 ? 1 : S.outputs[i].scale;
-                out[i].x = S.outputs[i].lx;
-                out[i].y = S.outputs[i].ly;
-                out[i].w = S.outputs[i].pw / s;
-                out[i].h = S.outputs[i].ph / s;
+                out[n].x = S.outputs[i].lx;
+                out[n].y = S.outputs[i].ly;
+                out[n].w = S.outputs[i].pw / s;
+                out[n].h = S.outputs[i].ph / s;
+                n++;
         }
         return n;
 }
 
 f64 wlshim_monitor_scale(int mon)
 {
-        if (mon < 0 || mon >= S.noutputs)
+        int s = shim_out_slot(mon);
+        if (s < 0)
                 return 1.0;
-        return (f64)(S.outputs[mon].scale < 1 ? 1 : S.outputs[mon].scale);
+        return (f64)(S.outputs[s].scale < 1 ? 1 : S.outputs[s].scale);
+}
+
+u64 wlshim_monitor_id(int mon)
+{
+        int s = shim_out_slot(mon);
+        if (s < 0)
+                return 0;
+        return (u64)S.outputs[s].global_name;
 }
 
 int wlshim_add_window(RRect geom)
 {
         (void)geom;
-        if (!S.active || S.nwins >= 8)
+        if (!S.active)
                 return -1;
 
-        int mon = -1;
-        for (int i = 0; i < S.noutputs; i++)
+        int oslot = -1;
+        for (int i = 0; i < S.noutputs; i++) {
+                if (S.outputs[i].removed)
+                        continue;
                 if (S.outputs[i].lx == geom.x && S.outputs[i].ly == geom.y) {
-                        mon = i;
+                        oslot = i;
                         break;
                 }
-        if (mon < 0)
-                mon = 0;
+        }
+        if (oslot < 0)
+                oslot = 0;    /* geometry not found: first present output */
 
-        int wi = S.nwins;
+        if (S.outputs[oslot].win >= 0 && S.wins[S.outputs[oslot].win].in_use)
+                return S.outputs[oslot].win;    /* already has a window */
+        S.outputs[oslot].win = -1;    /* stale ref from a torn-down window */
+
+        /* window slots are reusable (renderer per-window state indexes them) */
+        int wi = -1;
+        for (int i = 0; i < S.nwins; i++) {
+                if (!S.wins[i].in_use) {
+                        wi = i;
+                        break;
+                }
+        }
+        if (wi < 0) {
+                if (S.nwins >= 8)
+                        return -1;
+                wi = S.nwins++;
+        }
+
         ShimWin *win = &S.wins[wi];
-        win->out = mon;
-        S.outputs[mon].win = wi;
+        memset(win, 0, sizeof *win);
+        win->out = oslot;
+        win->in_use = true;
+        win->pool_fd = -1;
+        S.outputs[oslot].win = wi;
 
         /* wl_compositor.create_surface — inline-only wrapper in the headers;
          * marshal opcode 0 via the exported constructor (NULL = new_id slot). */
@@ -875,7 +959,7 @@ int wlshim_add_window(RRect geom)
                                                    WL_COMPOSITOR_CREATE_SURFACE,
                                                    S.wl_surface_iface, NULL);
         if (!win->surface)
-                return -1;
+                goto fail;
 
         /* zwlr_layer_shell_v1.get_layer_surface — opcode 0, signature "no?ous":
          *   (new_id, surface, output, layer=BACKGROUND(0), namespace)
@@ -886,12 +970,12 @@ int wlshim_add_window(RRect geom)
          *   omitting it shifts every later argument by one (garbage on the wire)
          * - flags: 0 (WL_MARSHAL_FLAG_DESTROY=1 would destroy the shell proxy)
          * - version: the shell's bound version becomes the new proxy's version */
-        wl_proxy_ *out_proxy = S.outputs[mon].output;
+        wl_proxy_ *out_proxy = S.outputs[oslot].output;
         win->layer_surface = S.proxy_marshal_flags(S.layer_shell, 0, zwlr_layer_surface_v1_iface,
                                                    S.shell_version, 0,
                                                    NULL, win->surface, out_proxy, 0, "reverie");
         if (!win->layer_surface)
-                return -1;
+                goto fail;
 
         static void (*const layer_listener[])(void) = {
                 (void (*)(void))on_layer_configure,
@@ -909,18 +993,16 @@ int wlshim_add_window(RRect geom)
         S.proxy_marshal(win->layer_surface, 1, 15u);
         S.proxy_marshal(win->layer_surface, 2, (i32)-1);
         S.proxy_marshal(win->layer_surface, 4, 0u);
-        i32 s = S.outputs[mon].scale < 1 ? 1 : S.outputs[mon].scale;
+        i32 s = S.outputs[oslot].scale < 1 ? 1 : S.outputs[oslot].scale;
         /* wl_surface.commit (opcode 6) — inline-only wrapper, marshalled directly */
         S.proxy_marshal(win->surface, WL_SURFACE_COMMIT);
         S.flush(S.display);
 
-        /* REGISTER the window BEFORE waiting: the configure (and any pointer)
-         * events dispatched below must find this win in S.wins[] — listeners
-         * search by proxy pointer, and S.nwins is the search bound. Registering
-         * only after the wait (the old bug) made every configure event MISS,
-         * so the dispatch loop blocked forever on the first follow-up read —
-         * the daemon stayed alive with a black desktop. */
-        S.nwins++;
+        /* the slot is already registered (S.nwins covers it) — configure and
+         * pointer events dispatched below must find this win in S.wins[]:
+         * listeners search by proxy pointer with S.nwins as the bound.
+         * Registering only after the wait (the old bug) made every configure
+         * event MISS and the dispatch loop blocked forever. */
 
         /* wait for configure */
         for (int spin = 0; spin < 100 && !win->configured; spin++) {
@@ -929,18 +1011,58 @@ int wlshim_add_window(RRect geom)
         }
         if (!win->configured) {
                 LOGW("wlshim: layer surface did not configure");
-                S.nwins--;               /* retire the failed slot */
-                S.outputs[mon].win = -1;
-                win->surface = NULL;
-                win->layer_surface = NULL;
-                return -1;
+                goto fail;
         }
         S.proxy_marshal(win->layer_surface, 6, win->cfg_serial);    /* ack_configure — opcode 6 (5 is get_popup) */
         S.flush(S.display);
 
-        win->lw = (u32)(S.outputs[mon].pw / s);
-        win->lh = (u32)(S.outputs[mon].ph / s);
+        win->lw = (u32)(S.outputs[oslot].pw / s);
+        win->lh = (u32)(S.outputs[oslot].ph / s);
         return wi;
+
+fail:
+        /* destroy the half-built proxies so the compositor does not keep an
+         * orphan surface holding an output reference */
+        if (win->layer_surface && S.proxy_destroy)
+                S.proxy_destroy(win->layer_surface);
+        if (win->surface && S.proxy_destroy)
+                S.proxy_destroy(win->surface);
+        memset(win, 0, sizeof *win);
+        win->pool_fd = -1;
+        S.outputs[oslot].win = -1;
+        return -1;
+}
+
+bool wlshim_destroy_window(int win)
+{
+        if (!S.active || win < 0 || win >= S.nwins)
+                return false;
+        ShimWin *win_ = &S.wins[win];
+        if (!win_->in_use)
+                return false;
+
+        /* children first (pool + buffers, pending frame callback), then the
+         * layer surface, then the wl_surface — mirroring the fini teardown.
+         * libwayland frees proxies ONLY on explicit wl_proxy_destroy. */
+        shim_pool_destroy(win_);
+        if (win_->frame_cb && S.proxy_destroy) {
+                S.proxy_destroy(win_->frame_cb);
+                win_->frame_cb = NULL;
+        }
+        if (win_->layer_surface && S.proxy_destroy)
+                S.proxy_destroy(win_->layer_surface);
+        if (win_->surface && S.proxy_destroy)
+                S.proxy_destroy(win_->surface);
+        if (win_->out >= 0 && win_->out < S.noutputs &&
+            S.outputs[win_->out].win == win)
+                S.outputs[win_->out].win = -1;
+        if (S.ptr_win == win)
+                S.ptr_win = -1;
+
+        memset(win_, 0, sizeof *win_);
+        win_->pool_fd = -1;
+        S.flush(S.display);
+        return true;
 }
 
 /* ---- wl_shm present path (v0.1.5) -------------------------------------------
@@ -1040,7 +1162,7 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
         if (!S.active || !S.display || win < 0 || win >= S.nwins)
                 return false;
         ShimWin *winp = &S.wins[win];
-        if (winp->closed || !rgba)
+        if (!winp->in_use || winp->closed || !rgba)
                 return false;
         if (winp->gl_surface) {
                 /* EGL owns this surface now (the GL renderer presents via
@@ -1259,7 +1381,7 @@ bool wlshim_wsi_frame_request(int win)
         if (!S.active || win < 0 || win >= S.nwins)
                 return false;
         ShimWin *w = &S.wins[win];
-        if (w->gl_surface || !w->surface)
+        if (!w->in_use || w->gl_surface || !w->surface)
                 return false;    /* not a WSI-presentable surface */
         if (!w->wsi) {
                 w->wsi = true;
@@ -1352,6 +1474,41 @@ void wlshim_pump(RPointerState *ptr)
                 S.dispatch(S.display);
         else
                 S.dispatch_pending(S.display);
+
+        /* hotplug: bind wl_output globals advertised mid-session (the
+         * registry listener records them; on_global_remove already
+         * tombstoned anything unplugged). One roundtrip per event collects
+         * the new output's geometry/mode/scale — a one-frame stall exactly
+         * once per hotplug. */
+        bool bound = false;
+        for (int i = 0; i < S.nglobals; i++) {
+                if (strcmp(S.globals[i].iface, "wl_output") != 0)
+                        continue;
+                u32 name = S.globals[i].name;
+                bool known = false;
+                for (int s = 0; s < S.noutputs; s++) {
+                        if (S.outputs[s].global_name == name) {
+                                known = true;    /* bound or tombstoned */
+                                break;
+                        }
+                }
+                if (known)
+                        continue;
+                if (shim_bind_output(&S.globals[i]) >= 0) {
+                        bound = true;
+                        LOGI("wlshim: output appeared (registry name %u)", name);
+                }
+        }
+        if (bound) {
+                S.roundtrip(S.display);
+                for (int s = 0; s < S.noutputs; s++) {
+                        if (!S.outputs[s].have_mode && !S.outputs[s].removed) {
+                                S.outputs[s].pw = 1280;
+                                S.outputs[s].ph = 720;
+                        }
+                }
+        }
+
         shim_idle_probes();
 }
 
@@ -1443,9 +1600,10 @@ u64 wlshim_dropped_frames(void)
 
 int wlshim_monitor_refresh(int mon)
 {
-        if (mon < 0 || mon >= S.noutputs)
+        int s = shim_out_slot(mon);
+        if (s < 0)
                 return 0;
-        i32 mhz = S.outputs[mon].refresh_mhz;
+        i32 mhz = S.outputs[s].refresh_mhz;
         if (mhz < 10000 || mhz > 1000000)
                 return 0;
         return (int)((mhz + 500) / 1000);
@@ -1453,14 +1611,14 @@ int wlshim_monitor_refresh(int mon)
 
 void wlshim_set_gl_surface(int win, bool on)
 {
-        if (win < 0 || win >= S.nwins)
+        if (win < 0 || win >= S.nwins || !S.wins[win].in_use)
                 return;
         S.wins[win].gl_surface = on;
 }
 
 bool wlshim_win_geometry(int win, RRect *geom)
 {
-        if (win < 0 || win >= S.nwins)
+        if (win < 0 || win >= S.nwins || !S.wins[win].in_use)
                 return false;
         int mon = S.wins[win].out;
         geom->x = S.outputs[mon].lx;

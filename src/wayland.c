@@ -63,11 +63,13 @@ typedef struct {
 
 typedef struct {
         u32 obj;
+        u32 global_name;   /* registry name — stable identity for hotplug  */
         i32 lx, ly;        /* logical position in global space      */
         i32 pw, ph;        /* physical pixel mode size              */
         i32 refresh_mhz;   /* mode refresh (mHz; 0 = unreported)    */
         i32 scale;
         bool have_mode, have_geom, done;
+        bool removed;      /* global_remove seen; filtered from lists */
         int win;           /* window index on this output, -1 none  */
 } WLOutput;
 
@@ -84,6 +86,7 @@ typedef struct {
         u32 pw, ph;        /* pixel size    */
         i32 scale;
         int out;
+        bool in_use;       /* slot occupied (freed by wl_remove_window) */
         bool configured;
         bool acked;
         bool closed;
@@ -105,6 +108,7 @@ struct WLDisplay {
         bool close_requested;
         char wl_error[160];    /* text of the last wl_display.error, if any */
         u32 comp_version;      /* wl_compositor version we bound */
+        u32 shell_version;      /* zwlr_layer_shell version we bound */
 
         WLObject objs[160];
         int nobjs;
@@ -371,6 +375,10 @@ static f64 gfix(const u8 *p)
  *   word 1: (size << 16) | opcode   — size INCLUDING the 8-byte header
  * The same layout is used for client requests (wl_begin_req) and for
  * compositor events, in both directions of the stream. */
+/* globals bookkeeping (defined below): the registry's global_remove handler
+ * in the event parser drops entries via this */
+static void wl_forget_global(u32 name);
+
 static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
 {
         if (avail < 8)
@@ -463,6 +471,25 @@ static i64 wl_parse_event(WLDisplay *w, const u8 *p, size_t avail)
                         u32 version = get32(a + voff);
                         extern void wl_note_global(WLDisplay * w, u32 name, const char *iface, u32 version);
                         wl_note_global(w, name, iface, version);
+                } else if (opcode == 1) {
+                        /* global_remove(name u32) — a hot-unplugged output
+                         * arrives here. Tombstone the bound output (windows
+                         * on it are the caller's business: wl_monitors()
+                         * stops listing it and the hotplug reconciler in
+                         * main.c tears the window down). */
+                        if (size < 12)
+                                break;
+                        u32 name = get32(a);
+                        for (int i = 0; i < w->noutputs; i++) {
+                                if (!w->outputs[i].removed &&
+                                    w->outputs[i].global_name == name) {
+                                        w->outputs[i].removed = true;
+                                        LOGI("wayland: output gone "
+                                             "(registry name %u)", name);
+                                        break;
+                                }
+                        }
+                        wl_forget_global(name);
                 }
                 break;
         }
@@ -710,6 +737,37 @@ static const WLGlobal *find_global(const char *iface)
         return NULL;
 }
 
+/* Drops a global from the bookkeeping table (global_remove). Returns the
+ * entry's iface-matched output slot hint: callers use wl_output names to
+ * tombstone the bound output. */
+static void wl_forget_global(u32 name)
+{
+        for (int i = 0; i < g_nglobals; i++) {
+                if (g_globals[i].name == name) {
+                        g_globals[i] = g_globals[g_nglobals - 1];
+                        g_nglobals--;
+                        return;
+                }
+        }
+}
+
+/* ---- packed monitor mapping ---------------------------------------------
+ * wl_monitors() filters removed outputs, so its indices are PACKED (n-th
+ * output still present) while windows and events keep raw SLOT references.
+ * This maps a packed monitor index to its internal slot, -1 when absent. */
+static int wl_out_slot(WLDisplay *w, int mon)
+{
+        if (mon < 0)
+                return -1;
+        for (int i = 0; i < w->noutputs; i++) {
+                if (w->outputs[i].removed)
+                        continue;
+                if (mon-- == 0)
+                        return i;
+        }
+        return -1;
+}
+
 /* --------------------------------------------------------------------------
  * connection
  * ------------------------------------------------------------------------ */
@@ -810,6 +868,11 @@ WLDisplay *wl_connect(char *err, size_t errcap)
         /* wl_compositor version: damage_buffer (surface op 9) needs v4 */
         w->comp_version = g_comp->version < 6 ? g_comp->version : 6;
         u32 bind_comp_v = w->comp_version;
+        {
+                const WLGlobal *g_shell_v = find_global("zwlr_layer_shell_v1");
+                w->shell_version = (g_shell_v && g_shell_v->version > 0)
+                                           ? g_shell_v->version : 1;
+        }
         if (!req_bind_typed(w, g_comp->name, "wl_compositor", bind_comp_v,
                             WK_COMPOSITOR, -1, -1, &w->compositor) ||
             !req_bind_typed(w, g_shm->name, "wl_shm", g_shm->version < 1 ? 1 : g_shm->version,
@@ -839,14 +902,13 @@ WLDisplay *wl_connect(char *err, size_t errcap)
         for (int i = 0; i < g_nglobals && w->noutputs < WL_MAX_OUTPUTS; i++) {
                 if (strcmp(g_globals[i].iface, "wl_output") != 0)
                         continue;
-                if (w->noutputs >= WL_MAX_OUTPUTS)
-                        break;
                 u32 outid;
                 if (!req_bind_typed(w, g_globals[i].name, "wl_output",
                                     g_globals[i].version < 4 ? g_globals[i].version : 4,
                                     WK_OUTPUT, -1, w->noutputs, &outid))
                         continue;
                 w->outputs[w->noutputs].obj = outid;
+                w->outputs[w->noutputs].global_name = g_globals[i].name;
                 w->outputs[w->noutputs].scale = 1;
                 w->outputs[w->noutputs].win = -1;
                 w->noutputs++;
@@ -897,59 +959,102 @@ WLDisplay *wl_connect(char *err, size_t errcap)
 
 int wl_monitors(WLDisplay *w, RRect *out, int max)
 {
-        int n = w->noutputs < max ? w->noutputs : max;
-        for (int i = 0; i < n; i++) {
+        /* packed: removed outputs are skipped, so monitor N means "the
+         * (N+1)-th output still present" — indices stay meaningful after
+         * unplug events without compacting the internal slots (windows and
+         * bound objects reference those slots). */
+        int n = 0;
+        for (int i = 0; i < w->noutputs && n < max; i++) {
+                if (w->outputs[i].removed)
+                        continue;
                 i32 s = w->outputs[i].scale < 1 ? 1 : w->outputs[i].scale;
-                out[i].x = w->outputs[i].lx;
-                out[i].y = w->outputs[i].ly;
-                out[i].w = w->outputs[i].pw / s;
-                out[i].h = w->outputs[i].ph / s;
+                out[n].x = w->outputs[i].lx;
+                out[n].y = w->outputs[i].ly;
+                out[n].w = w->outputs[i].pw / s;
+                out[n].h = w->outputs[i].ph / s;
+                n++;
         }
         return n;
 }
 
 f64 wl_monitor_scale(WLDisplay *w, int mon)
 {
-        if (mon < 0 || mon >= w->noutputs)
+        int s = wl_out_slot(w, mon);
+        if (s < 0)
                 return 1.0;
-        return (f64)(w->outputs[mon].scale < 1 ? 1 : w->outputs[mon].scale);
+        return (f64)(w->outputs[s].scale < 1 ? 1 : w->outputs[s].scale);
 }
 
 int wl_monitor_refresh(WLDisplay *w, int mon)
 {
-        if (!w || mon < 0 || mon >= w->noutputs)
+        int s = wl_out_slot(w, mon);
+        if (s < 0)
                 return 0;
-        i32 mhz = w->outputs[mon].refresh_mhz;
+        i32 mhz = w->outputs[s].refresh_mhz;
         /* mHz -> Hz, rounded; sanity gate against junk values */
         if (mhz < 10000 || mhz > 1000000)
                 return 0;
         return (int)((mhz + 500) / 1000);
 }
 
+u64 wl_monitor_id(WLDisplay *w, int mon)
+{
+        int s = wl_out_slot(w, mon);
+        if (s < 0)
+                return 0;
+        /* registry global names are unique per compositor session and never
+         * reused for a different output — the identity hotplug matches on */
+        return (u64)w->outputs[s].global_name;
+}
+
 int wl_add_window(WLDisplay *w, int mon)
 {
-        if (mon < 0 || mon >= w->noutputs || w->nwins >= WL_MAX_OUTPUTS)
+        int oslot = wl_out_slot(w, mon);
+        if (oslot < 0)
                 return -1;
-        if (w->outputs[mon].win >= 0)
-                return w->outputs[mon].win;    /* already has a window */
+        if (w->outputs[oslot].win >= 0) {
+                WLWin *ow = &w->wins[w->outputs[oslot].win];
+                if (ow->in_use)
+                        return w->outputs[oslot].win;    /* already has one */
+                w->outputs[oslot].win = -1;    /* stale ref (torn down) */
+        }
 
-        int wi = w->nwins;
+        /* window slots are reusable: freed by wl_remove_window, re-allocated
+         * here so renderer per-window state (indexed by the same number)
+         * never sees a platform renumbering */
+        int wi = -1;
+        for (int i = 0; i < w->nwins; i++) {
+                if (!w->wins[i].in_use) {
+                        wi = i;
+                        break;
+                }
+        }
+        if (wi < 0) {
+                if (w->nwins >= WL_MAX_OUTPUTS)
+                        return -1;
+                wi = w->nwins;
+                w->nwins++;
+        }
+
         WLWin *win = &w->wins[wi];
-        i32 scale = w->outputs[mon].scale < 1 ? 1 : w->outputs[mon].scale;
-        win->out = mon;
+        memset(win, 0, sizeof *win);
+        i32 scale = w->outputs[oslot].scale < 1 ? 1 : w->outputs[oslot].scale;
+        win->out = oslot;
         win->scale = scale;
-        win->w = (u32)(w->outputs[mon].pw / scale);
-        win->h = (u32)(w->outputs[mon].ph / scale);
-        win->pw = w->outputs[mon].pw;
-        win->ph = w->outputs[mon].ph;
+        win->w = (u32)(w->outputs[oslot].pw / scale);
+        win->h = (u32)(w->outputs[oslot].ph / scale);
+        win->pw = w->outputs[oslot].pw;
+        win->ph = w->outputs[oslot].ph;
         win->cur = 0;
+        win->in_use = true;
+        win->pool_fd = -1;
         for (int i = 0; i < WL_MAX_BUFS; i++)
                 win->buf_free[i] = true;
-        w->outputs[mon].win = wi;
+        w->outputs[oslot].win = wi;
 
         win->surface = wl_obj_new(w, WK_SURFACE, wi, -1);
         if (!wl_begin_req(w, w->compositor, 0, 4))    /* create_surface */
-                return -1;
+                goto fail;
         wl_put_u32(w, win->surface);
 
         win->layer_surface = wl_obj_new(w, WK_LAYER_SURFACE, wi, -1);
@@ -964,10 +1069,10 @@ int wl_add_window(WLDisplay *w, int mon)
                 size_t nsl = strlen(ns) + 1;
                 size_t payload = 4 + 4 + 4 + 4 + 4 + nsl + ((4 - (nsl & 3)) & 3);
                 if (!wl_begin_req(w, w->layer_shell, 0, payload))
-                        return -1;
+                        goto fail;
                 wl_put_u32(w, win->layer_surface);
                 wl_put_u32(w, win->surface);
-                wl_put_u32(w, w->outputs[mon].obj);
+                wl_put_u32(w, w->outputs[oslot].obj);
                 wl_put_u32(w, 0);              /* layer: background */
                 wl_put_str(w, ns);
         }
@@ -987,30 +1092,27 @@ int wl_add_window(WLDisplay *w, int mon)
          * compositors demarshal as set_size(uu) needing 8 bytes and kill the
          * connection with "invalid arguments for set_size". */
         if (!wl_begin_req(w, win->layer_surface, 0, 8))    /* set_size(0,0) */
-                return -1;
+                goto fail;
         wl_put_u32(w, 0);
         wl_put_u32(w, 0);
         if (!wl_begin_req(w, win->layer_surface, 1, 4))    /* set_anchor */
-                return -1;
+                goto fail;
         wl_put_u32(w, 15);                 /* top|bottom|left|right */
         if (!wl_begin_req(w, win->layer_surface, 2, 4))    /* set_exclusive_zone */
-                return -1;
+                goto fail;
         wl_put_i32(w, -1);                 /* fill the whole output */
         if (!wl_begin_req(w, win->layer_surface, 4, 4))    /* set_keyboard_interactivity */
-                return -1;
+                goto fail;
         wl_put_u32(w, 0);                  /* none */
 
         /* commit with no buffer */
         if (!wl_begin_req(w, win->surface, 6, 0))
-                return -1;
+                goto fail;
         if (!wl_flush(w))
-                return -1;
+                goto fail;
 
-        /* the window must be visible to the event parser (win index) before
-         * we wait for the configure event */
-        w->nwins++;
-
-        /* wait for configure */
+        /* wait for configure — the window slot is already registered with
+         * the event parser (nwins covers it) */
         {
                 for (int spin = 0; spin < 100 && !win->configured && !w->fatal; spin++) {
                         wl_dispatch_pending(w);
@@ -1023,14 +1125,14 @@ int wl_add_window(WLDisplay *w, int mon)
         }
         if (!win->configured) {
                 LOGW("wayland: layer surface did not configure");
-                return -1;
+                goto fail;
         }
 
         /* ack_configure — opcode 6 per the real protocol (opcode 5 is
          * get_popup, opcode 7 is destroy). The 0.1.5 client acked via the
          * get_popup slot after the set_size deletion shifted the table. */
         if (!wl_begin_req(w, win->layer_surface, 6, 4))
-                return -1;
+                goto fail;
         wl_put_u32(w, win->last_serial);
         win->acked = true;
 
@@ -1039,28 +1141,23 @@ int wl_add_window(WLDisplay *w, int mon)
         win->pool_fd = memfd_create("reverie-wl", 0);
         if (win->pool_fd < 0) {
                 LOGW("wayland: memfd_create failed");
-                return -1;
+                goto fail;
         }
-        if (ftruncate(win->pool_fd, (off_t)win->pool_size) < 0) {
-                close(win->pool_fd);
-                win->pool_fd = -1;
-                return -1;
-        }
+        if (ftruncate(win->pool_fd, (off_t)win->pool_size) < 0)
+                goto fail;
         win->pool_mem = mmap(NULL, win->pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, win->pool_fd, 0);
         if (win->pool_mem == MAP_FAILED) {
                 win->pool_mem = NULL;
-                close(win->pool_fd);
-                win->pool_fd = -1;
-                return -1;
+                goto fail;
         }
         win->pool = wl_obj_new(w, WK_POOL, wi, -1);
         if (!wl_create_pool(w, win->pool, win->pool_fd, (i32)win->pool_size))
-                return -1;
+                goto fail;
 
         for (int b = 0; b < WL_MAX_BUFS; b++) {
                 win->buf[b] = wl_obj_new(w, WK_BUFFER, wi, -1);
                 if (!wl_begin_req(w, win->pool, 0, 24))
-                        return -1;
+                        goto fail;
                 wl_put_u32(w, win->buf[b]);
                 wl_put_i32(w, (i32)((size_t)win->pw * win->ph * 4 * b));
                 wl_put_i32(w, (i32)win->pw);
@@ -1069,14 +1166,14 @@ int wl_add_window(WLDisplay *w, int mon)
                 wl_put_u32(w, 0);              /* WL_SHM_FORMAT_ARGB8888 */
         }
         if (!wl_flush(w))
-                return -1;
+                goto fail;
 
         /* first (empty) attach so the surface becomes visible */
         {
                 u8 *dst = (u8 *)win->pool_mem;
                 memset(dst, 0, (size_t)win->pw * win->ph * 4);
                 if (!wl_begin_req(w, win->surface, 1, 12))    /* attach */
-                        return -1;
+                        goto fail;
                 wl_put_u32(w, win->buf[0]);
                 wl_put_i32(w, 0);
                 wl_put_i32(w, 0);
@@ -1086,14 +1183,14 @@ int wl_add_window(WLDisplay *w, int mon)
                  * 16 bytes, never the 20 the 0.1.5 client sent */
                 if (w->comp_version >= 4) {
                         if (!wl_begin_req(w, win->surface, 9, 16))
-                                return -1;
+                                goto fail;
                         wl_put_i32(w, 0);
                         wl_put_i32(w, 0);
                         wl_put_u32(w, win->pw);
                         wl_put_u32(w, win->ph);
                 } else {
                         if (!wl_begin_req(w, win->surface, 2, 16))
-                                return -1;
+                                goto fail;
                         wl_put_i32(w, 0);
                         wl_put_i32(w, 0);
                         wl_put_u32(w, win->w);
@@ -1101,18 +1198,99 @@ int wl_add_window(WLDisplay *w, int mon)
                 }
                 if (win->scale > 1 && w->comp_version >= 3) {
                         if (!wl_begin_req(w, win->surface, 8, 4))    /* set_buffer_scale */
-                                return -1;
+                                goto fail;
                         wl_put_i32(w, win->scale);
                 }
                 if (!wl_begin_req(w, win->surface, 6, 0))    /* commit */
-                        return -1;
+                        goto fail;
                 if (!wl_flush(w))
-                        return -1;
+                        goto fail;
                 win->buf_free[0] = false;
                 win->cur = 1;
         }
 
         return wi;
+
+fail:
+        /* unwind: destroy whatever reached the wire so the compositor does
+         * not keep a half-built surface (orphan layer surfaces hold an
+         * output reference and can wedge later get_layer_surface calls),
+         * release local resources, free the slot. */
+        if (win->layer_surface && w->shell_version >= 3 &&
+            wl_begin_req(w, win->layer_surface, 7, 0))       /* destroy */
+                wl_flush(w);
+        if (win->surface && wl_begin_req(w, win->surface, 0, 0))    /* destroy */
+                wl_flush(w);
+        if (win->pool && wl_begin_req(w, win->pool, 1, 0))    /* pool destroy */
+                wl_flush(w);
+        if (win->pool_mem)
+                munmap(win->pool_mem, win->pool_size);
+        if (win->pool_fd >= 0)
+                close(win->pool_fd);
+        if (win->frame_cb)
+                wl_obj_del(w, win->frame_cb);
+        for (int b = 0; b < WL_MAX_BUFS; b++)
+                if (win->buf[b])
+                        wl_obj_del(w, win->buf[b]);
+        if (win->pool)
+                wl_obj_del(w, win->pool);
+        if (win->layer_surface)
+                wl_obj_del(w, win->layer_surface);
+        if (win->surface)
+                wl_obj_del(w, win->surface);
+        memset(win, 0, sizeof *win);
+        win->pool_fd = -1;
+        w->outputs[oslot].win = -1;
+        return -1;
+}
+
+bool wl_remove_window(WLDisplay *w, int win_)
+{
+        if (!w || win_ < 0 || win_ >= w->nwins)
+                return false;
+        WLWin *win = &w->wins[win_];
+        if (!win->in_use)
+                return false;
+
+        /* Destroy the surface's role first, then the surface, then the shm
+         * pool (wl_shm_pool.destroy = opcode 1; resize is 2 — checked against
+         * libwayland's wayland-client-protocol.h). zwlr_layer_surface_v1.destroy
+         * is opcode 7 and only exists since layer-shell v3 — on older shells
+         * wl_surface.destroy (v1) unmaps and the compositor tears the role down
+         * with it. Objects are unregistered so late events (buffer release,
+         * callback done) land on unknown ids and are skipped harmlessly. */
+        if (win->layer_surface && w->shell_version >= 3 &&
+            wl_begin_req(w, win->layer_surface, 7, 0))       /* destroy */
+                (void)wl_flush(w);
+        if (win->surface && wl_begin_req(w, win->surface, 0, 0))    /* destroy */
+                (void)wl_flush(w);
+        if (win->pool && wl_begin_req(w, win->pool, 1, 0))    /* pool destroy */
+                (void)wl_flush(w);
+
+        if (win->pool_mem)
+                munmap(win->pool_mem, win->pool_size);
+        if (win->pool_fd >= 0)
+                close(win->pool_fd);
+        if (win->frame_cb)
+                wl_obj_del(w, win->frame_cb);
+        for (int b = 0; b < WL_MAX_BUFS; b++)
+                if (win->buf[b])
+                        wl_obj_del(w, win->buf[b]);
+        if (win->pool)
+                wl_obj_del(w, win->pool);
+        if (win->layer_surface)
+                wl_obj_del(w, win->layer_surface);
+        if (win->surface)
+                wl_obj_del(w, win->surface);
+        if (win->out >= 0 && win->out < w->noutputs &&
+            w->outputs[win->out].win == win_)
+                w->outputs[win->out].win = -1;
+        if (w->ptr_win == win_)
+                w->ptr_win = -1;    /* stale slot ref would mis-map pointer */
+
+        memset(win, 0, sizeof *win);
+        win->pool_fd = -1;
+        return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -1124,7 +1302,7 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
         if (!w || win_ < 0 || win_ >= w->nwins)
                 return false;
         WLWin *win = &w->wins[win_];
-        if (win->closed || w->fatal)
+        if (!win->in_use || win->closed || w->fatal)
                 return false;
         if (width != win->pw || height != win->ph || !rgba) {
                 if (rgba && (width != win->pw || height != win->ph)) {
@@ -1227,10 +1405,91 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
  * state
  * ------------------------------------------------------------------------ */
 
+/* Binds wl_output globals that were advertised AFTER the initial registry
+ * burst (a monitor plugged mid-session). Called from wl_pump so the bind
+ * happens on the main loop's cadence, never inside the event parser (which
+ * would re-enter dispatch). Each new output gets a bounded roundtrip for
+ * its geometry/mode/scale events — a one-frame stall exactly once per
+ * hotplug event. */
+static void wl_bind_late_outputs(WLDisplay *w)
+{
+        if (w->fatal)
+                return;
+        bool bound_any = false;
+        for (int i = 0; i < g_nglobals; i++) {
+                if (strcmp(g_globals[i].iface, "wl_output") != 0)
+                        continue;
+                u32 name = g_globals[i].name;
+
+                bool known = false;
+                for (int s = 0; s < w->noutputs; s++) {
+                        if (w->outputs[s].global_name == name) {
+                                known = true;    /* bound already (or tombstoned — do not rebind) */
+                                break;
+                        }
+                }
+                if (known)
+                        continue;
+                if (w->noutputs >= WL_MAX_OUTPUTS) {
+                        static bool warned;
+                        if (!warned) {
+                                warned = true;
+                                LOGW("wayland: output beyond the %d-slot cap "
+                                     "ignored (hotplug)", WL_MAX_OUTPUTS);
+                        }
+                        continue;
+                }
+
+                u32 outid;
+                if (!req_bind_typed(w, name, "wl_output",
+                                    g_globals[i].version < 4 ? g_globals[i].version : 4,
+                                    WK_OUTPUT, -1, w->noutputs, &outid))
+                        continue;
+                w->outputs[w->noutputs].obj = outid;
+                w->outputs[w->noutputs].global_name = name;
+                w->outputs[w->noutputs].scale = 1;
+                w->outputs[w->noutputs].win = -1;
+                w->noutputs++;
+                bound_any = true;
+                LOGI("wayland: output appeared (registry name %u)", name);
+        }
+        if (!bound_any)
+                return;
+        wl_flush(w);
+
+        /* bounded roundtrip: collect geometry/mode/scale/done for the new
+         * outputs before wl_monitors() can list them (same pattern as the
+         * connect-time roundtrip) */
+        u32 cb;
+        if (req_sync(w, &cb)) {
+                for (int spin = 0; spin < 100; spin++) {
+                        wl_dispatch_pending(w);
+                        if (wl_obj_find(w, cb) == NULL || w->fatal)
+                                break;
+                        struct pollfd p = { w->fd, POLLIN, 0 };
+                        if (poll(&p, 1, 100) <= 0 && spin > 20)
+                                break;
+                }
+        }
+        for (int s = 0; s < w->noutputs; s++) {
+                if (!w->outputs[s].have_mode && !w->outputs[s].removed) {
+                        /* same fallback as connect: an output that reported no
+                         * mode gets a benign default so window creation can
+                         * proceed (the compositor corrects via configure) */
+                        w->outputs[s].pw = 1280;
+                        w->outputs[s].ph = 720;
+                }
+        }
+}
+
 void wl_pump(WLDisplay *w)
 {
-        if (w)
-                wl_dispatch_pending(w);
+        if (!w)
+                return;
+        wl_dispatch_pending(w);
+        /* new wl_output globals are bound here (not inside the parser) and
+         * gone ones are already tombstoned by the global_remove handler */
+        wl_bind_late_outputs(w);
 }
 
 bool wl_pointer(WLDisplay *w, RPointerState *out)
@@ -1313,6 +1572,8 @@ bool wl_win_geometry(WLDisplay *w, int win_, RRect *geom)
         if (!w || win_ < 0 || win_ >= w->nwins)
                 return false;
         WLWin *win = &w->wins[win_];
+        if (!win->in_use)
+                return false;
         geom->x = w->outputs[win->out].lx;
         geom->y = w->outputs[win->out].ly;
         geom->w = (i32)win->w;

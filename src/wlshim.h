@@ -26,10 +26,18 @@ bool wlshim_active(void);
 /* ---- platform-level operations (delegated from plat_wayland.c) ---- */
 bool wlshim_platform_init(RPlatform *p, char *err, size_t errcap);
 void wlshim_platform_fini(RPlatform *p);
+/* Monitor list is PACKED: unplugged outputs (global_remove) are filtered,
+ * so monitor N = the (N+1)-th output still present. wlshim_pump() binds
+ * outputs advertised mid-session and tombstones removed ones. */
 int  wlshim_monitors(RRect *out, int max);
 f64  wlshim_monitor_scale(int mon);
 int  wlshim_monitor_refresh(int mon);   /* Hz, 0 unknown */
+u64  wlshim_monitor_id(int mon);        /* registry global name */
 int  wlshim_add_window(RRect geom);
+/* Destroys a window's pool/surface/layer-surface proxies and frees the
+ * slot for reuse. Release renderer-owned handles (EGL surface, Vulkan
+ * surface) FIRST. */
+bool wlshim_destroy_window(int win);
 /* Present one CPU-readable frame through wl_shm. `premultiplied`: the bytes
  * are already premultiplied against alpha (the Vulkan tier converts on the
  * GPU) — the presenter then does a single memcpy; false = straight alpha and

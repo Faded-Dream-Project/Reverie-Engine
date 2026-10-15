@@ -59,6 +59,15 @@ struct RPlatform {
         /* Current output refresh rate in Hz (rounded); 0 = unknown (X11 core
          * does not report it — pacing then falls back to the scene fps). */
         int  (*monitor_refresh)(RPlatform *p, int mon);
+        /* Stable per-output identity for hotplug matching: the same physical
+         * output reports the same id across re-enumerations. Wayland: the
+         * wl_output global name (compositor-assigned, stable for the output's
+         * lifetime). X11: a key derived from the Xinerama position — the only
+         * stable handle core X11 offers; a monitor MOVED to a new origin
+         * therefore matches as remove+add (window recreation), which is
+         * correct if chatty. NULL = backend has no stable identity; callers
+         * fall back to index-matching and re-enumeration is only advisory. */
+        u64  (*monitor_id)(RPlatform *p, int mon);
 
         /* ---- windows ---- */
         int  (*add_window)(RPlatform *p, RRect geom);
@@ -100,6 +109,13 @@ struct RPlatform {
         /* geometry changed: recreate the window in place (same index) so
          * renderers can rebuild their surfaces */
         bool (*resize_window)(RPlatform *p, int win, RRect geom);
+        /* Destroy a window created by add_window and free its slot; the
+         * index becomes reusable by a later add_window. The caller must
+         * have released any renderer-owned surface for it FIRST (the
+         * renderer remove_window hook). NULL = backend cannot destroy
+         * windows at runtime; the hotplug reconciler then refuses to
+         * release the monitors it no longer controls instead of crashing. */
+        bool (*remove_window)(RPlatform *p, int win);
 
         /* ---- events / state ---- */
         void (*pump)(RPlatform *p);

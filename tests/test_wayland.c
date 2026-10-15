@@ -744,6 +744,144 @@ static void *phase_b(void *arg)
                 return NULL;
 }
 
+/* ---- 8b. OUTPUT HOTPLUG helpers ------------------------------------------
+ * A second wl_output advertised mid-session is bound inside wl_pump (never
+ * in the event parser); global_remove tombstones it; windows ride reusable
+ * slots. The fake server serves the late-bind roundtrip and the hotplug
+ * window setups from threads while the client blocks inside the API. */
+static u32 hp_out2;                 /* client id of the second wl_output   */
+static u32 hp_surface, hp_layer;    /* current hotplug window's objects    */
+static u32 hp_pool, hp_buf[2];
+
+static void *phase_hotplug_bind(void *arg)
+{
+        (void)arg;
+        /* wl_pump (main thread, blocked in its bounded roundtrip) writes
+         * bind(99) then sync; serve both, then feed the new output's
+         * geometry/mode/scale/done + the sync callback completion. */
+        n = s_read_msg(msg, sizeof msg, NULL);
+        if (n >= 24 && s_check(msg, n)) {
+                u32 slen = s_get32(msg + 12);
+                u32 padded = ((slen + 3) & ~3u);
+                hp_out2 = s_get32(msg + 20 + padded);
+        }
+        n = s_read_msg(msg, sizeof msg, NULL);
+        u32 sync_cb = (n >= 12) ? s_get32(msg + 8) : 0;
+        /* logical 512x384 @1x, positioned to the right of output 1
+         * (400x300 logical at scale 2) */
+        u8 p[32];
+        memset(p, 0, sizeof p);
+        s_put32(p, 400);
+        s_put32(p + 4, 0);
+        s_put32(p + 8, 512);
+        s_put32(p + 12, 384);
+        s_send(hp_out2, 0, p, 24);                  /* geometry */
+        u8 m[20];
+        memset(m, 0, sizeof m);
+        s_put32(m, 1);
+        s_put32(m + 4, 512);
+        s_put32(m + 8, 384);
+        s_put32(m + 12, 60000);
+        s_send(hp_out2, 1, m, 16);                  /* mode (current) */
+        u8 sc[8];
+        s_put32(sc, 1);
+        s_send(hp_out2, 3, sc, 4);                  /* scale */
+        s_send(hp_out2, 2, NULL, 0);                /* done */
+        s_send(sync_cb, 0, NULL, 0);                /* sync callback done */
+        u8 d[4];
+        s_put32(d, sync_cb);
+        s_send(OBJ_DISPLAY, 1, d, 4);               /* delete_id */
+        return NULL;
+}
+
+static struct {
+        u32 output;    /* the wl_output object the window must target */
+        u32 cw, ch;    /* configure size (logical)                     */
+} hp_win_arg;
+
+static void *phase_hotplug_win(void *arg)
+{
+        (void)arg;
+        u32 want_output = hp_win_arg.output;
+        n = s_read_msg(msg, sizeof msg, NULL);
+        CHECK(n >= 12 && s_get32(msg) == S.compositor && msg_opcode(msg) == 0,
+              "hotplug win: create_surface (opcode 0)");
+        u32 surface = (n >= 12) ? s_get32(msg + 8) : 0;
+        if (n >= 8)
+                s_check(msg, n);
+
+        n = s_read_msg(msg, sizeof msg, NULL);
+        CHECK(n >= 32 && s_get32(msg) == S.layer_shell && msg_opcode(msg) == 0,
+              "hotplug win: get_layer_surface (opcode 0, not destroy)");
+        u32 layer = 0;
+        if (n >= 32) {
+                layer = s_get32(msg + 8);
+                CHECK(s_get32(msg + 16) == want_output,
+                      "hotplug win: get_layer_surface targets the right output");
+        }
+        if (n >= 8)
+                s_check(msg, n);
+
+        /* drain set_size / set_anchor / set_exclusive_zone /
+         * set_keyboard_interactivity + commit(null) */
+        for (int i = 0; i < 8; i++) {
+                n = s_read_msg(msg, sizeof msg, NULL);
+                if (n < 8)
+                        break;
+                if (!s_check(msg, n))
+                        break;
+                if (s_get32(msg) == surface && msg_opcode(msg) == 6)
+                        break;    /* commit(null) */
+        }
+
+        /* configure(serial, w, h) — the size this test's output implies */
+        u8 p[16];
+        s_put32(p, 78);
+        s_put32(p + 4, hp_win_arg.cw);
+        s_put32(p + 8, hp_win_arg.ch);
+        s_send(layer, 0, p, 12);
+
+        hp_surface = surface;
+        hp_layer = layer;
+        return NULL;
+}
+
+/* main-thread drain of a window's post-configure setup (ack_configure,
+ * create_pool + fd, two create_buffers, first attach/commit). Returns true
+ * when the full sequence was seen and validated. */
+static bool hp_drain_window_setup(void)
+{
+        bool saw_ack = false, saw_commit = false;
+        hp_pool = 0;
+        hp_buf[0] = hp_buf[1] = 0;
+        for (int i = 0; i < 14; i++) {
+                int fd = -1;
+                n = s_read_msg(msg, sizeof msg, &fd);
+                if (n < 8)
+                        break;
+                if (!s_check(msg, n))
+                        break;
+                if (fd >= 0)
+                        close(fd);    /* the pool's shm fd: not needed here */
+                u32 obj = s_get32(msg);
+                u32 op = msg_opcode(msg);
+                if (obj == hp_layer && op == 6) {
+                        saw_ack = true;
+                } else if (obj == S.shm && op == 0) {
+                        hp_pool = s_get32(msg + 8);
+                } else if (hp_pool && obj == hp_pool && op == 0) {
+                        if (!hp_buf[0])
+                                hp_buf[0] = s_get32(msg + 8);
+                        else
+                                hp_buf[1] = s_get32(msg + 8);
+                } else if (obj == hp_surface && op == 6) {
+                        saw_commit = true;
+                        break;
+                }
+        }
+        return saw_ack && saw_commit && hp_buf[0] && hp_buf[1];
+}
+
 int main(void)
 {
         /* the fake compositor writes from its thread; a write racing the
@@ -1020,6 +1158,134 @@ int main(void)
         CHECK(pst2.dx == 0.0 && pst2.dy == 0.0 && !pst2.click,
               "consume-on-read: no stale deltas or click repeats");
         CHECK(pst2.clicks == 1, "total click count survives reads");
+
+        /* 8b. OUTPUT HOTPLUG — the full add/bind/window/remove/reuse cycle.
+         * A second output advertised mid-session must be bound by wl_pump,
+         * listed with a stable identity, host a window, disappear cleanly on
+         * global_remove (packed list, stable indices), and free its window
+         * slot for reuse (renderer per-window state depends on that). */
+        {
+                /* drain the stale requests of the last present cycle
+                 * (attach/damage/commit are still unread; the trailing frame
+                 * request was suppressed — one was already pending) so the
+                 * hotplug phases read exactly what they expect */
+                int stale = 0;
+                for (int i = 0; i < 6; i++) {
+                        n = s_read_msg(msg, sizeof msg, NULL);
+                        if (n < 8)
+                                break;
+                        if (!s_check(msg, n))
+                                break;
+                        stale++;
+                        if (s_get32(msg) == S.surface && msg_opcode(msg) == 6)
+                                break;    /* the present's commit */
+                }
+                CHECK(stale >= 2, "drained the stale present requests");
+
+                CHECK(wl_monitor_id(wl, 0) == 13,
+                      "monitor identity = registry global name (13)");
+
+                /* ---- plug: registry advertises output 99 ---- */
+                pthread_t thb2;
+                pthread_create(&thb2, NULL, phase_hotplug_bind, NULL);
+                s_send_str_event(OBJ_REGISTRY, 0, 99, "wl_output", 4);
+                wl_pump(wl);    /* parses the global, binds, rounds geometry in */
+                pthread_join(thb2, NULL);
+                CHECK(hp_out2 != 0, "hotplug: bind for registry name 99 seen");
+
+                RRect hm[8];
+                int hn = wl_monitors(wl, hm, 8);
+                CHECK(hn == 2, "two monitors after the hotplug add");
+                CHECK(hn == 2 && hm[1].x == 400 && hm[1].y == 0 &&
+                      hm[1].w == 512 && hm[1].h == 384,
+                      "second monitor geometry exact (512x384 @1x at +400)");
+                CHECK(hn == 2 && hm[0].w == 400 && hm[0].h == 300,
+                      "first monitor unchanged (400x300 @2x)");
+                CHECK(wl_monitor_id(wl, 1) == 99, "second monitor identity = 99");
+                CHECK(wl_monitor_id(wl, 0) == 13, "first monitor identity stable");
+                CHECK(wl_monitor_scale(wl, 1) == 1.0, "second monitor scale 1");
+                CHECK(wl_monitor_refresh(wl, 1) == 60, "second monitor refresh 60 Hz");
+
+                /* ---- window on the new monitor (slot 1: slot 0 is taken) ---- */
+                pthread_t thw;
+                hp_win_arg.output = hp_out2;
+                hp_win_arg.cw = 512;
+                hp_win_arg.ch = 384;
+                pthread_create(&thw, NULL, phase_hotplug_win, NULL);
+                int hwin = wl_add_window(wl, 1);
+                CHECK(hwin == 1, "window on the new monitor takes slot 1");
+                pthread_join(thw, NULL);
+                CHECK(hp_drain_window_setup(), "hotplug window setup complete + valid");
+                {
+                        RRect g;
+                        CHECK(wl_win_geometry(wl, 1, &g) && g.w == 512 && g.h == 384,
+                              "hotplug window geometry via configure");
+                }
+
+                /* ---- unplug: global_remove(99) ---- */
+                {
+                        u8 p[8];
+                        s_put32(p, 99);
+                        s_send(OBJ_REGISTRY, 1, p, 4);   /* global_remove */
+                }
+                wl_pump(wl);
+                hn = wl_monitors(wl, hm, 8);
+                CHECK(hn == 1, "one monitor after global_remove");
+                CHECK(hn == 1 && hm[0].w == 400 && hm[0].h == 300,
+                      "packed list: surviving monitor is the original");
+                CHECK(wl_monitor_id(wl, 0) == 13,
+                      "packed index 0 maps to the surviving output's slot");
+                CHECK(wl_monitor_scale(wl, 0) == 2.0, "surviving monitor scale correct");
+
+                /* ---- window teardown: role, surface, pool destroyed on the wire,
+                 * in that order, each strictly validated ---- */
+                CHECK(wl_remove_window(wl, 1), "window 1 removed");
+                {
+                        u32 seen = 0;
+                        for (int i = 0; i < 3; i++) {
+                                n = s_read_msg(msg, sizeof msg, NULL);
+                                if (n < 8)
+                                        break;
+                                if (!s_check(msg, n))
+                                        break;
+                                u32 obj = s_get32(msg);
+                                u32 op = msg_opcode(msg);
+                                if (obj == hp_layer && op == 7 && n == 8)
+                                        seen |= 1;
+                                else if (obj == hp_surface && op == 0 && n == 8)
+                                        seen |= 2;
+                                else if (obj == hp_pool && op == 1 && n == 8)
+                                        seen |= 4;
+                        }
+                        CHECK(seen == 7, "layer_surface.destroy + wl_surface.destroy + "
+                                         "wl_shm_pool.destroy seen (real opcodes)");
+                }
+                {
+                        RRect g;
+                        CHECK(!wl_win_geometry(wl, 1, &g), "freed slot reports no geometry");
+                }
+
+                /* ---- slot reuse: remove window 0, re-add it, same slot number ---- */
+                CHECK(wl_remove_window(wl, 0), "window 0 removed");
+                for (int r = 0; r < 3; r++) {
+                        n = s_read_msg(msg, sizeof msg, NULL);
+                        if (n < 8 || !s_check(msg, n))
+                                break;
+                }
+                pthread_t thw2;
+                hp_win_arg.output = S.output;
+                hp_win_arg.cw = 400;
+                hp_win_arg.ch = 300;
+                pthread_create(&thw2, NULL, phase_hotplug_win, NULL);
+                int rwin = wl_add_window(wl, 0);
+                CHECK(rwin == 0, "re-added window reuses slot 0 (no renumbering)");
+                pthread_join(thw2, NULL);
+                CHECK(hp_drain_window_setup(), "re-added window setup complete + valid");
+
+                /* sections 9/10 below must reference the LIVE window objects */
+                S.surface = hp_surface;
+                S.layer_surface = hp_layer;
+        }
 
         /* 9. closed event */
         s_send(S.layer_surface, 1, NULL, 0);
