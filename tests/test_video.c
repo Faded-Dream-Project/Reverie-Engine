@@ -203,11 +203,13 @@ int main(int argc, char **argv)
 				      "forced-unavailable refusal carries \"no video support\"");
 				if (rc != 0) {
 					snprintf(scmd, sizeof scmd, "cat '%s/out' 2>/dev/null", dir);
-					system(scmd); /* surface the child's diagnostics */
+					if (system(scmd) != 0)
+						printf("  (child diagnostics unavailable)\n");
 				}
 			}
 			snprintf(scmd, sizeof scmd, "rm -rf '%s'", dir);
-			system(scmd);
+			if (system(scmd) != 0)
+				printf("  (warn: stub-leg temp dir left behind)\n");
 		}
 	}
 
