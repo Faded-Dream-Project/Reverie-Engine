@@ -137,8 +137,14 @@ reverie scenes/ripple-lake.rev      # plain scene (unchanged)
 reverie old-scene.revpack           # v1 scene pack (unchanged)
 ```
 
-Hot-reload works for folder themes (mtime watch on the directory's
-`theme.json` path); packed themes reload when the file changes.
+Hot-reload polls a snapshot of every file under the theme (scene,
+`theme.json`, all assets) roughly every 0.5 s — folders, packs (the single
+container file), and plain scenes alike. Editing any file, adding one, or
+removing one reloads the theme; a failed reload keeps the old scene running
+and logs the parse error. (Watching a directory's own mtime would never
+fire on an in-place edit — a directory's mtime only moves when entries are
+added or removed — so the watch walks the tree and compares
+(path, mtime, size) records; bounded at 256 files / 5 levels deep.)
 
 ## Compatibility
 

@@ -43,6 +43,17 @@ bool wlshim_win_geometry(int win, RRect *geom);
 void wlshim_sync(void);
 bool wlshim_should_close(void);
 
+/* Idle power-save: false when every wl_shm-presented window has gone
+ * unlatched past the visibility window (fullscreen app over the wallpaper,
+ * display asleep) — the caller should stop rendering and pace at a slow
+ * probe rate; the shim keeps asking the compositor ~4 Hz and flips back to
+ * true on the first latched callback. Surfaces owned by EGL / a Vulkan
+ * swapchain are excluded (they throttle through their own present calls). */
+bool wlshim_surface_visible(void);
+/* Test/field hook: override the starvation window in seconds (<0 restores
+ * the env/default 0.25). */
+void wlshim_set_vis_timeout(f64 seconds);
+
 /* Marks a window's wl_surface as owned by EGL (render_gl.c calls this once
  * its wl_egl_window is active). The wl_shm presenter then stays off that
  * surface so it cannot fight the EGL swapchain for commits. */

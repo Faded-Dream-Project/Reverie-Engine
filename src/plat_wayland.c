@@ -172,6 +172,16 @@ static u64 pw_dropped_frames(RPlatform *p)
         return wl_dropped_frames(c->wl);
 }
 
+static bool pw_surface_visible(RPlatform *p)
+{
+        (void)p;
+        /* shim path only: the raw client has no latched-frame evidence,
+        * so it reports visible (never idles). */
+        if (wlshim_active())
+                return wlshim_surface_visible();
+        return true;
+}
+
 static bool pw_win_geometry(RPlatform *p, int win, RRect *geom)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
@@ -250,6 +260,7 @@ RPlatform *plat_wayland_create(void)
         p->pointer = pw_pointer;
         p->wait_frame = pw_wait_frame;
         p->dropped_frames = pw_dropped_frames;
+        p->surface_visible = pw_surface_visible;
         p->win_geometry = pw_win_geometry;
         p->sync = pw_sync;
         p->should_close = pw_should_close;

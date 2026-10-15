@@ -39,6 +39,25 @@ wallpaper engines cannot exist there without compositor extensions. When
 the global is missing, Reverie exits with an explicit message saying
 exactly that.
 
+### Idle power-save (Wayland, wl_shm present path)
+
+A wallpaper daemon runs all day, and most of that time nobody is looking
+at it. On the wl_shm present path the shim watches `wl_callback.done`
+traffic: when a surface stops being latched — a fullscreen app covering
+the wallpaper, the display going to sleep — the callbacks stop, and after
+a 250 ms starvation window the daemon **stops rendering entirely**: no GPU
+work, no simulations, no presents, the animation clock frozen. An idle
+probe re-attaches the current buffer ~4 Hz (a same-pixels repaint — the
+cheapest unambiguous "are you still there?"), and the first latched
+callback resumes full-rate rendering exactly where the scene froze.
+`REV_WL_VIS_MS` tunes the starvation window.
+
+Limitations, on purpose: EGL and `REV_VK_PRESENT=wsi` surfaces are owned
+by their own swapchains (the shim must not interleave commits with the
+driver's), so they do not idle — their present calls throttle themselves.
+The X11 and raw-Wayland-client paths have no latched-frame evidence and
+always render. The pause/resume transitions are logged (`idle: …`).
+
 ## The renderer policy (2026-10 redesign)
 
 `--renderer` / `REV_RENDERER` accept `auto | vulkan | opengl | cpu`.
@@ -273,6 +292,7 @@ selects.
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
+| `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long flips the daemon to paused — see "Idle power-save") |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
 | `REV_AUTO_VK`       | `1` = let auto also consider the present-only Vulkan tier (off by default) |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |

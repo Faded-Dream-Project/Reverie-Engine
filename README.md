@@ -204,6 +204,29 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **Theme hot-reload was dead; the daemon now sleeps when nobody is
+  looking (2026-10, post-field-report hardening).** Two finds from
+  auditing the daemon loop after the fifth field report. (1) Hot-reload
+  watched the theme FOLDER's own mtime — which on Linux never moves when
+  a file inside is edited in place (only on entry add/remove/rename), so
+  the feature silently never fired for the primary dev workflow. The
+  watch now snapshots every file under the theme (path, mtime, size) and
+  re-walks it every 0.5 s: scene edits, asset swaps, `theme.json`
+  changes, added/removed files all reload; packs stat their container.
+  (2) Idle power-save: a wallpaper runs all day under fullscreen apps
+  and locked screens, and the loop kept rendering 60 fps nobody saw. On
+  the wl_shm present path the shim watches `wl_callback.done` traffic;
+  past a 250 ms starvation window the daemon stops rendering entirely
+  (no GPU work, no sims, animation clock frozen) and re-attaches the
+  current buffer ~4 Hz as a probe — the first latched callback resumes
+  full rate exactly where the scene froze (`REV_WL_VIS_MS` tunes it;
+  EGL/WSI-owned surfaces and X11 stay always-rendering by design).
+  Same audit, third find: the pacing deadline was re-anchored to
+  loop-top every frame, so each frame inherited the wait's wake-up slack
+  (~0.4 ms) — the steady creep behind the field reports' 57.6–58.3 fps
+  against a 60 Hz display (frame avg 17.2 ms where p50 was 17.0). The
+  deadline grid is now absolute (resync on overruns), locking a trivial
+  scene to a measured 60.0 fps / 16.7 ms avg on the test stack.
 * **WSI present wedge + every blue rendered red (2026-10, fifth field
   report).** Two reports in one: `REV_VK_PRESENT=wsi` froze the wallpaper
   at "1.0–1.6 fps" with `frame p50` pinned at exactly 1000.0 ms, and the

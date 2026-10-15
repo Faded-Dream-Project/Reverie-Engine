@@ -121,6 +121,15 @@ struct RPlatform {
          * Used by the perf stats — cheap to query, monotonic. */
         u64  (*dropped_frames)(RPlatform *p);
 
+        /* ---- visibility (idle power-save) --------------------------------
+         * False when the platform knows no surface is being shown (Wayland:
+         * every wl_shm-presented window went unlatched past the visibility
+         * window — fullscreen app on top, display asleep). The daemon then
+         * stops rendering and paces at a slow probe rate until the platform
+         * flips back. NULL = platform cannot tell (X11, raw Wayland client)
+         * and the caller must assume always-visible. */
+        bool (*surface_visible)(RPlatform *p);
+
         /* ---- tests / tools ---- */
         u32 *(*screenshot)(RPlatform *p, int win, u32 *w, u32 *h);
 };

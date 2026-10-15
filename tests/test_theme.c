@@ -4,10 +4,12 @@
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "json.h"
@@ -100,7 +102,7 @@ int main(void)
 			CHECK(strcmp(rev_json_str(rev_json_get(v, "esc"), ""), "a\nbA") == 0,
 			      "json: escapes (\\n + \\u0041)");
 			CHECK(strcmp(rev_json_str(rev_json_get(rev_json_get(v, "obj"), "deep"), ""),
-			             "yes") == 0, "json: nested object");
+				     "yes") == 0, "json: nested object");
 			arena_destroy(ar);
 		}
 		/* rejects garbage */
@@ -155,8 +157,8 @@ int main(void)
 			CHECK(ir != NULL, "theme scene parses");
 			if (ir) {
 				RTScene *sc = rtscene_compile_assets(ir, ar, theme_base_dir(th),
-				                                     th, test_theme_asset,
-				                                     err, sizeof err);
+								     th, test_theme_asset,
+								     err, sizeof err);
 				CHECK(sc != NULL, "theme scene compiles via provider (%s)",
 				      sc ? "" : err);
 				if (sc)
@@ -277,10 +279,110 @@ int main(void)
 		CHECK(!rev_theme_path_safe(ctl), "unsafe: control char");
 	}
 
+	/* ---- 6. hot-reload watch ----
+	 * A folder's own mtime never moves on an in-place edit, so the watch
+	 * walks the whole tree and compares (path, mtime, size) snapshots —
+	 * every leg below was INVISIBLE to the old dir-mtime check. */
+	{
+		char wdir[256], wsub[600];
+		snprintf(wdir, sizeof wdir, "/tmp/revwatch_%d", (int)getpid());
+		mkdir(wdir, 0755);
+		snprintf(wsub, sizeof wsub, "%s/assets", wdir);
+		mkdir(wsub, 0755);
+		char jp[600], sp[600], ap[700];
+		snprintf(jp, sizeof jp, "%s/theme.json", wdir);
+		snprintf(sp, sizeof sp, "%s/scene.rev", wdir);
+		snprintf(ap, sizeof ap, "%s/dot.png", wsub);
+		wr(jp, "{ \"id\": \"watch\", \"scene\": \"scene.rev\" }");
+		wr(sp, "scene { layer s { type = solid color = #112233 } }");
+		CHECK(make_png(ap), "watch: asset created");
+
+		RTheme *th = theme_load(wdir, err, sizeof err);
+		CHECK(th != NULL, "watch: theme loads (%s)", th ? "" : err);
+		if (th) {
+			CHECK(!theme_files_changed(th),
+			      "watch: clean tree reports no change");
+
+			/* in-place scene edit — the exact case the old
+			 * directory-mtime watch could never see. Same-length
+			 * text, so the mtime bump (explicit, deterministic)
+			 * is what must carry the signal. */
+			wr(sp, "scene { layer s { type = solid color = #334455 } }");
+			struct timespec ts0[2];
+			ts0[0].tv_sec = time(NULL) + 3;
+			ts0[0].tv_nsec = 0;
+			ts0[1] = ts0[0];
+			utimensat(AT_FDCWD, sp, ts0, 0);
+			CHECK(theme_files_changed(th),
+			      "watch: in-place scene.rev edit detected");
+
+			theme_free(th);
+			th = theme_load(wdir, err, sizeof err);
+			CHECK(th != NULL && !theme_files_changed(th),
+			      "watch: fresh snapshot after reload is clean");
+
+			/* same-size rewrite + explicit mtime bump: the MTIME
+			 * signal, not the size, must fire */
+			wr(jp, "{ \"id\": \"watch\", \"scene\": \"scene.rev\" }");
+			struct timespec ts[2];
+			ts[0].tv_sec = time(NULL) + 2;
+			ts[0].tv_nsec = 0;
+			ts[1] = ts[0];
+			CHECK(utimensat(AT_FDCWD, jp, ts, 0) == 0,
+			      "watch: theme.json mtime bumped");
+			CHECK(theme_files_changed(th),
+			      "watch: same-size theme.json edit detected via mtime");
+
+			theme_free(th);
+			th = theme_load(wdir, err, sizeof err);
+
+			/* asset edit in a SUBDIRECTORY (recursive walk) */
+			ts[0].tv_sec = time(NULL) + 4;
+			ts[1] = ts[0];
+			utimensat(AT_FDCWD, ap, ts, 0);
+			CHECK(theme_files_changed(th),
+			      "watch: asset touch under assets/ detected");
+
+			theme_free(th);
+			th = theme_load(wdir, err, sizeof err);
+
+			/* added / removed files change the file COUNT */
+			char extra[600];
+			snprintf(extra, sizeof extra, "%s/extra.txt", wdir);
+			wr(extra, "x");
+			CHECK(theme_files_changed(th), "watch: added file detected");
+			theme_free(th);
+			th = theme_load(wdir, err, sizeof err);
+			CHECK(unlink(extra) == 0, "watch: extra removed");
+			CHECK(theme_files_changed(th), "watch: removed file detected");
+			theme_free(th);
+			th = NULL;
+		}
+
+		/* packed theme: the single container file is watched */
+		char pp[600];
+		snprintf(pp, sizeof pp, "%s/demo.revpack", dir);
+		RTheme *pth = theme_load(pp, err, sizeof err);
+		CHECK(pth != NULL, "watch: packed theme loads");
+		if (pth) {
+			CHECK(!theme_files_changed(pth),
+			      "watch: clean pack reports no change");
+			struct timespec ts[2];
+			ts[0].tv_sec = time(NULL) + 2;
+			ts[0].tv_nsec = 0;
+			ts[1] = ts[0];
+			utimensat(AT_FDCWD, pp, ts, 0);
+			CHECK(theme_files_changed(pth),
+			      "watch: pack container touch detected");
+			theme_free(pth);
+		}
+	}
+
 	/* cleanup */
 	{
 		char cmd[700];
-		snprintf(cmd, sizeof cmd, "rm -rf '%s' /tmp/rev_v1_scene.rev", dir);
+		snprintf(cmd, sizeof cmd, "rm -rf '%s' /tmp/revwatch_%d /tmp/rev_v1_scene.rev",
+			 dir, (int)getpid());
 		if (system(cmd) != 0)
 			fprintf(stderr, "cleanup failed\n");
 	}

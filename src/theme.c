@@ -22,6 +22,24 @@
  * any sane theme and stops a hostile one from ballooning the process */
 #define REV_THEME_CACHE_MAX (256u * 1024u * 1024u)
 
+/* ---- hot-reload watch ------------------------------------------------------- */
+
+/* Hot reload polls a snapshot of (path, mtime, size) for every file under
+ * the theme. Watching the theme FOLDER's own mtime is useless on Linux:
+ * a directory's mtime only moves when entries are added/removed/renamed —
+ * editing scene.rev or replacing an asset leaves it untouched, so the old
+ * check never fired on the common case. Themes are small (a scene, a json,
+ * a handful of assets), so a bounded recursive stat() walk every 0.5s is
+ * cheaper and more portable than inotify and needs no teardown. */
+#define REV_THEME_WATCH_MAX 256
+#define REV_THEME_WATCH_DEPTH 5
+
+typedef struct {
+        char rel[192];          /* theme-relative path ("assets/lake.png")  */
+        f64 mtime;              /* seconds, ns resolution when the fs gives it */
+        long long size;
+} TWatchEnt;
+
 enum { THEME_DIR, THEME_PACK };
 
 typedef struct {
@@ -41,7 +59,12 @@ struct RTheme {
         TCacheEnt cache[64];      /* THEME_DIR                             */
         int ncache;
         size_t cache_bytes;
+        TWatchEnt watch[REV_THEME_WATCH_MAX];   /* reload poll snapshot   */
+        int nwatch;
+        bool watch_capped;        /* >REV_THEME_WATCH_MAX files: partial   */
 };
+
+static void theme_watch_snapshot(RTheme *th);   /* defined with the pack walker */
 
 /* ---- path safety ----------------------------------------------------------- */
 
@@ -223,6 +246,7 @@ static RTheme *theme_load_dir(const char *path, char *err, size_t errcap)
         th->scene_text = (char *)stext;
         th->scene_len = slen;
         (void)file_exists_at;
+        theme_watch_snapshot(th);
         return th;
 }
 
@@ -281,6 +305,7 @@ static RTheme *theme_load_pack(const char *path, char *err, size_t errcap)
         memcpy(th->scene_text, stext, slen);
         th->scene_text[slen] = 0;
         th->scene_len = slen;
+        theme_watch_snapshot(th);
         return th;
 }
 
@@ -379,6 +404,118 @@ u8 *theme_asset(RTheme *th, const char *rel, size_t *len)
 }
 
 /* ---- packing a folder theme ----------------------------------------------------- */
+
+/* Snapshot helpers: collect every regular file under `dir` (bounded by
+ * REV_THEME_WATCH_MAX entries / REV_THEME_WATCH_DEPTH levels — also bounds
+ * symlink loops). Returns the entry count, or -1 on a transient failure. */
+static int tw_collect(const char *dir, const char *prefix, TWatchEnt *out,
+                       int max, int depth)
+{
+        if (depth > REV_THEME_WATCH_DEPTH)
+                return 0;
+        DIR *d = opendir(dir);
+        if (!d)
+                return 0;    /* unreadable subtree: simply unwatched */
+        int n = 0;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL && n < max) {
+                const char *nm = de->d_name;
+                if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0)
+                        continue;
+                /* rel mirrors the entry field size: the snprintf guard below
+                 * skips anything longer, so the copy into out[n].rel cannot
+                 * truncate */
+                char full[1024], rel[192];
+                if (snprintf(full, sizeof full, "%s/%s", dir, nm) >= (int)sizeof full)
+                        continue;
+                if (snprintf(rel, sizeof rel, "%s%s%s", prefix ? prefix : "",
+                             prefix ? "/" : "", nm) >= (int)sizeof rel)
+                        continue;
+                struct stat st;
+                if (stat(full, &st) != 0)
+                        continue;
+                if (S_ISDIR(st.st_mode)) {
+                        int sub = tw_collect(full, rel, out + n, max - n, depth + 1);
+                        if (sub < 0) {
+                                closedir(d);
+                                return -1;
+                        }
+                        n += sub;
+                        continue;
+                }
+                if (!S_ISREG(st.st_mode))
+                        continue;
+                snprintf(out[n].rel, sizeof out[n].rel, "%s", rel);
+                out[n].mtime = (f64)st.st_mtim.tv_sec +
+                               (f64)st.st_mtim.tv_nsec * 1e-9;
+                out[n].size = (long long)st.st_size;
+                n++;
+        }
+        closedir(d);
+        return n;
+}
+
+/* Called once at load (and after each successful reload — the reload builds
+ * a fresh RTheme): folders snapshot the whole tree, packs stat the single
+ * container file. */
+static void theme_watch_snapshot(RTheme *th)
+{
+        th->nwatch = 0;
+        th->watch_capped = false;
+        if (th->mode == THEME_PACK) {
+                struct stat st;
+                if (stat(th->root, &st) == 0) {
+                        snprintf(th->watch[0].rel, sizeof th->watch[0].rel, "(pack)");
+                        th->watch[0].mtime = (f64)st.st_mtim.tv_sec +
+                                             (f64)st.st_mtim.tv_nsec * 1e-9;
+                        th->watch[0].size = (long long)st.st_size;
+                        th->nwatch = 1;
+                }
+                return;
+        }
+        int n = tw_collect(th->root, NULL, th->watch, REV_THEME_WATCH_MAX, 0);
+        if (n < 0)
+                n = 0;
+        th->nwatch = n;
+        if (n == REV_THEME_WATCH_MAX) {
+                th->watch_capped = true;
+                LOGW("theme: >%d files under '%s' — hot-reload watch is partial",
+                     REV_THEME_WATCH_MAX, th->root);
+        }
+}
+
+bool theme_files_changed(RTheme *th)
+{
+        if (!th || th->nwatch == 0)
+                return false;    /* nothing snapshotted: leave firing to the caller */
+        if (th->mode == THEME_PACK) {
+                struct stat st;
+                if (stat(th->root, &st) != 0)
+                        return true;    /* container vanished — reload (fails loudly) */
+                f64 mt = (f64)st.st_mtim.tv_sec + (f64)st.st_mtim.tv_nsec * 1e-9;
+                return mt != th->watch[0].mtime ||
+                       (long long)st.st_size != th->watch[0].size;
+        }
+        /* folder: re-walk and compare bidirectionally (readdir order is
+         * arbitrary, so no positional assumptions) */
+        static TWatchEnt cur[REV_THEME_WATCH_MAX];   /* daemon poll: single-threaded */
+        int n = tw_collect(th->root, NULL, cur, REV_THEME_WATCH_MAX, 0);
+        if (n < 0)
+                return false;    /* transient walk failure — retry next poll */
+        if (n != th->nwatch)
+                return true;     /* a file was added or removed */
+        for (int i = 0; i < n; i++) {
+                const TWatchEnt *o = NULL;
+                for (int j = 0; j < th->nwatch; j++)
+                        if (strcmp(cur[i].rel, th->watch[j].rel) == 0) {
+                                o = &th->watch[j];
+                                break;
+                        }
+                if (!o || o->mtime != cur[i].mtime || o->size != cur[i].size)
+                        return true;
+        }
+        return false;
+}
 
 static void pk32(u8 *p, u32 v)
 {

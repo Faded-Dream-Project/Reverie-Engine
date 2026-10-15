@@ -155,6 +155,15 @@ typedef struct {
         bool gl_surface;       /* EGL owns this surface: the wl_shm
                                 * presenter must NOT touch it (the GL
                                 * renderer presents via eglSwapBuffers)    */
+        /* visibility (idle power-save): a wl_shm-presented window is
+         * "visible" while the compositor keeps latching its frames; the
+         * callback timestamps are the evidence. gl_surface / never-presented
+         * windows (WSI swapchains, EGL) are excluded — their own present
+         * calls throttle them. */
+        bool presented;        /* ever presented through wl_shm            */
+        f64 last_done;         /* last wl_callback.done (0 = never)        */
+        f64 last_present;      /* last wl_shm commit                       */
+        f64 last_probe;        /* last idle re-present probe               */
 } ShimWin;
 
 typedef struct {
@@ -512,8 +521,10 @@ static void on_frame_done(void *data, wl_proxy_ *cb, u32 time)
 {
         (void)cb; (void)time;
         ShimWin *win = (ShimWin *)data;
-        if (win)
+        if (win) {
                 win->frame_ready = true;
+                win->last_done = rev_monotonic();
+        }
 }
 
 /* ---- activation ------------------------------------------------------------- */
@@ -1135,6 +1146,8 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
                 return false;
         winp->buf_free[b] = false;
         winp->cur = b;
+        winp->presented = true;
+        winp->last_present = rev_monotonic();
 
         if (++S.presents == 1)
                 LOGI("wlshim: wl_shm present active (%ux%u, scale %d, double-buffered, "
@@ -1143,6 +1156,109 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
         else if (S.presents == 1000)
                 LOGD("wlshim: 1000 frames presented");
         return true;
+}
+
+/* ---- visibility / idle power-save ------------------------------------------ */
+
+/* A visible surface gets wl_callback.done at the compositor's repaint rate.
+ * A gap far past that means the surface is not being drawn at all — most
+ * often a fullscreen app covering the wallpaper, or the display asleep —
+ * and the engine can stop rendering until asked again. The threshold is
+ * deliberately generous (a lazy compositor legitimately drops to a few Hz
+ * when nothing changes); REV_WL_VIS_MS tunes it (tests shrink it). */
+static f64 vis_override = -1;   /* test hook: <0 = auto (env / default) */
+
+static f64 wl_vis_timeout(void)
+{
+        if (vis_override >= 0)
+                return vis_override;
+        static f64 cached = -1;
+        if (cached < 0) {
+                const char *e = getenv("REV_WL_VIS_MS");
+                cached = (e && *e) ? atof(e) / 1000.0 : 0.25;
+                if (cached < 0.02)
+                        cached = 0.02;
+        }
+        return cached;
+}
+
+/* Test/field hook: override the starvation window (seconds; <0 restores the
+ * env/default). Tests shrink it so the idle machinery verifies quickly. */
+void wlshim_set_vis_timeout(f64 seconds)
+{
+        vis_override = seconds < 0 ? -1 : (seconds < 0.001 ? 0.001 : seconds);
+}
+
+/* True when at least one wl_shm-presented window was latched recently (or
+ * no window is wl_shm-presented yet — startup, EGL/WSI surfaces — in which
+ * case visibility is not ours to judge and rendering must continue). */
+bool wlshim_surface_visible(void)
+{
+        if (!S.active)
+                return true;
+        f64 now = rev_monotonic();
+        f64 vis = wl_vis_timeout();
+        bool any_ours = false;
+        for (int i = 0; i < S.nwins; i++) {
+                ShimWin *w = &S.wins[i];
+                if (w->gl_surface || !w->presented)
+                        continue;    /* EGL/WSI swapchain paces itself */
+                any_ours = true;
+                f64 last = w->last_done > w->last_present ? w->last_done
+                                                          : w->last_present;
+                if (now - last < vis)
+                        return true;
+        }
+        return !any_ours;
+}
+
+/* Idle probe: re-attach the CURRENT buffer with full damage + commit. A
+ * bare frame request with no commit may never be answered, and a commit
+ * with no damage lets lazy compositors skip the repaint — and the callback
+ * — entirely; redrawing the same pixels is the cheapest unambiguous "are
+ * you still there?". Hidden: the compositor ignores it (cost: nothing).
+ * Visible again: the next latch fires the pending frame callback, the
+ * visibility check flips, and full-rate rendering resumes. */
+static void shim_probe(ShimWin *w)
+{
+        if (w->cur < 0 || !w->bufs[w->cur] || !w->pool)
+                return;
+        S.proxy_marshal(w->surface, 1, w->bufs[w->cur], 0, 0);          /* attach */
+        S.proxy_marshal(w->surface, S.comp_version >= 4 ? 9 : 2,
+                        0, 0, (i32)w->pw, (i32)w->ph);                  /* damage */
+        if (!w->frame_cb && S.wl_callback_iface) {
+                w->frame_cb = S.proxy_marshal_constructor(w->surface, 3,
+                                                          S.wl_callback_iface, NULL);
+                if (w->frame_cb) {
+                        static void (*const cb_listener[])(void) = {
+                                (void (*)(void))on_frame_done,
+                        };
+                        S.proxy_add_listener(w->frame_cb,
+                                             (void (**)(void))cb_listener, w);
+                }
+        }
+        S.proxy_marshal(w->surface, WL_SURFACE_COMMIT);
+        S.flush(S.display);
+}
+
+/* Probes are throttled to ~4 Hz and only sent for starved windows. */
+#define WL_PROBE_INTERVAL 0.25
+
+static void shim_idle_probes(void)
+{
+        f64 now = rev_monotonic();
+        f64 vis = wl_vis_timeout();
+        for (int i = 0; i < S.nwins; i++) {
+                ShimWin *w = &S.wins[i];
+                if (w->gl_surface || !w->presented)
+                        continue;
+                f64 last = w->last_done > w->last_present ? w->last_done
+                                                          : w->last_present;
+                if (now - last >= vis && now - w->last_probe >= WL_PROBE_INTERVAL) {
+                        w->last_probe = now;
+                        shim_probe(w);
+                }
+        }
 }
 
 void wlshim_pump(RPointerState *ptr)
@@ -1155,6 +1271,7 @@ void wlshim_pump(RPointerState *ptr)
                 S.dispatch(S.display);
         else
                 S.dispatch_pending(S.display);
+        shim_idle_probes();
 }
 
 bool wlshim_pointer(RPointerState *out)
@@ -1198,6 +1315,13 @@ bool wlshim_wait_frame(f64 seconds)
         if (seconds < 0)
                 seconds = 0;
         f64 deadline = rev_monotonic() + seconds;
+        /* starved = no window was latched within the visibility window: the
+         * frame callbacks we are waiting for will not come at repaint rate,
+         * so there is nothing to gain from 16ms poll slices — sleep coarser
+         * (the idle probe in pump() still runs ~4 Hz, and input arriving on
+         * the socket still wakes poll() immediately). */
+        const bool starved = !wlshim_surface_visible();
+        const int slice_cap = starved ? 100 : 16;
 
         for (;;) {
                 struct pollfd p = { S.get_fd(S.display), POLLIN, 0 };
@@ -1225,8 +1349,8 @@ bool wlshim_wait_frame(f64 seconds)
                 int ms = (int)(rem * 1000.0);
                 if (ms < 1)
                         ms = 1;
-                if (ms > 16)
-                        ms = 16;
+                if (ms > slice_cap)
+                        ms = slice_cap;
                 poll(&p, 1, ms);
         }
 }

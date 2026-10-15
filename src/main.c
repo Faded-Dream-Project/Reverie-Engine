@@ -36,6 +36,10 @@ static void on_signal(int sig)
 
 #define PERF_RING 512
 
+/* idle pacing: loop cadence while no surface is visible (matches the wlshim
+ * compositor-probe interval) */
+#define IDLE_PACE_S 0.25
+
 static void perf_sort(f64 *a, u32 n)
 {
         /* insertion sort: n <= 512, called once per 5s window — plenty */
@@ -95,6 +99,9 @@ static void usage(void)
 "                  (llvmpipe test hook — normally software keeps the CPU\n"
 "                  solver, which is faster there)\n"
 "  REV_WL_TRACE    1 = dump raw Wayland wire traffic to stderr\n"
+"  REV_WL_VIS_MS   idle power-save starvation window in ms (default 250):\n"
+"                  a wl_shm-presented surface unlatched this long pauses\n"
+"                  rendering until the compositor latches the idle probe\n"
 "  REV_AUTO_VK     1 = let auto also consider the present-only Vulkan\n"
 "                  tier (off by default: that tier composites on CPU)\n"
 "  REV_AUTO_GL_SW  1 = let auto keep software GL (llvmpipe) instead of\n"
@@ -567,6 +574,17 @@ int main(int argc, char **argv)
         u64 last_drops = 0;
         bool shot_done = false;
         RTFrameList fl;
+        /* scene clock + pacing grid:
+         * t_vis — the animation clock FREEZES while no surface is visible
+         *   (idle power-save): sims, procedural animation and video resume
+         *   exactly where they stopped instead of fast-forwarding through
+         *   the hidden gap. While always visible it is identical to the old
+         *   wall clock (it accumulates the same dts).
+         * next_deadline — the absolute frame grid; see the pacing block. */
+        f64 t_vis = 0;
+        f64 next_deadline = 0;
+        bool prev_visible = true;
+        bool idle_note_shown = false;
         /* REV_PROFILE=1: stage breakdown appended to the periodic perf line.
          * Averages LIE on a contended box (one 300ms stall poisons a 5s
          * mean while fps barely moves), so frame times ALSO report
@@ -655,9 +673,39 @@ int main(int argc, char **argv)
                  * simulation (fluid/ripple/particles) stepped with dt≈0 and
                  * effectively froze (only wall-clock-t animations moved). */
                 last_frame = now;
-                f64 t = now - t0;
-                if (prof_on && nframe_ms < PERF_RING)
+
+                /* visibility (idle power-save): on Wayland the shim watches
+                 * frame-callback starvation — a fullscreen app over the
+                 * wallpaper or a sleeping display stops the callbacks.
+                 * Hidden: skip the render entirely, freeze the scene clock,
+                 * pace at the probe rate. NULL (X11, raw client) = assume
+                 * visible, exactly the old behavior. */
+                bool visible = !plat->surface_visible ||
+                               plat->surface_visible(plat);
+                if (prof_on && visible && nframe_ms < PERF_RING)
                         frame_ms[nframe_ms++] = dt * 1000.0;
+                if (!visible && !idle_note_shown) {
+                        idle_note_shown = true;
+                        LOGI("idle: no surface is being shown — rendering paused "
+                             "(compositor probe ~4 Hz, scene clock frozen)");
+                } else if (visible && idle_note_shown) {
+                        idle_note_shown = false;
+                        LOGI("idle: surface visible again — rendering resumed");
+                }
+                if (visible) {
+                        if (prev_visible) {
+                                t_vis += dt;
+                                /* clamp rare long stalls for the sims (they
+                                 * clamp internally too — belt and braces) */
+                                if (dt > 0.25)
+                                        dt = 0.25;
+                        } else {
+                                dt = 0;   /* resume frame: the gap was idle, not scene time */
+                        }
+                } else {
+                        dt = 0;           /* frozen while hidden */
+                }
+                f64 t = t_vis;
 
                 plat->pump(plat);
                 if (plat->should_close(plat))
@@ -729,78 +777,84 @@ int main(int argc, char **argv)
                         fpy = ny;
                 }
 
-                /* render + present */
-                for (int i = 0; i < nmon; i++) {
-                        if (winidx[i] < 0 || !fbs[i].px)
-                                continue;
-                        f64 r_t0 = rev_monotonic();
-                        if (gpu_layers) {
-                                fl.w = fbs[i].w;
-                                fl.h = fbs[i].h;
-                                fl.n = 0;
-                                fl.sim_offload = sim_offload;
-                                fl.point_offload = point_offload;
-                                fl.grad_offload = grad_offload;
-                                fl.video_offload = video_offload;
-                                rtscene_render_layers(sf.sc, &fl, i, t, dt);
-                                f64 s_ms, ra_ms;
-                                rtscene_profile(sf.sc, &s_ms, &ra_ms);
-                                prof_sim += s_ms;
-                                prof_raster += ra_ms;
-                                if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
+                /* render + present — skipped entirely while no surface is
+                 * visible (idle power-save): no GPU work, no sims, no
+                 * presents. wlshim's idle probe re-draws when the compositor
+                 * comes back, and the frozen scene clock resumes the scene
+                 * exactly where it stopped. */
+                if (visible) {
+                        for (int i = 0; i < nmon; i++) {
+                                if (winidx[i] < 0 || !fbs[i].px)
                                         continue;
-                                for (int k = 0; k < fl.n; k++) {
-                                        RLayerCmd cmd;
-                                        cmd.px = fl.cmds[k].px;
-                                        cmd.w = fl.cmds[k].w;
-                                        cmd.h = fl.cmds[k].h;
-                                        cmd.place_w = fl.cmds[k].place_w;
-                                        cmd.place_h = fl.cmds[k].place_h;
-                                        cmd.blend = fl.cmds[k].blend;
-                                        cmd.opacity = fl.cmds[k].opacity;
-                                        cmd.blur = fl.cmds[k].blur;
-                                        cmd.dx = fl.cmds[k].dx;
-                                        cmd.dy = fl.cmds[k].dy;
-                                        cmd.linear = fl.cmds[k].linear;
-                                        cmd.content_id = fl.cmds[k].content_id;
-                                        cmd.sim = fl.cmds[k].sim;
-                                        cmd.rsim = fl.cmds[k].rsim;
-                                        cmd.psim = fl.cmds[k].psim;
-                                        cmd.grad = fl.cmds[k].grad;
-                                        cmd.vsim = fl.cmds[k].vsim;
-                                        rend->layer(rend, &cmd);
+                                f64 r_t0 = rev_monotonic();
+                                if (gpu_layers) {
+                                        fl.w = fbs[i].w;
+                                        fl.h = fbs[i].h;
+                                        fl.n = 0;
+                                        fl.sim_offload = sim_offload;
+                                        fl.point_offload = point_offload;
+                                        fl.grad_offload = grad_offload;
+                                        fl.video_offload = video_offload;
+                                        rtscene_render_layers(sf.sc, &fl, i, t, dt);
+                                        f64 s_ms, ra_ms;
+                                        rtscene_profile(sf.sc, &s_ms, &ra_ms);
+                                        prof_sim += s_ms;
+                                        prof_raster += ra_ms;
+                                        if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
+                                                continue;
+                                        for (int k = 0; k < fl.n; k++) {
+                                                RLayerCmd cmd;
+                                                cmd.px = fl.cmds[k].px;
+                                                cmd.w = fl.cmds[k].w;
+                                                cmd.h = fl.cmds[k].h;
+                                                cmd.place_w = fl.cmds[k].place_w;
+                                                cmd.place_h = fl.cmds[k].place_h;
+                                                cmd.blend = fl.cmds[k].blend;
+                                                cmd.opacity = fl.cmds[k].opacity;
+                                                cmd.blur = fl.cmds[k].blur;
+                                                cmd.dx = fl.cmds[k].dx;
+                                                cmd.dy = fl.cmds[k].dy;
+                                                cmd.linear = fl.cmds[k].linear;
+                                                cmd.content_id = fl.cmds[k].content_id;
+                                                cmd.sim = fl.cmds[k].sim;
+                                                cmd.rsim = fl.cmds[k].rsim;
+                                                cmd.psim = fl.cmds[k].psim;
+                                                cmd.grad = fl.cmds[k].grad;
+                                                cmd.vsim = fl.cmds[k].vsim;
+                                                rend->layer(rend, &cmd);
+                                        }
+                                        rend->end(rend, NULL);
+                                } else {
+                                        /* CPU-composited mode still needs begin():
+                                         * renderers target their PRESENT path per
+                                         * window (cur_win) and size their viewports
+                                         * there — without it, GL presents into a
+                                         * 0x0 viewport (black screen) and multi-
+                                         * monitor presents everything to window 0 */
+                                        if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
+                                                continue;
+                                        memset(fbs[i].px, 0, (size_t)fbs[i].w * fbs[i].h * 4);
+                                        rtscene_render(sf.sc, &fbs[i], i, t, dt);
+                                        f64 s_ms, ra_ms;
+                                        rtscene_profile(sf.sc, &s_ms, &ra_ms);
+                                        prof_sim += s_ms;
+                                        prof_raster += ra_ms;
+                                        rend->end(rend, &fbs[i]);
                                 }
-                                rend->end(rend, NULL);
-                        } else {
-                                /* CPU-composited mode still needs begin():
-                                 * renderers target their PRESENT path per
-                                 * window (cur_win) and size their viewports
-                                 * there — without it, GL presents into a
-                                 * 0x0 viewport (black screen) and multi-
-                                 * monitor presents everything to window 0 */
-                                if (!rend->begin(rend, winidx[i], fbs[i].w, fbs[i].h))
-                                        continue;
-                                memset(fbs[i].px, 0, (size_t)fbs[i].w * fbs[i].h * 4);
-                                rtscene_render(sf.sc, &fbs[i], i, t, dt);
-                                f64 s_ms, ra_ms;
-                                rtscene_profile(sf.sc, &s_ms, &ra_ms);
-                                prof_sim += s_ms;
-                                prof_raster += ra_ms;
-                                rend->end(rend, &fbs[i]);
+                                prof_render += rev_monotonic() - r_t0;
                         }
-                        prof_render += rev_monotonic() - r_t0;
-                }
 
-                /* renderer-side counters (once per frame, after all windows):
-                 * upload wall time (a SUBSET of render above) and the async
-                 * GPU timer result for the PREVIOUS frame */
-                if (rend->perf) {
-                        f64 up = 0, gp = 0;
-                        if (rend->perf(rend, &up, &gp)) {
-                                prof_upload += up;
-                                if (gp > 0) {
-                                        prof_gpu += gp;
-                                        prof_gpu_n++;
+                        /* renderer-side counters (once per frame, after all windows):
+                         * upload wall time (a SUBSET of render above) and the async
+                         * GPU timer result for the PREVIOUS frame */
+                        if (rend->perf) {
+                                f64 up = 0, gp = 0;
+                                if (rend->perf(rend, &up, &gp)) {
+                                        prof_upload += up;
+                                        if (gp > 0) {
+                                                prof_gpu += gp;
+                                                prof_gpu_n++;
+                                        }
                                 }
                         }
                 }
@@ -832,11 +886,20 @@ int main(int argc, char **argv)
                         }
                 }
 
-                /* hot reload */
+                /* hot reload — themes poll every file in the folder: a
+                 * directory's own mtime never moves on an in-place edit,
+                 * which silently killed theme hot-reload until now. Plain
+                 * .rev scenes and .revpacks keep the single-file check. */
                 if (now - last_reload_check > 0.5) {
                         last_reload_check = now;
-                        f64 mt = rev_file_mtime(sf.path);
-                        if (mt > 0 && mt != sf.mtime) {
+                        bool scene_changed;
+                        if (sf.theme) {
+                                scene_changed = theme_files_changed(sf.theme);
+                        } else {
+                                f64 mt = rev_file_mtime(sf.path);
+                                scene_changed = mt > 0 && mt != sf.mtime;
+                        }
+                        if (scene_changed) {
                                 LOGI("scene changed on disk, reloading...");
                                 if (scene_load(&sf, sf.path, base_dir, err, sizeof err)) {
                                         LOGI("reload ok (%d layers)", rtscene_layer_count(sf.sc));
@@ -937,10 +1000,23 @@ int main(int argc, char **argv)
                 }
                 if (fps < 1) fps = 1;
                 if (fps > 240) fps = 240;
-                f64 frame_len = 1.0 / fps;
-                f64 deadline = now + frame_len;
+                /* ABSOLUTE treadmill: the deadline advances by exactly one
+                 * period from the PREVIOUS deadline. The old
+                 * `deadline = now + frame_len` re-anchored on loop-top, so
+                 * every frame inherited the pacing wait's wake-up slack
+                 * (poll-slice rounding + dispatch, ~0.4 ms) — a steady creep
+                 * that measured 58 fps against a 60 Hz display (frame avg
+                 * 17.2 ms where p50 was 17.0). A frame that overruns a whole
+                 * period resyncs (skips the missed slots) instead of letting
+                 * the grid drift; so does a visibility flip (idle period ->
+                 * frame period). While hidden, pace at the probe cadence. */
+                f64 frame_len = visible ? (1.0 / fps) : IDLE_PACE_S;
+                if (visible != prev_visible || now >= next_deadline + frame_len)
+                        next_deadline = now + frame_len;    /* resync */
+                else
+                        next_deadline += frame_len;        /* keep the grid */
                 for (;;) {
-                        f64 rem = deadline - rev_monotonic();
+                        f64 rem = next_deadline - rev_monotonic();
                         if (rem <= 0.0005)
                                 break;
                         if (plat->wait_frame)
@@ -954,7 +1030,9 @@ int main(int argc, char **argv)
                         if (!g_run || plat->should_close(plat))
                                 break;    /* quit arrived during the wait */
                 }
-                frames++;
+                prev_visible = visible;
+                if (visible)
+                        frames++;
         }
 
         LOGI("shutting down");

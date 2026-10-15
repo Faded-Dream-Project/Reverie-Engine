@@ -70,6 +70,12 @@ const RThemeMeta *theme_meta(const RTheme *th);
  * disk ("" for packed themes — they use the asset provider instead). */
 const char *theme_base_dir(const RTheme *th);
 
+/* Hot-reload polling: true when any file of the theme (scene, theme.json,
+ * assets; or the whole .revpack container) changed on disk since load.
+ * A folder's own mtime never moves on an in-place edit, so this re-walks
+ * the tree and compares (path, mtime, size) snapshots. */
+bool theme_files_changed(RTheme *th);
+
 /* Packs a folder theme into a .revpack v2 (all files, nested paths). */
 bool theme_pack(const char *theme_dir, const char *out_path,
                 char *err, size_t errcap);

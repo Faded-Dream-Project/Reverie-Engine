@@ -384,6 +384,10 @@ static bool saw_pool, saw_buf[2], saw_attach, saw_cycling;
 static bool saw_layer0, saw_ns_reverie, saw_size00, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
 static bool closed_sent, pointer_sent, saw_configure_sent;
 static volatile int hold_releases;   /* test gate: server skips wl_buffer.release */
+static volatile int hold_frame_cbs;   /* test gate: server DEFERS wl_callback.done —
+                                        * a starved surface gets no latch, exactly
+                                        * like a compositor not drawing it      */
+static u32 held_cb;                  /* the deferred callback object id           */
 static int frame_cb_replies;         /* wl_callback.done replies sent           */
 static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
 /* GPU-premul contract (vulkan tier hands premultiplied bytes): the next
@@ -677,11 +681,19 @@ static void *server(void *arg)
                 if (t == T_SURFACE && op == 3) {
                         /* wl_surface.frame(new_id) — the dev pacing request.
                          * Reply wl_callback.done(data) exactly like a compositor
-                         * that latched the presented frame. */
+                         * that latched the presented frame — unless the test
+                         * is STARVING the client (hold_frame_cbs): the callback
+                         * is then held back until the next commit (a compositor
+                         * not drawing the surface latches nothing), which is
+                         * what flips wlshim_surface_visible() to "hidden". */
                         u32 nid = s_get32(msg + 8);
-                        u32 cbdata = 4242;
-                        s_send(nid, 0, (const u8 *)&cbdata, 4);
-                        frame_cb_replies++;
+                        if (hold_frame_cbs) {
+                                held_cb = nid;
+                        } else {
+                                u32 cbdata = 4242;
+                                s_send(nid, 0, (const u8 *)&cbdata, 4);
+                                frame_cb_replies++;
+                        }
                         continue;
                 }
                 if (t == T_SURFACE && op == 1) {
@@ -762,6 +774,15 @@ static void *server(void *arg)
                                 s_send(id_layer_surface, 0, p, 12);
                                 saw_configure_sent = true;
                         } else {
+                                /* compositor came back and latched this commit:
+                                 * release a held frame callback (the probe's
+                                 * "are you still there?" gets its answer) */
+                                if (held_cb && !hold_frame_cbs) {
+                                        u32 cbdata = 4242;
+                                        s_send(held_cb, 0, (const u8 *)&cbdata, 4);
+                                        frame_cb_replies++;
+                                        held_cb = 0;
+                                }
                                 /* present commit: verify the pixels the client
                                  * premultiplied into the pool, then release the
                                  * slots so the next present can cycle (unless the
@@ -988,6 +1009,57 @@ int main(void)
                         usleep(100000);        /* server thread verifies + releases */
                         frame[100] = 0xFF0000FF;
                         frame[7] = 0x80408020;
+
+                        /* 5d. idle power-save (v0.2): starve the frame
+                         * callbacks — a compositor not drawing the surface
+                         * (fullscreen app over the wallpaper, display
+                         * asleep) latches nothing — and watch the visibility
+                         * machinery do its whole cycle: visible -> hidden
+                         * (starvation past the window) -> idle probe on the
+                         * wire -> callback deferred -> compositor revives ->
+                         * probe commit answered -> visible again. The pool
+                         * holds the red frame, so every probe re-attach
+                         * commit passes the server's pixel verification
+                         * unchanged. */
+                        wlshim_set_vis_timeout(0.08);
+                        {
+                                int att4 = attach_count;
+                                int tries = 0;
+                                while (attach_count == att4 && tries++ < 50) {
+                                        wlshim_present_cpu(win, frame, 800, 600, false);
+                                        usleep(20000);   /* server sees the commit */
+                                }
+                                CHECK(attach_count > att4,
+                                      "frame 4 (red) presented for the idle leg");
+                        }
+                        CHECK(wlshim_wait_frame(1.0),
+                              "frame 4 callback latched — surface visible");
+                        CHECK(wlshim_surface_visible(),
+                              "visible while callbacks flow");
+                        int replies_before = frame_cb_replies;
+                        int att5 = attach_count;
+                        hold_frame_cbs = 1;         /* compositor stops drawing us */
+                        usleep(150000);             /* > the 80ms starvation window */
+                        CHECK(!wlshim_surface_visible(),
+                              "starvation past the window: hidden (rendering would pause)");
+                        wlshim_pump(NULL);           /* fires the first idle probe */
+                        usleep(50000);
+                        CHECK(attach_count > att5,
+                              "idle probe re-attached the current buffer on the wire");
+                        hold_frame_cbs = 0;          /* compositor comes back */
+                        bool resumed = false;
+                        for (int i = 0; i < 60 && !resumed; i++) {
+                                wlshim_pump(NULL);
+                                resumed = wlshim_surface_visible();
+                                if (!resumed)
+                                        usleep(20000);
+                        }
+                        CHECK(resumed,
+                              "probe answered by the revived compositor — visible again");
+                        CHECK(frame_cb_replies > replies_before,
+                              "the deferred callback was answered on the wire");
+                        wlshim_set_vis_timeout(-1);  /* restore env/default */
+                        hold_frame_cbs = 0;
                         free(frame);
                 }
 
