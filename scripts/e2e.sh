@@ -490,6 +490,56 @@ else
 fi
 stop_xvfb
 
+# ---- Runtime IPC: theme switching, playlists, QUIT under a live daemon ------
+# The daemon serves its control socket; revtool ipc drives a full session:
+# PING/STATUS, a faded THEME switch, PLAYLIST + NEXT, and a clean QUIT that
+# must shut the daemon down before the timeout kills it.
+start_xvfb
+IPCSOCK="$OUT/rev.sock"
+DISPLAY="$XDISPLAY" REV_IPC_SOCK="$IPCSOCK" REV_FADE_MS=400 \
+    timeout 24 ./build/reverie -R cpu --shot 10 "$OUT/ipc" "$SCENE" \
+    > "$OUT/ipc.log" 2>&1 &
+DPID=$!
+sleep 2
+./build/revtool ipc -s "$IPCSOCK" PING > "$OUT/ipc1.out" 2>&1
+./build/revtool ipc -s "$IPCSOCK" STATUS > "$OUT/ipc2.out" 2>&1
+./build/revtool ipc -s "$IPCSOCK" "THEME themes/animated-gradients 600" > "$OUT/ipc3.out" 2>&1
+sleep 2                       # fade out+in (600ms each way)
+./build/revtool ipc -s "$IPCSOCK" "PLAYLIST themes/ripple-lake themes/snowfall" > "$OUT/ipc4.out" 2>&1
+./build/revtool ipc -s "$IPCSOCK" NEXT > "$OUT/ipc5.out" 2>&1
+sleep 2
+./build/revtool ipc -s "$IPCSOCK" "THEME /nonexistent/theme" > "$OUT/ipc6.out" 2>&1
+sleep 4                       # screenshot at t=10s
+./build/revtool ipc -s "$IPCSOCK" QUIT > "$OUT/ipc7.out" 2>&1
+sleep 1
+IPC_OK=1
+grep -q "OK PONG" "$OUT/ipc1.out" 2>/dev/null || IPC_OK=0
+grep -q "renderer=cpu" "$OUT/ipc2.out" 2>/dev/null || IPC_OK=0
+grep -q "OK switched" "$OUT/ipc3.out" 2>/dev/null || IPC_OK=0
+grep -q "ERR " "$OUT/ipc6.out" 2>/dev/null || IPC_OK=0     # bad theme -> ERR, daemon lives
+grep -q "ipc: control socket" "$OUT/ipc.log" 2>/dev/null || IPC_OK=0
+grep -q "ipc: theme 'themes/animated-gradients' active" "$OUT/ipc.log" 2>/dev/null || IPC_OK=0
+grep -q "ipc: theme 'themes/snowfall' active" "$OUT/ipc.log" 2>/dev/null || IPC_OK=0
+grep -q "shutting down" "$OUT/ipc.log" 2>/dev/null || IPC_OK=0
+[ -f "$OUT/ipc.png" ] || IPC_OK=0
+# QUIT must have ended the daemon before the timeout (process gone, clean log)
+kill -0 $DPID 2>/dev/null && IPC_OK=0
+# socket file cleaned up on shutdown
+[ -S "$IPCSOCK" ] && IPC_OK=0
+# per-user permission bits on the live socket were checked at start; re-verify
+# via the log line only (the file is already unlinked after QUIT)
+if [ "$IPC_OK" = 1 ]; then
+    echo "    ipc:          PASS (ping/status/faded switch/playlist/next/bad-theme/QUIT)"
+    PASS=$((PASS+1))
+else
+    echo "    ipc:          FAIL (control session incomplete)"
+    cat "$OUT/ipc.log" "$OUT/ipc1.out" "$OUT/ipc2.out" "$OUT/ipc3.out" \
+        "$OUT/ipc4.out" "$OUT/ipc5.out" "$OUT/ipc6.out" "$OUT/ipc7.out" 2>/dev/null
+    kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
 echo "==================================================="
 echo "e2e: $PASS passed, $SKIP skipped (no driver), $FAIL failed"
 echo "logs: $OUT"

@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "arena.h"
+#include "ipc.h"
 #include "png.h"
 #include "rev.h"
 #include "pack.h"
@@ -47,7 +48,12 @@ static void usage(void)
 "  revtool theme pack <theme dir> [-o out.revpack]\n"
 "      bundles the whole theme folder into one .revpack\n"
 "  revtool theme inspect <theme.revpack>\n"
-"      lists every entry with size + CRC check\n");
+"      lists every entry with size + CRC check\n"
+"  revtool ipc [-s <sock>] <command...>\n"
+"      sends one command to a running daemon's control socket and prints\n"
+"      the reply (exit 0 on OK, 1 on ERR). Commands: PING | STATUS |\n"
+"      THEME <path> [fade_ms] | PLAYLIST <p...> | NEXT [fade_ms] |\n"
+"      PREV [fade_ms] | ROTATE <sec> | FADE <ms> | QUIT — see docs/IPC.md\n");
 }
 
 static int cmd_pack(int argc, char **argv)
@@ -534,6 +540,46 @@ static int cmd_theme(int argc, char **argv)
 	return 1;
 }
 
+static int cmd_ipc(int argc, char **argv)
+{
+	const char *sock = NULL;
+	const char *cmdline = NULL;
+	int i = 2;
+	for (; i < argc; i++) {
+		if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--sock")) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "revtool: -s needs a path\n");
+				return 1;
+			}
+			sock = argv[++i];
+		} else {
+			cmdline = argv[i++];
+			break;
+		}
+	}
+	if (!cmdline) {
+		fprintf(stderr, "revtool: ipc needs a command\n");
+		usage();
+		return 1;
+	}
+	/* join the remaining words back into one command line — shells
+	 * quote the whole command anyway, but 'revtool ipc THEME p 500'
+	 * working unquoted is friendlier */
+	char line[1024];
+	snprintf(line, sizeof line, "%s", cmdline);
+	for (; i < argc && strlen(line) + strlen(argv[i]) + 1 < sizeof line; i++) {
+		strncat(line, " ", sizeof line - strlen(line) - 1);
+		strncat(line, argv[i], sizeof line - strlen(line) - 1);
+	}
+	char reply[IPC_REPLY_MAX + 32];
+	if (!ipc_request(sock, line, reply, sizeof reply, 2000)) {
+		fprintf(stderr, "revtool: %s\n", reply[0] ? reply : "request failed");
+		return 1;
+	}
+	printf("%s\n", reply);
+	return strncmp(reply, "OK", 2) == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -558,6 +604,8 @@ int main(int argc, char **argv)
 		return cmd_pnginfo(argv[2]);
 	if (strcmp(cmd, "theme") == 0 && argc >= 3)
 		return cmd_theme(argc, argv);
+	if (strcmp(cmd, "ipc") == 0 && argc >= 3)
+		return cmd_ipc(argc, argv);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
 		usage();
 		return 0;

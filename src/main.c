@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include "arena.h"
+#include "ipc.h"
 #include "log.h"
 #include "pack.h"
 #include "platform.h"
@@ -105,6 +106,12 @@ static void usage(void)
 "  REV_IDLE_AUDIT_S idle watchdog interval in seconds (default 30, 0 = off):\n"
 "                  after this long continuously hidden, a 1 s full-rate\n"
 "                  audit burst guards against a wedged idle detector\n"
+"  REV_IPC          0 = disable the runtime control socket (default: on;\n"
+"                  see docs/IPC.md — revtool ipc is the client)\n"
+"  REV_IPC_SOCK     override the control socket path (default:\n"
+"                  $XDG_RUNTIME_DIR/reverie.sock)\n"
+"  REV_FADE_MS      default theme-switch fade duration in ms (default 400,\n"
+"                  0 = hard cut)\n"
 "  REV_AUTO_VK     1 = let auto also consider the present-only Vulkan\n"
 "                  tier (off by default: that tier composites on CPU)\n"
 "  REV_AUTO_GL_SW  1 = let auto keep software GL (llvmpipe) instead of\n"
@@ -281,6 +288,293 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
         snprintf(sf->path, sizeof sf->path, "%s", path);
         sf->mtime = rev_file_mtime(path);
         return true;
+}
+
+/* Release everything a SceneFile owns (scene, IR arena, pack, theme). Used
+ * at shutdown, at IPC theme swaps, and when replacing a fade target. */
+static void scene_file_free(SceneFile *sf)
+{
+        if (sf->sc)
+                rtscene_free(sf->sc);
+        if (sf->ir_arena)
+                arena_destroy(sf->ir_arena);
+        if (sf->pack_used)
+                rev_pack_free(&sf->pack);
+        if (sf->theme)
+                theme_free(sf->theme);
+        memset(sf, 0, sizeof *sf);
+}
+
+/* ---- runtime IPC: theme switching, playlist rotation, fades -----------------
+ *
+ * The daemon exposes a per-user control socket (ipc.c, protocol v1). Theme
+ * switches dip through black: the NEW scene loads up front (a stall while
+ * the old one still shows), then a synthetic black overlay fades in over
+ * the rendered frame — as a plain 1x1 black LAYER on the GPU tiers (blend
+ * NORMAL with opacity = darkness, cached by a reserved content id) and as
+ * rev_comp_fade() on the CPU tier. At full black the active scene swaps and
+ * the overlay fades back out. A switch requested DURING a fade continues
+ * from the current darkness — the obsolete target never flashes in. */
+
+#define REV_PLAYLIST_MAX 64
+/* reserved raster serial for the synthetic fade layer: real serials are
+ * small process-global monotonic counts, so this can never alias one */
+#define REV_FADE_CID 0x7FFFFFFFull
+
+typedef struct {
+        SceneFile *sf;          /* ACTIVE scene (rendered + watched)      */
+        SceneFile next;         /* fade target                            */
+        bool have_next;
+        int phase;              /* 0 none, 1 fading out, 2 fading in      */
+        f64 t0;                 /* phase start, monotonic seconds         */
+        f64 ms;                 /* one-way fade duration                  */
+        f64 fade_ms_default;    /* default for switches without [fade_ms] */
+        char pl[REV_PLAYLIST_MAX][512];
+        int pl_n, pl_i;
+        f64 rotate_s;           /* auto-advance seconds, 0 = off          */
+        f64 last_advance;
+        RRenderer *rend;
+        RPlatform *plat;
+        volatile int *run;      /* QUIT clears it                        */
+} IpcState;
+
+static f64 fade_black_now(const IpcState *st, f64 now)
+{
+        if (st->phase == 0 || st->ms <= 0)
+                return 0.0;
+        f64 k = (now - st->t0) / (st->ms / 1000.0);
+        if (k < 0.0)
+                k = 0.0;
+        if (k > 1.0)
+                k = 1.0;
+        return st->phase == 1 ? k : 1.0 - k;
+}
+
+/* Loads `path` into `st->next` and starts (or redirects) the fade. Returns
+ * false with a message when the theme cannot load — the active scene is
+ * untouched in that case. */
+static bool daemon_switch_theme(IpcState *st, const char *path, f64 fade_ms,
+                                f64 now, char *err, size_t errcap)
+{
+        if (fade_ms < 0.0)
+                fade_ms = st->fade_ms_default;
+        if (fade_ms > 10000.0)
+                fade_ms = 10000.0;
+        if (strlen(path) >= sizeof st->next.path) {
+                snprintf(err, errcap, "theme path too long");
+                return false;
+        }
+
+        if (fade_ms <= 0.5) {
+                /* instant switch: replace the active scene outright */
+                char *bd = rev_path_dirname(path);
+                if (!scene_load(st->sf, path, bd ? bd : "", err, errcap)) {
+                        free(bd);
+                        return false;
+                }
+                free(bd);
+                scene_file_free(&st->next);
+                st->have_next = false;
+                st->phase = 0;
+                LOGI("ipc: theme '%s' active (%d layers, instant)",
+                     st->sf->path, rtscene_layer_count(st->sf->sc));
+                return true;
+        }
+
+        /* fading: load the target NOW (one stall while the old scene still
+         * shows), then dip through black */
+        SceneFile cand;
+        memset(&cand, 0, sizeof cand);
+        char *bd = rev_path_dirname(path);
+        if (!scene_load(&cand, path, bd ? bd : "", err, errcap)) {
+                free(bd);
+                return false;
+        }
+        free(bd);
+        scene_file_free(&st->next);
+        st->next = cand;
+        st->have_next = true;
+        /* a switch during a running fade CONTINUES from the current
+         * darkness: the obsolete target never flashes in */
+        f64 cur = fade_black_now(st, now);
+        st->ms = fade_ms;
+        st->phase = 1;
+        st->t0 = now - cur * (fade_ms / 1000.0);
+        LOGI("ipc: switching to '%s' (%.0f ms fade)", path, fade_ms);
+        return true;
+}
+
+/* Drives the fade timeline; performs the scene swap at full black. */
+static void fade_advance(IpcState *st, f64 now)
+{
+        if (st->phase == 0)
+                return;
+        f64 dur = st->ms / 1000.0;
+        if (dur <= 0 || now - st->t0 < dur)
+                return;
+        if (st->phase == 1) {
+                if (st->have_next) {
+                        scene_file_free(st->sf);
+                        *st->sf = st->next;
+                        memset(&st->next, 0, sizeof st->next);
+                        st->have_next = false;
+                        LOGI("ipc: theme '%s' active (%d layers)",
+                             st->sf->path, rtscene_layer_count(st->sf->sc));
+                        if (st->pl_n > 0) {
+                                /* keep the playlist index honest when the
+                                 * switch came from THEME, not NEXT/PREV */
+                                for (int i = 0; i < st->pl_n; i++)
+                                        if (!strcmp(st->pl[i], st->sf->path))
+                                                st->pl_i = i;
+                        }
+                }
+                st->phase = 2;
+                st->t0 = now;
+        } else {
+                st->phase = 0;
+        }
+}
+
+static int playlist_advance(IpcState *st, int dir, f64 now, char *err, size_t errcap)
+{
+        if (st->pl_n <= 0) {
+                snprintf(err, errcap, "no-playlist");
+                return -1;
+        }
+        st->pl_i = (st->pl_i + dir + st->pl_n) % st->pl_n;
+        st->last_advance = now;
+        if (!daemon_switch_theme(st, st->pl[st->pl_i], -1.0, now, err, errcap)) {
+                /* unavailable entry: report, keep the playlist running —
+                 * the daemon keeps rendering whatever it already has */
+                LOGW("ipc: playlist entry '%s' failed: %s", st->pl[st->pl_i], err);
+                return -1;
+        }
+        return st->pl_i;
+}
+
+static void ipc_handler(void *ctx, const IpcMsg *msg, IpcReply *rep)
+{
+        IpcState *st = (IpcState *)ctx;
+        const char *cmd = msg->argv[0];
+        f64 now = rev_monotonic();
+        char err[512] = { 0 };
+
+        rep->ok = false;
+        snprintf(rep->text, sizeof rep->text, "?");
+
+        if (!strcmp(cmd, "PING")) {
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "PONG");
+        } else if (!strcmp(cmd, "STATUS")) {
+                bool vis = !st->plat->surface_visible ||
+                           st->plat->surface_visible(st->plat);
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text,
+                         "theme=%.200s fps=%d renderer=%s backend=%s visible=%d "
+                         "fade=%.0f playlist=%d rotate=%.0f",
+                         st->sf->path, rtscene_fps(st->sf->sc), st->rend->name,
+                         st->plat->name, vis ? 1 : 0, st->fade_ms_default,
+                         st->pl_n, st->rotate_s);
+        } else if (!strcmp(cmd, "THEME")) {
+                if (msg->argc < 2 || msg->argc > 3 || !*msg->argv[1]) {
+                        snprintf(rep->text, sizeof rep->text,
+                                 "usage: THEME <path> [fade_ms]");
+                        return;
+                }
+                f64 fade = msg->argc == 3 ? atof(msg->argv[2]) : -1.0;
+                if (daemon_switch_theme(st, msg->argv[1], fade, now,
+                                        err, sizeof err)) {
+                        rep->ok = true;
+                        snprintf(rep->text, sizeof rep->text, "switched");
+                } else {
+                        snprintf(rep->text, sizeof rep->text, "%.220s", err);
+                }
+        } else if (!strcmp(cmd, "PLAYLIST")) {
+                if (msg->argc < 2) {
+                        snprintf(rep->text, sizeof rep->text,
+                                 "usage: PLAYLIST <theme> [<theme> ...]");
+                        return;
+                }
+                int n = msg->argc - 1;
+                if (n > REV_PLAYLIST_MAX)
+                        n = REV_PLAYLIST_MAX;
+                for (int i = 0; i < n; i++) {
+                        if (strlen(msg->argv[i + 1]) >= sizeof st->pl[i]) {
+                                snprintf(rep->text, sizeof rep->text,
+                                         "playlist path too long");
+                                return;
+                        }
+                        snprintf(st->pl[i], sizeof st->pl[i], "%s", msg->argv[i + 1]);
+                }
+                st->pl_n = n;
+                st->pl_i = 0;
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "playlist %d entries", n);
+        } else if (!strcmp(cmd, "NEXT") || !strcmp(cmd, "PREV")) {
+                f64 fade = msg->argc == 2 ? atof(msg->argv[1]) : -1.0;
+                if (msg->argc > 2) {
+                        snprintf(rep->text, sizeof rep->text,
+                                 "usage: %s [fade_ms]", cmd);
+                        return;
+                }
+                /* an explicit fade overrides the default for this switch */
+                if (fade >= 0.0) {
+                        f64 old = st->fade_ms_default;
+                        st->fade_ms_default = fade;
+                        int r = playlist_advance(st, !strcmp(cmd, "NEXT") ? 1 : -1,
+                                                 now, err, sizeof err);
+                        st->fade_ms_default = old;
+                        if (r < 0) {
+                                snprintf(rep->text, sizeof rep->text, "%.220s", err);
+                                return;
+                        }
+                } else {
+                        int r = playlist_advance(st, !strcmp(cmd, "NEXT") ? 1 : -1,
+                                                 now, err, sizeof err);
+                        if (r < 0) {
+                                snprintf(rep->text, sizeof rep->text, "%.220s", err);
+                                return;
+                        }
+                }
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "%.200s", st->pl[st->pl_i]);
+        } else if (!strcmp(cmd, "ROTATE")) {
+                if (msg->argc != 2) {
+                        snprintf(rep->text, sizeof rep->text,
+                                 "usage: ROTATE <seconds|0>");
+                        return;
+                }
+                f64 sec = atof(msg->argv[1]);
+                if (sec < 0.0)
+                        sec = 0.0;
+                if (sec > 86400.0)
+                        sec = 86400.0;
+                st->rotate_s = sec;
+                st->last_advance = now;
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "rotate=%.0f", sec);
+        } else if (!strcmp(cmd, "FADE")) {
+                if (msg->argc != 2) {
+                        snprintf(rep->text, sizeof rep->text,
+                                 "usage: FADE <ms>");
+                        return;
+                }
+                f64 ms = atof(msg->argv[1]);
+                if (ms < 0.0)
+                        ms = 0.0;
+                if (ms > 10000.0)
+                        ms = 10000.0;
+                st->fade_ms_default = ms;
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "fade=%.0f", ms);
+        } else if (!strcmp(cmd, "QUIT")) {
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "bye");
+                *st->run = 0;
+                LOGI("ipc: QUIT — shutting down");
+        } else {
+                snprintf(rep->text, sizeof rep->text, "unknown-command");
+        }
 }
 
 int main(int argc, char **argv)
@@ -566,6 +860,45 @@ int main(int argc, char **argv)
                      video_offload ? "GPU planes + shader color convert"
                                    : "CPU swscale");
 
+        /* ---- runtime IPC: theme switching / playlists / QUIT ------------------
+         * REV_IPC=0 opts out. A live socket owned by another daemon is left
+         * alone ("in-use") — this instance just runs without control. */
+        IpcState st;
+        memset(&st, 0, sizeof st);
+        st.sf = &sf;
+        st.rend = rend;
+        st.plat = plat;
+        st.run = &g_run;
+        {
+                const char *fm = getenv("REV_FADE_MS");
+                st.fade_ms_default = (fm && *fm) ? atof(fm) : 400.0;
+                if (st.fade_ms_default < 0)
+                        st.fade_ms_default = 0;
+                if (st.fade_ms_default > 10000)
+                        st.fade_ms_default = 10000;
+        }
+        IpcServer *ipc = NULL;
+        {
+                const char *dis = getenv("REV_IPC");
+                if (dis && strcmp(dis, "0") == 0) {
+                        LOGI("ipc: disabled (REV_IPC=0)");
+                } else {
+                        char ierr[256] = { 0 };
+                        ipc = ipc_serve_start(NULL, ierr, sizeof ierr);
+                        if (!ipc) {
+                                if (!strcmp(ierr, "in-use"))
+                                        LOGW("ipc: another daemon owns the "
+                                             "socket — control disabled");
+                                else
+                                        LOGW("ipc: %s — control disabled", ierr);
+                        } else {
+                                LOGI("ipc: control socket %s (protocol v%d, "
+                                     "per-user; revtool ipc is the client)",
+                                     ipc_serve_path(ipc), IPC_VERSION);
+                        }
+                }
+        }
+
         signal(SIGINT, on_signal);
         signal(SIGTERM, on_signal);
 
@@ -573,6 +906,7 @@ int main(int argc, char **argv)
         f64 last_frame = t0;
         f64 last_reload_check = t0;
         f64 last_stat = t0;
+        st.last_advance = t0;
         u32 frames = 0;
         u64 last_drops = 0;
         bool shot_done = false;
@@ -770,6 +1104,29 @@ int main(int argc, char **argv)
                 if (plat->should_close(plat))
                         break;
 
+                /* runtime IPC: bounded non-blocking pump — theme switches,
+                 * playlist commands and QUIT arrive here (works while hidden
+                 * too: the loop still ticks at the idle pace). */
+                if (ipc) {
+                        ipc_serve_poll(ipc, ipc_handler, &st);
+                        fade_advance(&st, now);
+                        if (st.rotate_s > 0 && st.pl_n > 0 &&
+                            now - st.last_advance >= st.rotate_s) {
+                                char rerr[512] = { 0 };
+                                int r = playlist_advance(&st, 1, now,
+                                                         rerr, sizeof rerr);
+                                if (r < 0)
+                                        /* keep rotating: a broken entry is
+                                         * skipped, not fatal */
+                                        LOGW("ipc: rotation skipped an entry "
+                                             "(%s)", rerr);
+                                else
+                                        LOGI("ipc: rotation -> %s", st.pl[r]);
+                        }
+                }
+                /* current fade darkness for this frame (0 = none) */
+                const f64 fade_black = fade_black_now(&st, now);
+
                 /* window resize handling: recreate in place, notify renderer */
                 for (int i = 0; i < nmon; i++) {
                         RRect g;
@@ -884,6 +1241,30 @@ int main(int argc, char **argv)
                                                 cmd.vsim = fl.cmds[k].vsim;
                                                 rend->layer(rend, &cmd);
                                         }
+                                        /* theme-switch fade on the GPU tiers:
+                                         * one constant-black layer stretched
+                                         * over the frame with opacity = the
+                                         * current darkness — the reserved
+                                         * content id means it uploads ONCE
+                                         * (a 1x1 texture) for the whole
+                                         * transition, on every backend */
+                                        if (fade_black > 0.0) {
+                                                static const u32 black_px[1] = {
+                                                        0xFF000000u
+                                                };
+                                                RLayerCmd cmd;
+                                                memset(&cmd, 0, sizeof cmd);
+                                                cmd.px = black_px;
+                                                cmd.w = 1;
+                                                cmd.h = 1;
+                                                cmd.place_w = fl.w;
+                                                cmd.place_h = fl.h;
+                                                cmd.blend = REV_BLEND_NORMAL;
+                                                cmd.opacity = fade_black;
+                                                cmd.linear = false;
+                                                cmd.content_id = REV_FADE_CID;
+                                                rend->layer(rend, &cmd);
+                                        }
                                         rend->end(rend, NULL);
                                 } else {
                                         /* CPU-composited mode still needs begin():
@@ -900,6 +1281,10 @@ int main(int argc, char **argv)
                                         rtscene_profile(sf.sc, &s_ms, &ra_ms);
                                         prof_sim += s_ms;
                                         prof_raster += ra_ms;
+                                        /* theme-switch fade: darken the finished
+                                         * CPU frame before presenting */
+                                        if (fade_black > 0.0)
+                                                rev_comp_fade(&fbs[i], fade_black);
                                         rend->end(rend, &fbs[i]);
                                 }
                                 prof_render += rev_monotonic() - r_t0;
@@ -1101,16 +1486,16 @@ int main(int argc, char **argv)
         }
 
         LOGI("shutting down");
+        if (ipc) {
+                ipc_serve_stop(ipc);
+                ipc = NULL;
+        }
         renderer_destroy(rend);
         for (int i = 0; i < nmon; i++)
                 free(fbs[i].px);
         platform_destroy(plat);
-        rtscene_free(sf.sc);
-        if (sf.pack_used)
-                rev_pack_free(&sf.pack);
-        if (sf.theme)
-                theme_free(sf.theme);
-        arena_destroy(sf.ir_arena);
+        scene_file_free(&sf);
+        scene_file_free(&st.next);
         free(base_dir);
         return 0;
 }

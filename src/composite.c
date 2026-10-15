@@ -9,6 +9,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+
 const char *rev_blend_name(int mode)
 {
 	switch (mode) {
@@ -226,6 +230,69 @@ void rev_blur(RFb *fb, f64 radius)
 	for (int pass = 0; pass < 3; pass++) {
 		blur_hpass(fb->px, fb->w, fb->h, r);
 		blur_vpass(fb->px, fb->w, fb->h, r);
+	}
+}
+
+/* --------------------------------------------------------------------------
+ * theme-switch fade
+ * ------------------------------------------------------------------------ */
+
+void rev_comp_fade(RFb *dst, f64 black)
+{
+	if (!dst || !dst->px || black <= 0.0)
+		return;
+	u32 k = (u32)(rev_clampf(black, 0.0, 1.0) * 256.0 + 0.5);
+	if (k > 256)
+		k = 256;
+	u32 keep = 256u - k;	/* 256 = untouched, 0 = fully black */
+	size_t n = (size_t)dst->w * dst->h;
+
+#ifdef __SSE2__
+	/* 4 pixels per iteration, exact same rounding as the scalar path:
+	 * each channel byte is isolated into the low byte of a u16 lane, scaled
+	 * with (c*keep+128)>>8 (the value lands back in the lane's low byte),
+	 * then shifted into its final position with a 32-bit lane shift. Alpha
+	 * is ORed through untouched. c*keep+128 <= 255*256+128 fits u16. */
+	if (n >= 4) {
+		const __m128i keepv = _mm_set1_epi16((short)keep);
+		const __m128i rnd = _mm_set1_epi16(128);
+		const __m128i bytemask = _mm_set1_epi32(0x000000FFu);
+		size_t n4 = n & ~(size_t)3;
+		for (size_t i = 0; i < n4; i += 4) {
+			__m128i v = _mm_loadu_si128((const __m128i *)(dst->px + i));
+			__m128i a = _mm_and_si128(v, _mm_set1_epi32((int)0xFF000000u));
+			/* isolate each channel into the low byte of its lanes */
+			__m128i r = _mm_and_si128(v, bytemask);
+			__m128i g = _mm_and_si128(_mm_srli_epi32(v, 8), bytemask);
+			__m128i b = _mm_and_si128(_mm_srli_epi32(v, 16), bytemask);
+			/* (c*keep+128)>>8: the scaled channel value (0..255) ends up in
+			 * the LOW byte of each u16 lane = bits 0-7 of the 32-bit lane */
+			r = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(r, keepv), rnd), 8);
+			g = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(g, keepv), rnd), 8);
+			b = _mm_srli_epi16(_mm_add_epi16(_mm_mullo_epi16(b, keepv), rnd), 8);
+			/* final positions: r stays at bits 0-7, g -> 8-15, b -> 16-23 */
+			g = _mm_slli_epi32(g, 8);
+			b = _mm_slli_epi32(b, 16);
+			__m128i out = _mm_or_si128(a, _mm_or_si128(r, _mm_or_si128(g, b)));
+			_mm_storeu_si128((__m128i *)(dst->px + i), out);
+		}
+		for (size_t i = n4; i < n; i++) {
+			u32 p = dst->px[i];
+			dst->px[i] = (p & 0xFF000000u) |
+				     ((((p & 0xFF0000u) >> 16) * keep + 128u) >> 8) << 16 |
+				     ((((p & 0x00FF00u) >> 8) * keep + 128u) >> 8) << 8 |
+				     (((p & 0xFFu) * keep + 128u) >> 8);
+		}
+		return;
+	}
+#endif
+
+	for (size_t i = 0; i < n; i++) {
+		u32 p = dst->px[i];
+		dst->px[i] = (p & 0xFF000000u) |
+		             ((((p & 0xFF0000u) >> 16) * keep + 128u) >> 8) << 16 |
+		             ((((p & 0x00FF00u) >> 8) * keep + 128u) >> 8) << 8 |
+		             (((p & 0xFFu) * keep + 128u) >> 8);
 	}
 }
 

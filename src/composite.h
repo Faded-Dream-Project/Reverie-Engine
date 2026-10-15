@@ -34,6 +34,12 @@ void rev_comp_blend(RFb *dst, const RFb *src, int mode, f64 opacity);
 void rev_comp_blend_at(RFb *dst, const RFb *src, int dx, int dy,
                        int mode, f64 opacity);
 
+/* Theme-switch fade: multiplies RGB by (1 - black), alpha untouched.
+ * black=0 is a no-op, 1 turns every pixel its own alpha with zero color —
+ * the dip-through-black transition (see docs/IPC.md). Fixed-point integer
+ * math, SSE2 when available: it runs every frame for the fade's duration. */
+void rev_comp_fade(RFb *dst, f64 black);
+
 /* 3-pass box blur (approximates a gaussian), premultiplied internally. */
 void rev_blur(RFb *fb, f64 radius);
 

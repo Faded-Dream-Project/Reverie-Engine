@@ -193,9 +193,19 @@ revtool render  <scene.rev> ...       # offline PNG rendering (with simulated
 revtool pack    <scene.rev> [-o out.revpack]   # bundle scene + assets
 revtool unpack  <file.revpack> [-d dir]        # extract it back
 revtool theme   list|info|validate|pack|inspect  # theme toolkit
+revtool ipc     "NEXT 800"           # talk to the RUNNING daemon: switch
+                                      #   themes, playlists, rotation, QUIT
+                                      #   (docs/IPC.md — per-user socket)
+
+While the daemon runs it accepts commands on a per-user control socket:
+`revtool ipc "PLAYLIST themes/ripple-lake themes/snowfall"`,
+`revtool ipc "ROTATE 900"`, `revtool ipc "THEME themes/ember-drift 800"` —
+switches dip through black with a fade, playlists rotate unattended, and
+idle power-save keeps working across switches.
 
 See docs/SCENE-FORMAT.md (the scene language), docs/THEMES.md (theme
-folders + packed themes), and docs/VIDEO.md (video architecture).
+folders + packed themes), docs/IPC.md (runtime control), and
+docs/VIDEO.md (video architecture).
 ```
 
 ## Status — 0.2.0-dev (development, unstable)
@@ -204,6 +214,26 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **Runtime control + idle power-save everywhere (2026-10, three-feature
+  pass).** (1) The WSI swapchain path — the fast present path — now idles:
+  every `vkQueuePresentKHR` arms a `wl_surface.frame` request on the very
+  surface it commits, so the daemon has latched-callback evidence (NOT
+  acquire stalls or backpressure) and pauses to a ~4 Hz frozen-clock probe
+  render when nothing latches. An idle watchdog (`REV_IDLE_AUDIT_S`)
+  forces a 1 s audit burst after long hidden periods on every platform —
+  no wedged detector can sleep the engine forever. (2) X11 gained DPMS-
+  aware idle: the raw-wire client queries `DPMSGetInfo` (MIT-SCREEN-SAVER
+  fallback) and freezes rendering while the display is in
+  standby/suspend/off — the same pause/resume machinery as Wayland.
+  (3) A per-user control socket (docs/IPC.md) drives the RUNNING daemon:
+  `revtool ipc "THEME themes/snowfall 800"` switches with a dip-through-
+  black fade (SSE2 `rev_comp_fade` on the CPU tier, a 1x1 black layer on
+  the GPU tiers), `PLAYLIST`/`NEXT`/`PREV`/`ROTATE` run unattended theme
+  rotation, `STATUS`/`QUIT` round it out — bounded, versioned, SO_PEERCRED
+  -checked, never clobbering a live daemon's socket. Known limits are
+  documented per feature: EGL surfaces still always render; compositors
+  that answer hidden surfaces' frame events keep us at full rate;
+  XWayland's DPMS may not track the Wayland display's power.
 * **Theme hot-reload was dead; the daemon now sleeps when nobody is
   looking (2026-10, post-field-report hardening).** Two finds from
   auditing the daemon loop after the fifth field report. (1) Hot-reload

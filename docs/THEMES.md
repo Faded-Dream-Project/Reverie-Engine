@@ -146,6 +146,13 @@ fire on an in-place edit — a directory's mtime only moves when entries are
 added or removed — so the watch walks the tree and compares
 (path, mtime, size) records; bounded at 256 files / 5 levels deep.)
 
+Themes can also be switched at RUNTIME without restarting the daemon —
+`revtool ipc "THEME themes/snowfall 800"` switches with a dip-through-black
+fade, and `PLAYLIST` + `ROTATE` cycle a set of themes unattended. Switching
+re-arms the hot-reload watcher on the new theme (its snapshot is taken at
+load time), so file edits on the active theme keep hot-reloading across
+switches. See docs/IPC.md for the full control protocol.
+
 ## Compatibility
 
 * v1 `.revpack` scene packs load exactly as before.

@@ -66,6 +66,7 @@ CORE_SRC = \
 	src/ripple.c \
 	src/particles.c \
 	src/platform.c \
+	src/ipc.c \
 	src/x11.c \
 	src/plat_x11.c \
 	src/plat_wayland.c \
