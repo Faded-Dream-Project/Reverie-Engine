@@ -1949,6 +1949,38 @@ static bool gl_window_surface(RenderGL *r, int win)
         return r->win[win].surf != NULL;
 }
 
+/* ---- runtime window lifecycle (hotplug) ------------------------------------
+ * Mirrors init's per-window surface setup and fini's teardown, one window at
+ * a time. The reconciler calls add_window after the platform created the
+ * window and remove_window BEFORE the platform destroys it. */
+static bool gl_add_window(RRenderer *rr, RPlatform *p, int win)
+{
+        RenderGL *r = (RenderGL *)rr->ctx;
+        if (p != r->plat) {
+                return false;    /* different platform instance: refuse */
+        }
+        return gl_window_surface(r, win);
+}
+
+static void gl_remove_window(RRenderer *rr, int win)
+{
+        RenderGL *r = (RenderGL *)rr->ctx;
+        if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
+                return;
+        if (r->win[win].surf && r->eglDestroySurface) {
+                r->eglDestroySurface(r->dpy, r->win[win].surf);
+                r->win[win].surf = NULL;
+        }
+        if (r->win[win].eglwin) {
+                /* hand the wl_surface back to the shim before the wrapper dies */
+                wlshim_set_gl_surface(win, false);
+                if (r->wl_egl_window_destroy)
+                        r->wl_egl_window_destroy(r->win[win].eglwin);
+                r->win[win].eglwin = NULL;
+        }
+        r->win[win].native = 0;
+}
+
 /* ---- init ------------------------------------------------------------------ */
 
 static bool gl_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
@@ -3164,6 +3196,8 @@ RRenderer *render_gl_create(void)
         rr->layer = gl_layer;
         rr->end = gl_end;
         rr->resize = gl_resize;
+        rr->add_window = gl_add_window;
+        rr->remove_window = gl_remove_window;
         rr->perf = gl_perf;
         return rr;
 }

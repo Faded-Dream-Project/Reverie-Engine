@@ -977,6 +977,59 @@ static u32 vkres_ok(u32 r)
 /* forward decls (vk_end references the WSI window machinery) */
 static void vkwin_destroy(RenderVK *v, VkWin_ *w);
 static bool vkwin_create(RenderVK *v, int idx, char *err, size_t errcap);
+
+/* ---- runtime window lifecycle (hotplug) ------------------------------------
+ * WSI-present mode owns a VkSurfaceKHR + swapchain per window — built by
+ * vkwin_create (which also creates the surface when the slot is fresh) and
+ * released here + vkwin_destroy. Platform-present mode owns nothing
+ * per-window (the platform presenter draws to the window; the probe surface
+ * was already destroyed at init) — both hooks are no-ops there. */
+static bool vk_add_window(RRenderer *rr, RPlatform *p, int win)
+{
+        RenderVK *v = (RenderVK *)rr->ctx;
+        if (p != v->plat)
+                return false;    /* different platform instance: refuse */
+        if (v->present_mode != VK_PRESENT_WSI)
+                return true;     /* no per-window Vulkan state to build */
+        if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
+                return false;
+        if (v->win[win].ready)
+                return true;     /* already built (idempotent) */
+        char sub[128] = { 0 };
+        if (!vkwin_create(v, win, sub, sizeof sub)) {
+                LOGW("vulkan: hotplug window %d skipped (%s)", win, sub);
+                /* a failed create may have left a surface with no swapchain:
+                 * drop it so a retry can rebuild from scratch */
+                if (v->win[win].surface && v->vkDestroySurfaceKHR) {
+                        if (v->vkDeviceWaitIdle)
+                                v->vkDeviceWaitIdle(v->dev);
+                        v->vkDestroySurfaceKHR(v->inst, v->win[win].surface, NULL);
+                        v->win[win].surface = 0;
+                }
+                return false;
+        }
+        return true;
+}
+
+static void vk_remove_window(RRenderer *rr, int win)
+{
+        RenderVK *v = (RenderVK *)rr->ctx;
+        if (v->present_mode != VK_PRESENT_WSI)
+                return;
+        if (win < 0 || win >= REV_PLATFORM_MAX_OUTPUTS)
+                return;
+        VkWin_ *w = &v->win[win];
+        vkwin_destroy(v, w);
+        /* vkwin_destroy keeps the surface for resize-reuse; a REMOVED window's
+         * native handle dies with the platform window, so the VkSurfaceKHR
+         * must die too or a later re-add builds on a dangling wl_surface */
+        if (w->surface && v->vkDestroySurfaceKHR) {
+                if (v->dev && v->vkDeviceWaitIdle)
+                        v->vkDeviceWaitIdle(v->dev);
+                v->vkDestroySurfaceKHR(v->inst, w->surface, NULL);
+                w->surface = 0;
+        }
+}
 static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap);
 
 /* ========================================================================== *
@@ -3673,6 +3726,8 @@ RRenderer *render_vk_create(void)
         rr->layer = vk_layer;
         rr->end = vk_end;
         rr->resize = vk_resize;
+        rr->add_window = vk_add_window;
+        rr->remove_window = vk_remove_window;
         rr->perf = vk_perf;
         return rr;
 }

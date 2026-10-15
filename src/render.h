@@ -199,6 +199,21 @@ struct RRenderer {
         bool (*end)(RRenderer *r, const RFb *cpu_frame);
         void (*resize)(RRenderer *r, int win, u32 w, u32 h);
 
+        /* ---- optional runtime window lifecycle (hotplug) ----------------
+         * Called by the daemon's output reconciler AFTER the platform layer
+         * created (or BEFORE it destroys) the window at index `win`.
+         * add_window: build the renderer's per-window GPU surface state
+         *   (GL: EGL surface + wl_egl_window; Vulkan WSI: VkSurfaceKHR +
+         *   swapchain). Platform-present Vulkan and the CPU renderer have no
+         *   per-window state — the hook is NULL there and nothing needs to
+         *   happen. Returns false (with a logged reason) if the surface
+         *   cannot be created; the caller then leaves the slot windowless.
+         * remove_window: release the per-window state. MUST be called before
+         *   the platform destroys the window (the native handle dies with
+         *   it). NULL = nothing to release. */
+        bool (*add_window)(RRenderer *r, RPlatform *p, int win);
+        void (*remove_window)(RRenderer *r, int win);
+
         /* Optional perf counters (read-and-reset, once per frame):
          *   cpu_ms — renderer CPU wall time that is a SUBSET of the caller's
          *            render measurement (GL: texture uploads; CPU tier: the
