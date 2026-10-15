@@ -10,6 +10,13 @@
 #                        GPU legs SKIP gracefully otherwise)
 #   4. ASan + UBSan     (rebuild + unit suite under sanitizers, leak
 #                        detection on — catches what -O2 hides)
+#   5. FFmpeg matrix     (system: distro dev headers + CLI — the build
+#                        compiles against the runner's FFmpeg (6.1), the
+#                        ABI guard passes, and the FULL video battery runs;
+#                        vendored: runtime libs only — the build falls back
+#                        to the bundled 7.1 headers, the ABI guard refuses
+#                        video by design, and the stub-refusal contract leg
+#                        plus the e2e SKIP legs cover that configuration)
 #
 # e2e-wayland.sh requires the local weston test stack (../gpulibs) which is
 # not reproducible on hosted runners; it runs informationally and always
@@ -32,6 +39,11 @@ jobs:
   build-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ff: [system, vendored]
+    name: build-test (ffmpeg=${{ matrix.ff }})
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +56,13 @@ jobs:
             libegl1 libegl-mesa0 libgl1-mesa-dri \
             libwayland-client0 \
             libavcodec60 libavformat60 libavutil58 libswscale7
+
+      - name: FFmpeg dev headers + CLI (system-header leg)
+        if: matrix.ff == 'system'
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            ffmpeg
 
       - name: build
         run: make -j"$(nproc)"

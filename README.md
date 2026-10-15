@@ -409,7 +409,12 @@ Still no tags and no GitHub releases. This dev cycle:
   wayland 4/4 against real headless weston, a clean ASan+UBSan+LSan pass
   over the unit suite AND a five-switch IPC daemon session including
   mid-fade redirects, plus GitHub Actions CI running build + unit + e2e
-  + sanitizers on every push. Field
+  + sanitizers on every push as a two-leg FFmpeg matrix: one leg installs
+  the distro's dev headers + CLI (full video decode coverage — unit legs
+  and both e2e video legs run for real), the other runs runtime-libraries-
+  only (bundled 7.1 headers vs the distro's FFmpeg — the ABI guard
+  disables video by design and the stub-refusal contract leg proves the
+  refusal message stays standard). Field
   validation on the 1050 Ti box remains open: the GPU-path performance
   claims come from paired measurements on this 2-core sandbox plus the
   user's prior report; the profiler now gives the next field run the
