@@ -235,8 +235,9 @@ idle power-save keeps working across switches.
 
 See docs/SCENE-FORMAT.md (the scene language), docs/THEMES.md (theme
 folders + packed themes), docs/IPC.md (runtime control),
-docs/VIDEO.md (video + media mode), and docs/AUTOSTART.md (login
-autostart).
+docs/VIDEO.md (video + media mode), docs/AUTOSTART.md (login
+autostart), and docs/BUILD-DISTRO.md (per-distribution build
+packages — Alpine/Arch/Debian/Fedora/openSUSE/Void).
 ```
 
 ## Status — 0.2.0-dev (development, unstable)

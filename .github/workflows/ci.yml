@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ff: [system, vendored, off]
+        ff: [system, vendored, "off"]
     name: build-test (ffmpeg=${{ matrix.ff }})
     steps:
       - uses: actions/checkout@v4
@@ -108,3 +108,50 @@ jobs:
           make clean
           make -j"$(nproc)" CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
           make test CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" ${{ matrix.ff == 'off' && 'ENABLE_FFMPEG=0' || '' }}
+
+  # ---- distribution portability (Tier 1 + Tier 2 families) ------------------
+  # Real containers, real toolchains, real FFmpeg majors: build + unit suite
+  # against each distro's own packages, then the no-FFmpeg stub build with
+  # its refusal contract. musl is covered by Alpine. e2e stays on the Ubuntu
+  # job (Xvfb + Mesa stacks are not worth per-distro images); this job is
+  # the BUILD/LINK/RUNTIME-portability evidence.
+  distro-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: alpine
+            image: "alpine:latest"
+            install: "apk add --no-cache git build-base ffmpeg ffmpeg-dev"
+          - distro: arch
+            image: "archlinux:latest"
+            install: "pacman -Sy --noconfirm git base-devel ffmpeg"
+          - distro: debian
+            image: "debian:latest"
+            install: "apt-get update && apt-get install -y --no-install-recommends git build-essential libavcodec-dev libavformat-dev libavutil-dev libswscale-dev"
+          - distro: fedora
+            image: "fedora:latest"
+            install: "dnf -y install git gcc make ffmpeg-devel"
+          - distro: opensuse-tumbleweed
+            image: "opensuse/tumbleweed:latest"
+            install: "zypper -n install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)'"
+          - distro: void
+            image: "voidlinux/voidlinux:latest"
+            install: "xbps-install -Sy git base-devel ffmpeg-devel"
+    name: distro (${{ matrix.distro }})
+    container: ${{ matrix.image }}
+    steps:
+      - name: toolchain
+        run: ${{ matrix.install }}
+      - uses: actions/checkout@v4
+      - name: build + unit tests (system FFmpeg)
+        run: |
+          make -j"$(nproc)"
+          make test
+      - name: stub build + unit tests (no FFmpeg)
+        run: |
+          make clean
+          make -j"$(nproc)" ENABLE_FFMPEG=0
+          make test ENABLE_FFMPEG=0
