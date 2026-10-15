@@ -394,17 +394,22 @@ Still no tags and no GitHub releases. This dev cycle:
   GPU color conversion. docs/VIDEO.md records the full decoder
   architecture assessment (why a from-scratch H.264 decoder is the
   wrong project, licensing notes, and the phase-2 hardware-decode plan).
-* **Verification.** 9 unit suites (new this cycle: the wl_shm presenter's
-  GPU-premultiplied contract — premul input must land in the pool VERBATIM,
-  no double premultiply — pinned against real libwayland), e2e 19/19 under
-  Xvfb (new this cycle: Vulkan GPU-compositing pixel parity vs the CPU
-  renderer on both present paths, GPU sims forced on lavapipe, GPU ripple
-  click parity; earlier legs: GPU ripple, folder/packed theme parity,
-  corrupt-pack rejection, video on CPU and GL tiers, delayed
-  click-after-calm on CPU and GL tiers), e2e-wayland 4/4 against real
-  headless weston, plus a clean run under the
-  Vulkan validation layer (REV_VK_VALIDATE=1). ASan+UBSan clean including
-  daemon smokes with clicks on the CPU and Vulkan tiers. Field
+* **Verification.** 12 unit suites (new this cycle: the IPC protocol —
+  handshake versioning, framing limits, garbage/oversize/partial-line
+  handling, stale-socket reclaim, in-use refusal, per-user permissions;
+  the fade math — SSE2 lanes vs the scalar path, exact rounding; the
+  X11 display-power parser), e2e 22/23 legs under Xvfb (new this cycle:
+  X11 DPMS idle cycle + idle-watchdog audit burst via the deterministic
+  hook; a full runtime-IPC session — ping, status, faded theme switch,
+  playlist + next, bad-theme ERR, clean QUIT before timeout; earlier
+  legs: Vulkan pixel parity on both present paths, GPU sims on lavapipe,
+  GPU ripple click parity, folder/packed theme parity, corrupt-pack
+  rejection, video on CPU and GL tiers, click-after-calm on CPU and GL
+  tiers; one leg skips on Xvfb builds without the DPMS extension), e2e-
+  wayland 4/4 against real headless weston, a clean ASan+UBSan+LSan pass
+  over the unit suite AND a five-switch IPC daemon session including
+  mid-fade redirects, plus GitHub Actions CI running build + unit + e2e
+  + sanitizers on every push. Field
   validation on the 1050 Ti box remains open: the GPU-path performance
   claims come from paired measurements on this 2-core sandbox plus the
   user's prior report; the profiler now gives the next field run the
