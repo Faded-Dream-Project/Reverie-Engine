@@ -16,6 +16,7 @@
 #include "pack.h"
 #include "scene.h"
 #include "theme.h"
+#include "autostart.h"
 #include "util.h"
 
 static void usage(void)
@@ -580,6 +581,60 @@ static int cmd_ipc(int argc, char **argv)
 	return strncmp(reply, "OK", 2) == 0 ? 0 : 1;
 }
 
+static int cmd_autostart(int argc, char **argv, int first)
+{
+	char err[512] = {0};
+	if (argc < first + 1) {
+		usage();
+		return 1;
+	}
+	if (!strcmp(argv[first], "enable")) {
+		const char *const *args = (const char *const *)&argv[first + 1];
+		int n = argc - first - 1;
+		if (n > 32) {
+			fprintf(stderr, "revtool: too many autostart arguments (max 32)\n");
+			return 1;
+		}
+		if (!rev_autostart_enable(args, n, err, sizeof err)) {
+			fprintf(stderr, "revtool: %s\n", err);
+			return 1;
+		}
+		RevAutostartStatus st;
+		if (rev_autostart_status(&st, err, sizeof err) && st.enabled)
+			printf("autostart enabled\n  exec: %s\n  config: %s\n",
+			       st.exec, st.config);
+		else
+			printf("autostart enabled\n");
+		return 0;
+	}
+	if (!strcmp(argv[first], "disable")) {
+		if (!rev_autostart_disable(err, sizeof err)) {
+			fprintf(stderr, "revtool: %s\n", err);
+			return 1;
+		}
+		printf("autostart disabled (remembered arguments kept)\n");
+		return 0;
+	}
+	if (!strcmp(argv[first], "status")) {
+		RevAutostartStatus st;
+		if (!rev_autostart_status(&st, err, sizeof err)) {
+			fprintf(stderr, "revtool: %s\n", err);
+			return 1;
+		}
+		printf("enabled: %s\n", st.enabled ? "yes" : "no");
+		printf("desktop: %s\n", st.desktop);
+		printf("config:  %s\n", st.config);
+		if (st.exec[0])
+			printf("exec:    %s\n", st.exec);
+		if (st.args[0])
+			printf("args:    %s\n", st.args);
+		return 0;
+	}
+	fprintf(stderr, "revtool: unknown autostart command '%s' "
+	        "(enable | disable | status)\n", argv[first]);
+	return 1;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) {
@@ -606,6 +661,8 @@ int main(int argc, char **argv)
 		return cmd_theme(argc, argv);
 	if (strcmp(cmd, "ipc") == 0 && argc >= 3)
 		return cmd_ipc(argc, argv);
+	if (strcmp(cmd, "autostart") == 0 && argc >= 3)
+		return cmd_autostart(argc, argv, 2);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0) {
 		usage();
 		return 0;

@@ -223,6 +223,9 @@ revtool theme   list|info|validate|pack|inspect  # theme toolkit
 revtool ipc     "NEXT 800"           # talk to the RUNNING daemon: switch
                                       #   themes, playlists, rotation, QUIT
                                       #   (docs/IPC.md — per-user socket)
+revtool autostart enable --scene ... # XDG Autostart at login, opt-in and
+                                      #   user-controlled; remembers the mode
+                                      #   (docs/AUTOSTART.md)
 
 While the daemon runs it accepts commands on a per-user control socket:
 `revtool ipc "PLAYLIST themes/ripple-lake themes/snowfall"`,
@@ -231,8 +234,9 @@ switches dip through black with a fade, playlists rotate unattended, and
 idle power-save keeps working across switches.
 
 See docs/SCENE-FORMAT.md (the scene language), docs/THEMES.md (theme
-folders + packed themes), docs/IPC.md (runtime control), and
-docs/VIDEO.md (video architecture).
+folders + packed themes), docs/IPC.md (runtime control),
+docs/VIDEO.md (video + media mode), and docs/AUTOSTART.md (login
+autostart).
 ```
 
 ## Status — 0.2.0-dev (development, unstable)

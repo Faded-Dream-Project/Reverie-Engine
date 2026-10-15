@@ -782,6 +782,58 @@ else
 fi
 stop_xvfb
 
+# ---- Autostart: entry lifecycle + duplicate-instance guard -----------------
+# revtool autostart runs against a private XDG_CONFIG_HOME: enable writes
+# the .desktop entry (Exec carries the arguments and --exit-if-running) and
+# the remembered-arguments config; disable removes the entry and keeps the
+# config. The guard itself runs LIVE: a daemon owns the socket, a second
+# launch with --exit-if-running must yield cleanly.
+{
+    AROOT="$OUT/xdg-home"
+    mkdir -p "$AROOT"
+    AOK=1
+    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart enable \
+        --scene "$SCENE" >/dev/null 2>&1 || AOK=0
+    [ -f "$AROOT/autostart/reverie.desktop" ] || AOK=0
+    grep -q "Exec=.*reverie.*--exit-if-running" \
+        "$AROOT/autostart/reverie.desktop" 2>/dev/null || AOK=0
+    [ -f "$AROOT/reverie/autostart.json" ] || AOK=0
+    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart status \
+        2>/dev/null | grep -q "enabled: yes" || AOK=0
+    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart disable \
+        >/dev/null 2>&1 || AOK=0
+    [ -f "$AROOT/autostart/reverie.desktop" ] && AOK=0
+    [ -f "$AROOT/reverie/autostart.json" ] || AOK=0
+    if [ "$AOK" = 1 ]; then
+        echo "    autostart(cfg):PASS (enable/status/disable + memory kept)"
+        PASS=$((PASS+1))
+    else
+        echo "    autostart(cfg):FAIL (entry lifecycle broken)"
+        FAIL=$((FAIL+1))
+    fi
+}
+
+start_xvfb
+DUPSOCK="$OUT/dup.sock"
+DISPLAY="$XDISPLAY" REV_IPC_SOCK="$DUPSOCK" timeout 12 ./build/reverie -R cpu "$SCENE" \
+    > "$OUT/dup.log" 2>&1 &
+DPID=$!
+sleep 2
+DISPLAY="$XDISPLAY" REV_IPC_SOCK="$DUPSOCK" timeout 8 ./build/reverie -R cpu "$SCENE" \
+    --exit-if-running > "$OUT/dup2.log" 2>&1
+DRC=$?
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+stop_xvfb
+if [ "$DRC" -eq 0 ] && grep -q "another reverie daemon owns the control socket" \
+        "$OUT/dup2.log" 2>/dev/null; then
+    echo "    autostart(dup):PASS (second launch yields to the live daemon)"
+    PASS=$((PASS+1))
+else
+    echo "    autostart(dup):FAIL (--exit-if-running guard, exit=$DRC)"
+    cat "$OUT/dup2.log"
+    FAIL=$((FAIL+1))
+fi
+
 echo "==================================================="
 echo "e2e: $PASS passed, $SKIP skipped (no driver), $FAIL failed"
 echo "logs: $OUT"
