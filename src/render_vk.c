@@ -2655,6 +2655,16 @@ static bool vk_begin(RRenderer *rr, int win, u32 w, u32 h)
 
         /* slot reuse: retire the frame that used this (slot, win) 3
          * engine-frames ago (fence), then reset everything it owned */
+        if (fr->recording) {
+                /* a previous frame abandoned this slot mid-recording (a
+                 * failed present path returned early) — end the buffer so
+                 * the pool reset below never sees a recording command
+                 * buffer, and drop the timer pair whose TOP write will
+                 * never execute (its BOTTOM is in the discarded buffer) */
+                v->vkEndCommandBuffer(fr->cmd);
+                fr->recording = false;
+                fr->ts_valid = false;
+        }
         if (fr->submitted) {
                 u32 wr = v->vkWaitForFences(v->dev, 1, &fr->fence, 1, 1000000000ull);
                 if (wr == (u32)VK_ERROR_DEVICE_LOST_) {
@@ -2807,6 +2817,273 @@ static bool vk_ensure_readback(RenderVK *v, int win, u32 w, u32 h)
         return true;
 }
 
+/* ---- WSI present: blit the finished accum into the swapchain, FIFO ------
+ *
+ * FIELD REPORT #5 (REV_VK_PRESENT=wsi on a GTX 1050 Ti: 1.0 fps, frozen
+ * wallpaper, p50 frame exactly 1000.0 ms): the old flow could block a
+ * full second inside vkAcquireNextImageKHR while nothing drained the
+ * Wayland socket, and on the timeout path it returned WITHOUT
+ * re-submitting the sync fence it had already reset at entry — so every
+ * following frame waited that dead fence for ANOTHER second and no
+ * buffer ever presented again. The stalled slot rotation also starved
+ * the GPU timer queries (gpu=0.0 "unavailable" although init reported
+ * them usable).
+ *
+ * The flow is now wedge-free by construction:
+ *   - acquire runs in 8 ms slices with the platform event queue pumped
+ *     between attempts (Wayland WSI buffer releases and input flow while
+ *     we wait); a frame gives up after ~250 ms instead of 1 s;
+ *   - the sync fence is reset only AFTER an image is acquired — a failed
+ *     acquire leaves it in its old signaled state, so no dead-fence
+ *     poison can ever take hold;
+ *   - the slot rotation (sync_slot + frame_no) advances on EVERY exit,
+ *     so frame slots, sync slots and timer queries keep cycling even
+ *     while frames are being dropped. */
+static bool vk_wsi_present_frame(RenderVK *v, int win, VFrame *fr)
+{
+        VkWin_ *w = &v->win[win];
+        VImg *acc = &w->accum[w->accum_cur];
+        VkSync_ *s = &w->sync[w->sync_slot];
+        bool ok = false;
+
+        /* wait the sync-slot's fence: signaled by the submit of the last
+         * frame that USED this slot (fences start SIGNALED). It is only
+         * reset below when a frame will actually be submitted, so this
+         * wait cannot wedge; the 250 ms bound is a driver-hang guard. */
+        u32 wr = v->vkWaitForFences(v->dev, 1, &s->fence, 1, 250000000ull);
+        if (wr == (u32)VK_ERROR_DEVICE_LOST_) {
+                if (!v->device_lost) {
+                        v->device_lost = true;
+                        LOGE("vulkan: DEVICE LOST — the Vulkan tier can "
+                             "no longer present");
+                }
+                goto out;
+        }
+        if (wr != VK_SUCCESS_)
+                goto out;
+
+        /* acquire, sliced: 8 ms per attempt, ~250 ms total budget, pumping
+         * the platform's event queue between attempts. FIFO images sit
+         * with the compositor until a newer buffer latches, and the
+         * releases arrive as display events — waiting them out with the
+         * event loop stalled is deadlock food. */
+        u32 img = 0;
+        u32 r = VK_TIMEOUT_;
+        {
+                f64 deadline = rev_monotonic() + 0.250;
+                for (;;) {
+                        f64 rem = deadline - rev_monotonic();
+                        if (rem <= 0.0)
+                                break;
+                        u64 tns = (u64)(rem * 1e9);
+                        if (tns > 8000000ull)
+                                tns = 8000000ull;
+                        r = v->vkAcquireNextImageKHR(v->dev, w->swapchain,
+                                                     tns, s->acq, 0, &img);
+                        if (vkres_ok(r))
+                                break;
+                        if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
+                                vkwin_destroy(v, w);
+                                char err[128] = { 0 };
+                                if (!vkwin_create(v, win, err, sizeof err))
+                                        LOGW("vulkan: swapchain recreate failed: %s", err);
+                                goto out;    /* frame consumed; next one re-presents */
+                        }
+                        if (r != (u32)VK_TIMEOUT_)
+                                goto out;    /* real acquire error — drop the frame */
+                        /* slice expired: drain compositor events (releases,
+                         * input) and retry while the budget lasts */
+                        if (v->plat->pump)
+                                v->plat->pump(v->plat);
+                }
+                if (!vkres_ok(r)) {
+                        static f64 last_starve;
+                        f64 now = rev_monotonic();
+                        if (now - last_starve > 5.0) {
+                                last_starve = now;
+                                LOGW("vulkan: swapchain starved — the compositor "
+                                     "is not releasing FIFO images fast enough; "
+                                     "dropping frames (acquire timeout)");
+                        }
+                        goto out;
+                }
+        }
+
+        /* an image is in hand: THIS frame will submit, so the fence may
+         * be reset now. A timeout above left it in its old (signaled)
+         * state — the next wait on this slot sees "already complete"
+         * instead of a dead fence, so the loop can never wedge. */
+        v->vkResetFences(v->dev, 1, &s->fence);
+
+        /* accum -> swapchain image (BLIT; handles the BGRA component
+         * swizzle, and the identity rect is orientation-neutral —
+         * accum rows are already top-down = presentation order).
+         * _SRGB swapchains re-encode gamma on blit writes, and the
+         * engine's bytes are already display-encoded — for those
+         * (rare: most compositors offer UNORM variants) run one
+         * sRGB-decode compute pass first so the blit's encode makes
+         * the roundtrip the identity. */
+        {
+                const VImg *blit_src = acc;
+                if (w->srgb_format) {
+                        if (!ensure_scratch(v, win, &v->tex_a, acc->w, acc->h))
+                                goto out;
+                        f32 par[4];
+                        memset(par, 0, sizeof par);
+                        par[0] = (f32)acc->w;
+                        par[1] = (f32)acc->h;
+                        VDisp d;
+                        memset(&d, 0, sizeof d);
+                        d.kernel = K_DECODE;
+                        d.F16a = acc;    /* rgba8 read (decode.comp's slot 8) */
+                        d.out8 = &v->tex_a;
+                        d.par = par;
+                        d.npar = 1;
+                        if (!vk_run(v, win, &d))
+                                goto out;
+                        blit_src = &v->tex_a;
+                }
+                vk_img_barrier(v, fr->cmd, blit_src->img,
+                               VK_ACCESS_SHADER_READ_BIT_ |
+                               VK_ACCESS_SHADER_WRITE_BIT_ |
+                               VK_ACCESS_TRANSFER_WRITE_BIT_,
+                               VK_ACCESS_TRANSFER_READ_BIT_,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT_);
+                {
+                        VkImageMemoryBarrier_ b;
+                        memset(&b, 0, sizeof b);
+                        b.sType_ = ST_IMAGE_MEMORY_BARRIER;
+                        b.srcAccessMask = 0;
+                        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT_;
+                        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED_;
+                        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_;
+                        b.image = w->images[img];
+                        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
+                        b.subresourceRange.levelCount = 1;
+                        b.subresourceRange.layerCount = 1;
+                        v->vkCmdPipelineBarrier(fr->cmd,
+                                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT_,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT_,
+                                                0, 0, NULL, 0, NULL, 1, &b);
+                }
+                {
+                        VkImageBlit_ bl;
+                        memset(&bl, 0, sizeof bl);
+                        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
+                        bl.srcSubresource.layerCount = 1;
+                        bl.srcOffsets[0].x = 0;
+                        bl.srcOffsets[0].y = 0;
+                        bl.srcOffsets[0].z = 0;
+                        bl.srcOffsets[1].x = (i32)blit_src->w;
+                        bl.srcOffsets[1].y = (i32)blit_src->h;
+                        bl.srcOffsets[1].z = 1;
+                        bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
+                        bl.dstSubresource.layerCount = 1;
+                        bl.dstOffsets[0].x = 0;
+                        bl.dstOffsets[0].y = 0;
+                        bl.dstOffsets[0].z = 0;
+                        bl.dstOffsets[1].x = (i32)w->width;
+                        bl.dstOffsets[1].y = (i32)w->height;
+                        bl.dstOffsets[1].z = 1;
+                        v->vkCmdBlitImage(fr->cmd, blit_src->img,
+                                          VK_IMAGE_LAYOUT_GENERAL_,
+                                          w->images[img],
+                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_,
+                                          1, &bl, VK_FILTER_NEAREST_);
+                }
+                {
+                        VkImageMemoryBarrier_ b;
+                        memset(&b, 0, sizeof b);
+                        b.sType_ = ST_IMAGE_MEMORY_BARRIER;
+                        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT_;
+                        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT_;
+                        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_;
+                        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR_;
+                        b.image = w->images[img];
+                        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
+                        b.subresourceRange.levelCount = 1;
+                        b.subresourceRange.layerCount = 1;
+                        v->vkCmdPipelineBarrier(fr->cmd,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT_,
+                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_,
+                                                0, 0, NULL, 0, NULL, 1, &b);
+                }
+                if (v->tq_ok)
+                        v->vkCmdWriteTimestamp(fr->cmd,
+                                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_,
+                                               v->tq, ts_query_base(v, win) + 1);
+                if (v->vkEndCommandBuffer(fr->cmd) != VK_SUCCESS_)
+                        goto out;
+                fr->recording = false;
+
+                VkSubmitInfo_ si;
+                memset(&si, 0, sizeof si);
+                si.sType_ = ST_SUBMIT_INFO;
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &s->acq;
+                u32 stage = VK_PIPELINE_STAGE_TRANSFER_BIT_;
+                si.pWaitDstStageMask = &stage;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &fr->cmd;
+                si.signalSemaphoreCount = 1;
+                si.pSignalSemaphores = &s->rend;
+                u32 sr = v->vkQueueSubmit(v->queue, 1, &si, s->fence);
+                if (sr == (u32)VK_ERROR_DEVICE_LOST_) {
+                        if (!v->device_lost) {
+                                v->device_lost = true;
+                                LOGE("vulkan: DEVICE LOST during submit — "
+                                     "presenting disabled for this session");
+                        }
+                        goto out;
+                }
+                if (sr != VK_SUCCESS_)
+                        goto out;
+
+                VkPresentInfoKHR_ pi;
+                memset(&pi, 0, sizeof pi);
+                pi.sType_ = ST_PRESENT_INFO_KHR;
+                pi.waitSemaphoreCount = 1;
+                pi.pWaitSemaphores = &s->rend;
+                pi.swapchainCount = 1;
+                pi.pSwapchains = &w->swapchain;
+                pi.pImageIndices = &img;
+                r = v->vkQueuePresentKHR(v->queue, &pi);
+                if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
+                        vkwin_destroy(v, w);
+                        char rerr[128] = { 0 };
+                        if (vkwin_create(v, win, rerr, sizeof rerr))
+                                LOGI("vulkan: swapchain recreated after OUT_OF_DATE present");
+                        else
+                                LOGW("vulkan: swapchain recreate failed: %s", rerr);
+                        ok = true;    /* frame consumed — same as the old path */
+                        goto out;
+                }
+                if (r == (u32)VK_ERROR_DEVICE_LOST_) {
+                        if (!v->device_lost) {
+                                v->device_lost = true;
+                                LOGE("vulkan: DEVICE LOST during present — "
+                                     "presenting disabled for this session");
+                        }
+                        goto out;
+                }
+                ok = vkres_ok(r) ? true : false;
+        }
+
+out:
+        /* rotation on EVERY exit — frame slots, sync slots and the GPU
+         * timer query pairs all cycle on frame_no/sync_slot; stalling
+         * the rotation on failure paths is what starved gpu= to 0.0 in
+         * the field. Also never leave the command buffer recording. */
+        if (fr->recording) {
+                v->vkEndCommandBuffer(fr->cmd);    /* discard-safe end */
+                fr->recording = false;
+                fr->ts_valid = false;    /* the armed TOP write never executes */
+        }
+        w->sync_slot ^= 1;
+        v->frame_no++;
+        return ok;
+}
+
 static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
 {
         RenderVK *v = (RenderVK *)rr->ctx;
@@ -2882,6 +3159,11 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                         par[0] = (f32)acc->w;
                         par[1] = (f32)acc->h;
                         par[4] = 1.0f;    /* premul on */
+                        /* wl_shm ARGB8888 wants memory B,G,R,A; the engine's
+                         * accum is R,G,B,A — swizzle on store (field report
+                         * #5: blues rendered red before the flag existed).
+                         * X11 takes engine order (x11.c converts). */
+                        par[5] = v->plat->present_bgra ? 1.0f : 0.0f;
                         VDisp d;
                         memset(&d, 0, sizeof d);
                         d.kernel = K_COPYPREMUL;
@@ -2980,204 +3262,13 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                                             acc->w, acc->h, pre_premul);
         }
 
-        /* ---- WSI present: blit into the swapchain, FIFO present --------- */
+        /* ---- WSI present: blit into the swapchain, FIFO present ---------
+         * (wedge-free flow: see vk_wsi_present_frame — field report #5) */
         if (!fr->recording || !w->ready)
                 return false;
-        {
-                VImg *acc = &w->accum[w->accum_cur];
-                if (!acc->img)
-                        return false;
-                VkSync_ *s = &w->sync[w->sync_slot];
-
-                /* wait the sync-slot's fence (signaled by the submit two
-                 * frames ago — every WSI end() waits before reusing it),
-                 * then acquire. The frame-slot fence belongs to the platform
-                 * path; retirement for pool resets is covered by induction:
-                 * slot S recycles 3 frames later, and every frame's end()
-                 * waited the fence of the submit that used slot S. */
-                u32 wr = v->vkWaitForFences(v->dev, 1, &s->fence, 1, 1000000000ull);
-                if (wr == (u32)VK_ERROR_DEVICE_LOST_) {
-                        if (!v->device_lost) {
-                                v->device_lost = true;
-                                LOGE("vulkan: DEVICE LOST — the Vulkan tier can "
-                                     "no longer present");
-                        }
-                        return false;
-                }
-                if (wr != VK_SUCCESS_)
-                        return false;
-                v->vkResetFences(v->dev, 1, &s->fence);
-
-                u32 img = 0;
-                u32 r = v->vkAcquireNextImageKHR(v->dev, w->swapchain,
-                                                 1000000000ull, s->acq, 0, &img);
-                if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
-                        vkwin_destroy(v, w);
-                        char err[128] = { 0 };
-                        if (!vkwin_create(v, v->cur_win, err, sizeof err))
-                                LOGW("vulkan: swapchain recreate failed: %s", err);
-                        return false;    /* frame consumed; next one re-presents */
-                }
-                if (r != VK_SUCCESS_)
-                        return false;
-
-                /* accum -> swapchain image (BLIT; handles the BGRA component
-                 * swizzle, and the identity rect is orientation-neutral —
-                 * accum rows are already top-down = presentation order).
-                 * _SRGB swapchains re-encode gamma on blit writes, and the
-                 * engine's bytes are already display-encoded — for those
-                 * (rare: most compositors offer UNORM variants) run one
-                 * sRGB-decode compute pass first so the blit's encode makes
-                 * the roundtrip the identity. */
-                const VImg *blit_src = acc;
-                if (w->srgb_format) {
-                        if (!ensure_scratch(v, win, &v->tex_a, acc->w, acc->h))
-                                return false;
-                        f32 par[4];
-                        memset(par, 0, sizeof par);
-                        par[0] = (f32)acc->w;
-                        par[1] = (f32)acc->h;
-                        VDisp d;
-                        memset(&d, 0, sizeof d);
-                        d.kernel = K_DECODE;
-                        d.F16a = acc;    /* rgba8 read (decode.comp's slot 8) */
-                        d.out8 = &v->tex_a;
-                        d.par = par;
-                        d.npar = 1;
-                        if (!vk_run(v, win, &d))
-                                return false;
-                        blit_src = &v->tex_a;
-                }
-                vk_img_barrier(v, fr->cmd, blit_src->img,
-                               VK_ACCESS_SHADER_READ_BIT_ |
-                               VK_ACCESS_SHADER_WRITE_BIT_ |
-                               VK_ACCESS_TRANSFER_WRITE_BIT_,
-                               VK_ACCESS_TRANSFER_READ_BIT_,
-                               VK_PIPELINE_STAGE_TRANSFER_BIT_);
-                {
-                        VkImageMemoryBarrier_ b;
-                        memset(&b, 0, sizeof b);
-                        b.sType_ = ST_IMAGE_MEMORY_BARRIER;
-                        b.srcAccessMask = 0;
-                        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT_;
-                        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED_;
-                        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_;
-                        b.image = w->images[img];
-                        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
-                        b.subresourceRange.levelCount = 1;
-                        b.subresourceRange.layerCount = 1;
-                        v->vkCmdPipelineBarrier(fr->cmd,
-                                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT_,
-                                                VK_PIPELINE_STAGE_TRANSFER_BIT_,
-                                                0, 0, NULL, 0, NULL, 1, &b);
-                }
-                {
-                        VkImageBlit_ bl;
-                        memset(&bl, 0, sizeof bl);
-                        bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
-                        bl.srcSubresource.layerCount = 1;
-                        bl.srcOffsets[0].x = 0;
-                        bl.srcOffsets[0].y = 0;
-                        bl.srcOffsets[0].z = 0;
-                        bl.srcOffsets[1].x = (i32)blit_src->w;
-                        bl.srcOffsets[1].y = (i32)blit_src->h;
-                        bl.srcOffsets[1].z = 1;
-                        bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
-                        bl.dstSubresource.layerCount = 1;
-                        bl.dstOffsets[0].x = 0;
-                        bl.dstOffsets[0].y = 0;
-                        bl.dstOffsets[0].z = 0;
-                        bl.dstOffsets[1].x = (i32)w->width;
-                        bl.dstOffsets[1].y = (i32)w->height;
-                        bl.dstOffsets[1].z = 1;
-                        v->vkCmdBlitImage(fr->cmd, blit_src->img,
-                                          VK_IMAGE_LAYOUT_GENERAL_,
-                                          w->images[img],
-                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_,
-                                          1, &bl, VK_FILTER_NEAREST_);
-                }
-                {
-                        VkImageMemoryBarrier_ b;
-                        memset(&b, 0, sizeof b);
-                        b.sType_ = ST_IMAGE_MEMORY_BARRIER;
-                        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT_;
-                        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT_;
-                        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL_;
-                        b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR_;
-                        b.image = w->images[img];
-                        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT_;
-                        b.subresourceRange.levelCount = 1;
-                        b.subresourceRange.layerCount = 1;
-                        v->vkCmdPipelineBarrier(fr->cmd,
-                                                VK_PIPELINE_STAGE_TRANSFER_BIT_,
-                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_,
-                                                0, 0, NULL, 0, NULL, 1, &b);
-                }
-                if (v->tq_ok)
-                        v->vkCmdWriteTimestamp(fr->cmd,
-                                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_,
-                                               v->tq, ts_query_base(v, win) + 1);
-                if (v->vkEndCommandBuffer(fr->cmd) != VK_SUCCESS_)
-                        return false;
-                fr->recording = false;
-
-                VkSubmitInfo_ si;
-                memset(&si, 0, sizeof si);
-                si.sType_ = ST_SUBMIT_INFO;
-                si.waitSemaphoreCount = 1;
-                si.pWaitSemaphores = &s->acq;
-                u32 stage = VK_PIPELINE_STAGE_TRANSFER_BIT_;
-                si.pWaitDstStageMask = &stage;
-                si.commandBufferCount = 1;
-                si.pCommandBuffers = &fr->cmd;
-                si.signalSemaphoreCount = 1;
-                si.pSignalSemaphores = &s->rend;
-                u32 sr = v->vkQueueSubmit(v->queue, 1, &si, s->fence);
-                if (sr == (u32)VK_ERROR_DEVICE_LOST_) {
-                        if (!v->device_lost) {
-                                v->device_lost = true;
-                                LOGE("vulkan: DEVICE LOST during submit — "
-                                     "presenting disabled for this session");
-                        }
-                        return false;
-                }
-                if (sr != VK_SUCCESS_)
-                        return false;
-
-                VkPresentInfoKHR_ pi;
-                memset(&pi, 0, sizeof pi);
-                pi.sType_ = ST_PRESENT_INFO_KHR;
-                pi.waitSemaphoreCount = 1;
-                pi.pWaitSemaphores = &s->rend;
-                pi.swapchainCount = 1;
-                pi.pSwapchains = &w->swapchain;
-                pi.pImageIndices = &img;
-                r = v->vkQueuePresentKHR(v->queue, &pi);
-                if ((i32)r == VK_ERROR_OUT_OF_DATE_KHR_) {
-                        vkwin_destroy(v, w);
-                        char rerr[128] = { 0 };
-                        if (vkwin_create(v, v->cur_win, rerr, sizeof rerr))
-                                LOGI("vulkan: swapchain recreated after OUT_OF_DATE present");
-                        else
-                                LOGW("vulkan: swapchain recreate failed: %s", rerr);
-                        w->sync_slot ^= 1;
-                        v->frame_no++;
-                        return true;
-                }
-                if (r == (u32)VK_ERROR_DEVICE_LOST_) {
-                        if (!v->device_lost) {
-                                v->device_lost = true;
-                                LOGE("vulkan: DEVICE LOST during present — "
-                                     "presenting disabled for this session");
-                        }
-                        w->sync_slot ^= 1;
-                        v->frame_no++;
-                        return false;
-                }
-                w->sync_slot ^= 1;
-                v->frame_no++;
-                return vkres_ok(r);
-        }
+        if (!w->accum[w->accum_cur].img)
+                return false;
+        return vk_wsi_present_frame(v, win, fr);
 }
 
 static bool vk_perf(RRenderer *rr, f64 *cpu_ms, f64 *gpu_ms)
@@ -3330,11 +3421,15 @@ static bool vkwin_create(RenderVK *v, int idx, char *err, size_t errcap)
         /* Prefer UNORM swapchain formats: the present path BLITS the
          * RGBA8 accumulation into the swapchain image, and a blit into
          * an _SRGB destination re-encodes gamma (the engine's colors are
-         * already display-encoded, like the CPU tier's bytes). SRGB-only
-         * surfaces fall back to the raw byte-copy present (no blit). */
+         * already display-encoded, like the CPU tier's bytes). BGRA8
+         * ranks FIRST: the blit maps components by name (the R/B byte
+         * swap is free), and BGRA8 is the fourcc every Wayland compositor
+         * imports natively (dmabuf ARGB8888) while RGBA8/ABGR8888 import
+         * support varies (field report #5 follow-up). SRGB-only surfaces
+         * fall back to the raw byte-copy present (no blit). */
         u32 format = fmts[0].format, colorspace = fmts[0].colorSpace;
-        static const u32 pref[4] = { VK_FORMAT_R8G8B8A8_UNORM_, VK_FORMAT_B8G8R8A8_UNORM_,
-                                     43 /*R8G8B8A8_SRGB*/, 50 /*B8G8R8A8_SRGB*/ };
+        static const u32 pref[4] = { VK_FORMAT_B8G8R8A8_UNORM_, VK_FORMAT_R8G8B8A8_UNORM_,
+                                     50 /*B8G8R8A8_SRGB*/, 43 /*R8G8B8A8_SRGB*/ };
         for (u32 p = 0; p < 4; p++) {
                 for (u32 i = 0; i < nfmt; i++) {
                         if (fmts[i].format == pref[p] &&
@@ -3370,7 +3465,14 @@ fmt_picked:
 
         u32 minimg = caps.minImageCount;
         if (minimg < 2) minimg = 2;
-        if (caps.maxImageCount && minimg > caps.maxImageCount)
+        /* two spare images beyond the minimum: FIFO swapchain images sit
+         * with the compositor until a NEWER buffer latches, and with only
+         * the minimum the acquire races the release cycle head-on — the
+         * starvation of field report #5 (acquire slicing also covers it,
+         * but headroom makes the race not exist). */
+        if (caps.maxImageCount == 0 || caps.maxImageCount >= minimg + 2)
+                minimg += 2;
+        else if (caps.maxImageCount > minimg)
                 minimg = caps.maxImageCount;
 
         VkSwapchainCreateInfoKHR_ sci;
@@ -4177,9 +4279,10 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                 }
                 LOGI("vulkan: device present-capable (queue family %u); finished "
                      "frames download through HOST_CACHED staging — the "
-                     "premultiply runs as a GPU kernel and the presenter does "
-                     "one memcpy — and present via the platform SHM path — "
-                     "set REV_VK_PRESENT=wsi for zero-copy swapchain present",
+                     "premultiply AND the wl_shm BGRA byte swap run as one GPU "
+                     "kernel and the presenter does one memcpy — and present "
+                     "via the platform SHM path — set REV_VK_PRESENT=wsi for "
+                     "zero-copy swapchain present",
                      v->queue_family);
                 return true;
         }
@@ -4215,7 +4318,11 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                         LOGW("vulkan: window %d skipped (%s)", i, sub);
         }
 
-        LOGI("vulkan: swapchain present path ready (queue family %u, format %s)",
-             v->queue_family, v->win[0].format == VK_FORMAT_R8G8B8A8_UNORM_ ? "RGBA8" : "BGRA8");
+        LOGI("vulkan: swapchain present path ready (queue family %u, format %s, "
+             "%u images, BGRA-first) — acquire is slice-pumped so a slow "
+             "compositor can stall a frame but never wedge the loop",
+             v->queue_family,
+             v->win[0].format == VK_FORMAT_R8G8B8A8_UNORM_ ? "RGBA8" : "BGRA8",
+             v->win[0].nimages);
         return true;
 }

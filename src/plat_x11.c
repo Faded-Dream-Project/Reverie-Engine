@@ -177,6 +177,8 @@ RPlatform *plat_x11_create(void)
         p->add_window = px_add_window;
         p->present_cpu = px_present_cpu;
         p->present_premul = false;    /* no premul convention on X11 presents */
+        p->present_bgra = false;      /* x11.c converts into the visual's masks
+                                       * itself; the engine's R,G,B,A order in */
         p->has_gpu = true;
         p->native_handle = px_native_handle;
         p->native_display = px_native_display;

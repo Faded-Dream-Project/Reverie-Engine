@@ -204,6 +204,30 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **WSI present wedge + every blue rendered red (2026-10, fifth field
+  report).** Two reports in one: `REV_VK_PRESENT=wsi` froze the wallpaper
+  at "1.0–1.6 fps" with `frame p50` pinned at exactly 1000.0 ms, and the
+  Vulkan tier recolored the theme ("blue purple … to just red green-ish —
+  how does the renderer affect the theme wth?"). Two independent bugs,
+  both real-GPU-only. (1) The WSI flow reset its sync fence before
+  acquiring a swapchain image, then on the acquire timeout returned
+  without submitting — leaving a reset-and-never-signaled fence that
+  every later frame waited a full second on (p50 exactly 1000.0 ms, zero
+  presents; the skipped slot rotation also starved the GPU timer pairs
+  into `gpu=0.0 "unavailable"`). Acquire now runs in 8 ms slices with
+  the Wayland queue pumped between attempts (releases and input flow
+  while waiting; ~250 ms give-up budget, `swapchain starved` warning),
+  the fence resets only after an image is in hand, and the swapchain
+  gets `minImageCount+2` headroom. (2) wl_shm ARGB8888 packs its bytes
+  B,G,R,A while the engine is R,G,B,A — every wl_shm present swapped
+  red and blue; X11 repacked for the visual and EGL swaps for itself,
+  so only the Wayland CPU/Vulkan-SHM legs were wrong, and pixel-parity
+  tests couldn't see it (the CPU reference was equally swapped). The
+  `copypremul` kernel now does premul + the R/B swap in one dispatch
+  (`RPlatform::present_bgra`), the CPU legs swap in their premultiply
+  loops, and the wlshim probes are asymmetric so a regression fails.
+  (The maintainer's 57.5–58.2 fps field run already proved the SHM
+  path's throughput — the colors it showed were this swap in disguise.)
 * **The Vulkan SHM present un-throttled (2026-10, fourth field report).**
   "It's even worse and the CPU core is maxed out the second the command
   runs": 0.9 fps, `render=1112 ms`, `gpu=2.1 ms` — the GPU finished each

@@ -890,7 +890,10 @@ int main(void)
          * The engine framebuffer is PIXEL-sized (800x600 at scale 2). */
         u32 frame[800 * 600];
         for (u32 i = 0; i < 800 * 600; i++)
-                frame[i] = 0xff0000ff;    /* opaque blue in ARGB8888 = premul of straight blue */
+                /* engine-native straight BLUE: u32 0xAABBGGRR with b=0xff ->
+                 * 0xFFFF0000 (looks red-as-u32 — channel order is positional,
+                 * not nominal; wl_present must swap it into ARGB8888 blue) */
+                frame[i] = 0xffff0000;
         /* release the initially-attached buffer so present can cycle slots */
         s_send(buf_ids[0], 0, NULL, 0);
         wl_pump(wl);
@@ -921,7 +924,7 @@ int main(void)
         if (map != MAP_FAILED) {
                 u32 *px0 = (u32 *)map;
                 u32 *px1 = (u32 *)((u8 *)map + (size_t)800 * 600 * 4);
-                CHECK(px0[0] == 0xff0000ff, "buffer0 pixel is premultiplied blue");
+                CHECK(px0[0] == 0xff0000ff, "buffer0 pixel is ARGB8888 blue (engine 0xffff0000 swapped)");
                 /* cycle: release the used slot, present again -> other buffer */
                 s_send(buf_ids[1], 0, NULL, 0);
                 wl_pump(wl);

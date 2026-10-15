@@ -479,7 +479,10 @@ static void send_shm_formats(void)
 
 /* verify pixels of the slot the client just committed — the server mmaps the
  * SAME memfd the client sent via SCM_RIGHTS and reads the pool memory.
- * frames: #1 red + one semi-transparent probe, #2 green, #3 red again. */
+ * frames: #1 red + one semi-transparent probe, #2 green, #3 red again.
+ * Pool bytes must be wl_shm ARGB8888 (u32 0xAARRGGBB): the engine's
+ * 0xAABBGGRR input gets its R and B bytes SWAPPED here — the red probes
+ * and the asymmetric semi-transparent probe pin the channel order. */
 static void verify_present_pixels(int slot)
 {
         if (pool_fd < 0)
@@ -502,12 +505,12 @@ static void verify_present_pixels(int slot)
                 return;
         }
         if (attach_count == 1) {
-                CHECK(px[100] == 0xFF0000FF, "frame 1: opaque red pixel premultiplied-identical");
-                CHECK(px[7] == 0x80204020, "frame 1: semi-transparent pixel PREMULTIPLIED (0x80408040 -> 0x80204020)");
+                CHECK(px[100] == 0xFFFF0000, "frame 1: engine red 0xFF0000FF lands as ARGB8888 red 0xFFFF0000 (R/B swapped)");
+                CHECK(px[7] == 0x80104020, "frame 1: semi-transparent probe PREMULTIPLIED + swapped (0x80408020 -> 0x80104020)");
         } else if (attach_count == 2) {
-                CHECK(px[100] == 0xFF00FF00, "frame 2: green pixel in slot 1");
+                CHECK(px[100] == 0xFF00FF00, "frame 2: green pixel in slot 1 (R/B symmetric)");
         } else {
-                CHECK(px[100] == 0xFF0000FF, "frame 3: red pixel back in slot 0 (cycled)");
+                CHECK(px[100] == 0xFFFF0000, "frame 3: red pixel back in slot 0 (cycled, swapped)");
         }
 }
 
@@ -918,7 +921,8 @@ int main(void)
                 if (frame) {
                         for (int i = 0; i < 800 * 600; i++)
                                 frame[i] = 0xFF0000FF;        /* opaque red */
-                        frame[7] = 0x80408040;                 /* semi-transparent probe */
+                        frame[7] = 0x80408020;                 /* asymmetric semi-transparent probe
+                                                                 * (r!=b: a missing R/B swap fails the check) */
                         CHECK(wlshim_present_cpu(win, frame, 800, 600, false),
                               "frame 1 presented via wl_shm through libwayland");
                         CHECK(wlshim_wait_frame(1.0),
@@ -974,16 +978,16 @@ int main(void)
                          * semi-transparent so a stray premultiply pass would
                          * darken them and fail the byte check. */
                         frame[100] = 0x80FFFFFF;       /* a=0x80: premul would make 0x80808080 */
-                        frame[7] = 0x80408040;         /* a=0x80: premul would make 0x80204020 */
+                        frame[7] = 0x80408020;         /* a=0x80: premul would make 0x80104020 */
                         expect_px100 = 0x80FFFFFF;
-                        expect_px7 = 0x80408040;
+                        expect_px7 = 0x80408020;
                         expect_verbatim = 1;
                         CHECK(wlshim_present_cpu(win, frame, 800, 600, true),
                               "GPU-premultiplied frame presented via wl_shm");
                         wlshim_wait_frame(1.0);
                         usleep(100000);        /* server thread verifies + releases */
                         frame[100] = 0xFF0000FF;
-                        frame[7] = 0x80408040;
+                        frame[7] = 0x80408020;
                         free(frame);
                 }
 

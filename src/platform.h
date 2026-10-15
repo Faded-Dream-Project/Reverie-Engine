@@ -75,6 +75,14 @@ struct RPlatform {
          * decide where the straight->premul conversion runs (GPU kernel +
          * memcpy vs straight pass-through). */
         bool present_premul;
+        /* True when the presenter's wire byte order is B,G,R,A — wl_shm
+         * ARGB8888 packs the u32 as 0xAARRGGBB, so the FIRST byte in
+         * memory is the blue channel, the opposite of the engine's
+         * 0xAABBGGRR native order. Renderers with a GPU copy kernel
+         * swizzle R/B on store when this is set; wlshim's CPU premultiply
+         * leg applies the same mapping. False on X11 (x11.c converts into
+         * the visual's masks itself, engine order in). */
+        bool present_bgra;
 
         /* ---- GPU surface support ----
          * has_gpu:   accelerated present possible on this platform

@@ -5,7 +5,12 @@
  *
  * UBO:
  *   [0] dst dims (x,y), _, _
- *   [1] premul (0/1), _, _, _
+ *   [1] premul (0/1), bgra (0/1), _, _
+ *
+ * bgra: store with R and B bytes exchanged (memory order B,G,R,A) — the
+ * byte layout wl_shm ARGB8888 buffers demand. Only the PRESENT dispatch
+ * sets it (v->plat->present_bgra); the blur-chain uses leave it 0 so the
+ * upscale pass keeps sampling-compatible RGBA bytes.
  */
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -27,5 +32,7 @@ void main()
     vec4 s = texture(src_tex, uv);
     if (u.p[1].x > 0.5)
         s = vec4(s.rgb * s.a, s.a);
+    if (u.p[1].y > 0.5)
+        s = vec4(s.b, s.g, s.r, s.a);    /* wl_shm ARGB8888 byte order */
     imageStore(dst_img, pc, s);
 }

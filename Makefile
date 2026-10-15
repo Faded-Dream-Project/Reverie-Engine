@@ -101,7 +101,14 @@ all: $(BINS)
 $(BUILD):
 	@mkdir -p $(BUILD)
 
-$(BUILD)/%.o: src/%.c | $(BUILD)
+# Header deps: every object depends on ALL src/*.h — including the
+# GENERATED src/vk_spv.h. Without this, regenerating the embedded SPIR-V
+# (scripts/gen_spv.sh) leaves render_vk.o stale and the new kernels
+# silently never reach the binary (bit this project twice: platform.h in
+# the 0.2.0 staging rework, vk_spv.h in the byte-swap fix — caught only
+# by scripts/verify-bgra-flag.sh). Over-broad recompilation is cheap;
+# stale objects are not.
+$(BUILD)/%.o: src/%.c $(wildcard src/*.h) | $(BUILD)
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 $(LIBREV): $(CORE_OBJ)
@@ -113,7 +120,7 @@ $(BUILD)/reverie: $(BUILD)/main.o $(LIBREV)
 $(BUILD)/revtool: $(BUILD)/revtool.o $(LIBREV)
 	$(CC) $(ALL_CFLAGS) -o $@ $(BUILD)/revtool.o $(LIBREV) $(LDFLAGS) $(LIBS)
 
-$(BUILD)/%.o: tests/%.c | $(BUILD)
+$(BUILD)/%.o: tests/%.c $(wildcard src/*.h) | $(BUILD)
 	$(CC) $(ALL_CFLAGS) -c $< -o $@
 
 $(BUILD)/test_%: $(BUILD)/test_%.o $(LIBREV)
@@ -122,8 +129,8 @@ $(BUILD)/test_%: $(BUILD)/test_%.o $(LIBREV)
 test: $(TEST_BIN)
 	@fail=0; \
 	for t in $(TEST_BIN); do \
-		printf '  RUN  %s\n' "$$t"; \
-		"$$t" || { printf '  FAIL %s\n' "$$t"; fail=1; }; \
+	        printf '  RUN  %s\n' "$$t"; \
+	        "$$t" || { printf '  FAIL %s\n' "$$t"; fail=1; }; \
 	done; \
 	[ $$fail -eq 0 ] && echo '  ALL TESTS PASSED' || exit 1
 

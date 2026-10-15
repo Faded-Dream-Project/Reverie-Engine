@@ -1153,22 +1153,27 @@ bool wl_present(WLDisplay *w, int win_, const u32 *rgba, u32 width, u32 height)
                 return true;
         }
 
-        /* premultiply into the shm pool slot */
+        /* premultiply into the shm pool slot. BYTE ORDER: wl_shm ARGB8888
+         * packs the u32 as 0xAARRGGBB (memory bytes B,G,R,A); the engine's
+         * native u32 is 0xAABBGGRR — swap R and B while premultiplying,
+         * same as wlshim's CPU leg (field report #5: blues rendered red). */
         u32 *dst = (u32 *)((u8 *)win->pool_mem + (size_t)win->pw * win->ph * 4 * b);
         size_t n = (size_t)width * height;
         for (size_t i = 0; i < n; i++) {
                 u32 p = rgba[i];
                 u32 a = p >> 24;
                 if (a == 255) {
-                        dst[i] = p;
+                        dst[i] = (p & 0xFF00FF00u) |
+                                 ((p & 0x00FF0000u) >> 16) |
+                                 ((p & 0x000000FFu) << 16);
                 } else if (a == 0) {
                         dst[i] = 0;
                 } else {
                         u32 r = (p & 0xff), g = (p >> 8) & 0xff, bl = (p >> 16) & 0xff;
                         dst[i] = (a << 24) |
-                                 (((bl * a + 127) / 255) << 16) |
+                                 (((r * a + 127) / 255) << 16) |
                                  (((g * a + 127) / 255) << 8) |
-                                 ((r * a + 127) / 255);
+                                 ((bl * a + 127) / 255);
                 }
         }
 

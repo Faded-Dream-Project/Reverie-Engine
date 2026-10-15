@@ -237,9 +237,11 @@ RPlatform *plat_wayland_create(void)
         p->monitor_refresh = pw_monitor_refresh;
         p->add_window = pw_add_window;
         p->present_cpu = pw_present_cpu;
-        /* wl_shm ARGB8888 is a premultiplied format: presenters on this
-         * platform can take GPU-premultiplied bytes as a verbatim copy */
+        /* wl_shm ARGB8888 is a premultiplied format AND packs the u32 as
+         * 0xAARRGGBB (memory bytes B,G,R,A) — the engine's native order is
+         * 0xAABBGGRR, so presenters on this platform must swizzle R/B */
         p->present_premul = true;
+        p->present_bgra = true;
         p->has_gpu = false;    /* set dynamically in init() */
         p->native_handle = pw_native_handle;
         p->native_display = pw_native_display;

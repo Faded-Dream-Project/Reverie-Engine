@@ -1069,11 +1069,19 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
         }
 
         /* fill the pool slot. premultiplied input (the Vulkan tier converts
-         * on the GPU): one verbatim memcpy — the entire CPU cost of an SHM
-         * present, ~1ms at 1080p, and no per-pixel loop over GPU memory
-         * (reading an uncached staging heap per pixel was field report #4:
-         * 1.1 s/frame on a GTX 1050 Ti). straight input (CPU tier): the
-         * scalar premultiply below — the source is plain RAM, ~5ms. */
+         * + swizzles on the GPU): one verbatim memcpy — the entire CPU cost
+         * of an SHM present, ~1ms at 1080p, and no per-pixel loop over GPU
+         * memory (reading an uncached staging heap per pixel was field
+         * report #4: 1.1 s/frame on a GTX 1050 Ti). straight input (CPU
+         * tier): the scalar premultiply below — the source is plain RAM,
+         * ~5ms.
+         *
+         * BYTE ORDER (field report #5): wl_shm ARGB8888 packs the u32 as
+         * 0xAARRGGBB — memory bytes B,G,R,A — while the engine's native
+         * u32 is 0xAABBGGRR (memory R,G,B,A). The loop therefore swaps R
+         * and B while it premultiplies; skipping the swap made every blue
+         * render red (the X11 path never had this: x11.c repacks into the
+         * visual's masks). */
         u32 *dst = (u32 *)((u8 *)winp->pool_mem + (size_t)w * h * 4 * b);
         size_t n = (size_t)w * h;
         if (premultiplied) {
@@ -1083,15 +1091,19 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
                         u32 p = rgba[i];
                         u32 a = p >> 24;
                         if (a == 255) {
-                                dst[i] = p;
+                                /* opaque: just exchange the R and B bytes
+                                 * (A and G keep their positions) */
+                                dst[i] = (p & 0xFF00FF00u) |
+                                         ((p & 0x00FF0000u) >> 16) |
+                                         ((p & 0x000000FFu) << 16);
                         } else if (a == 0) {
                                 dst[i] = 0;
                         } else {
                                 u32 r = (p & 0xff), g = (p >> 8) & 0xff, bl = (p >> 16) & 0xff;
                                 dst[i] = (a << 24) |
-                                         (((bl * a + 127) / 255) << 16) |
+                                         (((r * a + 127) / 255) << 16) |
                                          (((g * a + 127) / 255) << 8) |
-                                         ((r * a + 127) / 255);
+                                         ((bl * a + 127) / 255);
                         }
                 }
         }

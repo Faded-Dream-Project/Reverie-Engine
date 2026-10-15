@@ -133,7 +133,11 @@ selects.
 * **GPU timing:** core Vulkan 1.0 timestamp queries bracket every frame's
   compute; `REV_PROFILE` reports them asynchronously (several frames
   behind) exactly like the GL tier's timer queries — labeled `gpu=...*`,
-  never conflated with CPU wall time.
+  never conflated with CPU wall time. The query pairs cycle on the frame
+  slot rotation, which advances on *every* `end()` outcome — a rotation
+  that stalled on failed presents is what made the WSI path report
+  `gpu=0.0 "unavailable"` in the fifth field report while init had just
+  logged the queries as available.
 * **Present paths (mechanism unchanged since 0.1.1, fed by GPU frames —
   staging fixed in 0.2.0 after the fourth field report):**
   - *platform present (default)* — the finished image is copied to a
@@ -154,22 +158,40 @@ selects.
       non-coherent) → HOST_VISIBLE|COHERENT *preferring non-DEVICE-LOCAL*
       → any. The chosen class is logged (`frame download staging: memory
       type …`).
-    - **The premultiply runs on the GPU.** wl_shm ARGB8888 is premultiplied;
-      the straight→premul conversion is one extra `copypremul` compute
-      dispatch into the accum ping-pong twin, downloaded after it, and the
-      presenter receives `premultiplied=true` → a single `memcpy` (~1 ms
-      at 1080p) — the CPU never touches a per-pixel loop on the Vulkan
-      tier. X11 has no premul convention (`present_premul=false`): bytes
-      copy through straight, bit-identical to the CPU tier (E2E parity
-      stays byte-exact). The CPU tier still premultiplies on the CPU —
-      its source is plain RAM (~5 ms at 1080p, cached).
+    - **The premultiply AND the byte swap run on the GPU.** wl_shm
+      ARGB8888 is premultiplied *and* packs its u32 as `0xAARRGGBB` —
+      memory bytes B,G,R,A — while the engine's native u32 is
+      `0xAABBGGRR` (memory R,G,B,A). The straight→premul conversion is
+      one extra `copypremul` compute dispatch into the accum ping-pong
+      twin that also exchanges R and B on store (`p[1].y` flag, from
+      `RPlatform::present_bgra`), downloaded after it, and the presenter
+      receives `premultiplied=true` → a single `memcpy` (~1 ms at 1080p)
+      — the CPU never touches a per-pixel loop on the Vulkan tier. X11
+      has no premul or byte-order convention (`present_premul=false`,
+      `present_bgra=false`): bytes copy through straight and x11.c
+      converts into the visual's masks, bit-identical to the CPU tier
+      (E2E parity stays byte-exact). The CPU tier's wl_shm leg and the
+      raw Wayland client swap R/B in their premultiply loops (~5 ms at
+      1080p, cached RAM).
     GPU-side cost of the present download at 1080p: one 8.3 MB DMA + one
     tiny kernel, both inside the timestamped region — reported in `gpu=`.
   - *WSI present (`REV_VK_PRESENT=wsi`)* — the image is blitted into the
-    swapchain (UNORM formats preferred; the blit handles the BGRA
-    component swizzle) and presented FIFO, zero-copy. Surfaces that only
-    offer _SRGB swapchain formats get one sRGB-decode compute pass first
-    so the blit's encode roundtrips to the identity.
+    swapchain (BGRA8 UNORM preferred first: the blit maps components by
+    name so the R/B swap is free, and BGRA8 is the fourcc every Wayland
+    compositor imports natively while RGBA8/ABGR8888 support varies) and
+    presented FIFO, zero-copy. Surfaces that only offer _SRGB swapchain
+    formats get one sRGB-decode compute pass first so the blit's encode
+    roundtrips to the identity.
+    The 0.2.0 wedge-free acquire flow (fifth field report: 1.0 fps,
+    frozen wallpaper, `frame p50` exactly 1000.0 ms): images are acquired
+    in 8 ms slices with the platform event queue pumped between attempts
+    (Wayland WSI releases and input flow while waiting), a frame gives up
+    after ~250 ms and logs a throttled `swapchain starved` warning, and
+    the swapchain is created with `minImageCount + 2` headroom so FIFO
+    acquires do not race the compositor's release cycle head-on. The sync
+    fence is reset only after an image is actually acquired — the old
+    code reset it first and could return without ever submitting, leaving
+    every later frame waiting a dead fence for a full second each.
   The default stays platform-SHM because the 0.1.0 WSI path had a black
   screen on one real XWayland stack; both paths are E2E-tested and
   pixel-exact. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or present
@@ -260,6 +282,47 @@ selects.
 | `REV_RIPPLE_DUMP`   | TEST: `"call,call,..."` = read the GPU ripple height field back at those step-call indices and log statistics (placement debugging) |
 
 ## Troubleshooting
+
+* **WSI present wedged at exactly 1 s/frame + every blue rendered red
+  (0.2.0 postmortem, the fifth field report)** — field report:
+  `REV_VK_PRESENT=wsi` on the GTX 1050 Ti ran at 1.0–1.6 fps with the
+  wallpaper frozen and `frame p50` pinned at exactly 1000.0 ms; separately,
+  choosing the Vulkan tier turned the theme's blue/purple into
+  red/green-ish ("how does the renderer affect the theme wth?"). Two
+  independent root causes, both invisible to the sandbox stack:
+  1. **A self-poisoning sync fence.** The WSI `end()` reset its sync
+     fence *before* `vkAcquireNextImageKHR`; when the acquire timed out
+     (1 s) the frame returned without ever submitting — the fence stayed
+     reset-and-unsignaled, and because the failure path also skipped the
+     slot rotation, every later frame waited that same dead fence for
+     another full second: p50 exactly 1000.0 ms, zero presents, and the
+     stalled rotation starved the GPU timer pairs (`gpu=0.0
+     "unavailable"` although init had logged them usable). The stall was
+     seeded by acquire timeouts in the first place — blocking a second
+     inside the driver while nothing drained the Wayland socket means
+     buffer releases never reach the WSI. Fix — the acquire now runs in
+     8 ms slices with the platform event queue pumped between attempts
+     (~250 ms budget, throttled `swapchain starved` warning on give-up),
+     the fence is reset only after an image is in hand, `minImageCount+2`
+     headroom keeps FIFO acquires off the release cycle's heels, and the
+     slot rotation advances on every exit so fences, frame slots and
+     timer queries keep cycling.
+  2. **An R/B byte-order swap on every wl_shm present.** wl_shm
+     ARGB8888 packs its u32 as `0xAARRGGBB` (memory B,G,R,A); the
+     engine's native u32 is `0xAABBGGRR` (memory R,G,B,A). The shim's
+     premultiply loop and the raw Wayland client wrote engine-order
+     bytes into ARGB8888 buffers — every blue swapped to red, purple to
+     washed red. X11 never showed this (x11.c always repacked into the
+     visual's masks), the GL tier never showed it (EGL owns the surface
+     and the swap), and E2E pixel parity could not catch it because the
+     reference was the CPU tier — two swapped paths agree with each
+     other. The old wlshim unit test even used a *symmetric*
+     semi-transparent probe (r == b), which is invariant under the swap.
+     Fix — `RPlatform::present_bgra` declares the presenter's byte
+     order; the Vulkan tier's `copypremul` kernel swaps R and B on store
+     (same dispatch as the GPU premultiply, free), and the CPU legs swap
+     inside their existing premultiply loops. The unit probes are now
+     asymmetric so a regression fails loudly.
 
 * **Ripple lake: the splash expands, glitches once it reaches the screen
   edges, and later clicks do nothing (2026-10 postmortem, the sequel)** —
