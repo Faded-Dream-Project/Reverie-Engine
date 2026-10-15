@@ -390,9 +390,13 @@ RevVideo *rev_video_open(const RVideoSource *src, bool loop,
                 return NULL;
         }
         if (!ff_load()) {
+                /* one refusal contract for every disable reason (libraries
+                 * missing, symbols missing, ABI mismatch) and for the
+                 * no-headers stub build: the "no video support" anchor */
                 snprintf(err, errcap,
-                         "video: FFmpeg libraries not usable on this system "
-                         "(see the log for the reason)");
+                         "video: no video support — FFmpeg libraries unusable "
+                         "on this system (missing or ABI-mismatched; see the "
+                         "log for the reason)");
                 return NULL;
         }
 

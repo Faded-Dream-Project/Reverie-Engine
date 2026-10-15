@@ -27,8 +27,33 @@ static int fails = 0;
 	} \
 } while (0)
 
-int main(void)
+/* ---- forced-unavailable regression leg --------------------------------------- *
+ * The first CI run (2026-10-15) exposed a contract bug: when the build's
+ * vendored FFmpeg headers (7.1) met the runner's FFmpeg 6.1 libraries, the
+ * runtime ABI guard refused video (correct) — but rev_video_open's refusal
+ * text did not carry the "no video support" anchor the no-headers stub
+ * build (and this test) expect. This leg forces the unavailable state
+ * deterministically on ANY machine: an LD_LIBRARY_PATH directory of empty
+ * shared objects shadows every soname the loader can try, the function
+ * table load fails, and the re-exec'd child must receive the standard
+ * refusal. Environment-independent — runs wherever cc exists. */
+static int stub_refusal_child(void)
 {
+	char err[512] = {0};
+	RVideoSource src = { .path = "/nonexistent/file.mp4" };
+	RevVideo *v = rev_video_open(&src, true, err, sizeof err);
+	bool ok = v == NULL && strstr(err, "no video support");
+	printf("%s: forced-unavailable refusal carries \"no video support\" (%s)\n",
+	       ok ? "  ok" : "FAIL", err);
+	return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+	/* re-exec'd child of the stub-refusal leg below (shadowed sonames) */
+	if (argc > 1 && !strcmp(argv[1], "--stub-refusal"))
+		return stub_refusal_child();
+
 	char err[512];
 
 	/* availability is environment-dependent: libraries + ABI match */
@@ -141,6 +166,48 @@ int main(void)
 				}
 				free(data);
 			}
+		}
+	}
+
+
+	/* stub-refusal leg — deterministic on every machine: shadow every soname
+	 * the loader can try with an empty shared object, re-exec ourselves under
+	 * that LD_LIBRARY_PATH, and require the standard refusal anchor */
+	{
+		char dir[] = "/tmp/revvidstubXXXXXX";
+		char self[300];
+		ssize_t nself = readlink("/proc/self/exe", self, sizeof self - 1);
+		if (nself <= 0 || !mkdtemp(dir)) {
+			CHECK(false, "stub leg setup (readlink/mkdtemp)");
+		} else {
+			char scmd[768];
+			int rc;
+			self[nself] = '\0';
+			snprintf(scmd, sizeof scmd,
+				 "cd '%s' && cc -shared -fPIC -o libstub.so -x c /dev/null 2>/dev/null && "
+				 "for n in libavcodec.so.61 libavcodec.so.60 libavcodec.so.59 "
+				 "libavcodec.so.58 libavcodec.so libavformat.so.61 libavformat.so.60 "
+				 "libavformat.so.59 libavformat.so.58 libavformat.so libavutil.so.59 "
+				 "libavutil.so.58 libavutil.so.57 libavutil.so.56 libavutil.so "
+				 "libswscale.so.8 libswscale.so.7 libswscale.so.6 libswscale.so.5 "
+				 "libswscale.so; do ln -sf libstub.so \"$n\"; done",
+				 dir);
+			rc = system(scmd);
+			CHECK(rc == 0, "stub leg: loader sonames shadowed with empty .so");
+			if (rc == 0) {
+				snprintf(scmd, sizeof scmd,
+					 "env LD_LIBRARY_PATH='%s' '%s' --stub-refusal >'%s/out' 2>&1",
+					 dir, self, dir);
+				rc = system(scmd);
+				CHECK(rc == 0,
+				      "forced-unavailable refusal carries \"no video support\"");
+				if (rc != 0) {
+					snprintf(scmd, sizeof scmd, "cat '%s/out' 2>/dev/null", dir);
+					system(scmd); /* surface the child's diagnostics */
+				}
+			}
+			snprintf(scmd, sizeof scmd, "rm -rf '%s'", dir);
+			system(scmd);
 		}
 	}
 
