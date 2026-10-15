@@ -30,16 +30,6 @@
 #include <libavutil/avutil.h>
 #include <libswscale/swscale.h>
 
-/* AVFrame gained `duration` in FFmpeg 6.1 (libavutil 58.29.100); older
- * toolchains (Void's FFmpeg 6.0 era headers) only have pkt_duration,
- * and 6.1-7.x deprecate it. Version-gate on the exact introduction so
- * every supported header set compiles warning-free either way. */
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 29, 100)
-#define REV_FRAME_DURATION(f) ((f)->duration)
-#else
-#define REV_FRAME_DURATION(f) ((f)->pkt_duration)
-#endif
-
 /* ---- the dlopen'd function table (signatures from the headers) ------------- */
 
 typedef struct {
@@ -387,7 +377,6 @@ static AVFrame *normalize_rgb(RevVideo *v, AVFrame *f)
         o->width = f->width;
         o->height = f->height;
         o->pts = f->pts;
-        o->duration = REV_FRAME_DURATION(f);
 
         /* PAL8 carries its palette in data[1]; every other format is a
          * plain plane list. sws reads the palette per call, so mid-stream
@@ -851,18 +840,29 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
                                 g_ff.av_frame_unref(v->cur);
                                 g_ff.av_frame_ref(v->cur, f);
                                 v->cur_pts = pts;
-                                /* the frame's END drives the loop wrap:
-                                 * duration metadata when present, else one
-                                 * average frame period */
+                                /* the frame's END drives the loop wrap.
+                                 * The next queued frame's pts is the exact
+                                 * end (variable frame rates included); with
+                                 * an empty queue fall back to one average
+                                 * frame period. No duration metadata is
+                                 * read — its field name moved across FFmpeg
+                                 * majors (pkt_duration -> duration), and
+                                 * distro header sets disagree about which
+                                 * exists at which version. */
                                 {
-                                        f64 dur = REV_FRAME_DURATION(f) > 0
-                                                ? pts_seconds(REV_FRAME_DURATION(f),
-                                                              st->time_base)
-                                                : -1.0;
-                                        if (dur <= 0.0 || dur > 10.0)
-                                                dur = v->fps > 0.0
-                                                        ? 1.0 / v->fps : 1.0 / 30.0;
-                                        v->cur_end = pts + dur;
+                                        f64 end = pts +
+                                                (v->fps > 0.0 ? 1.0 / v->fps
+                                                              : 1.0 / 30.0);
+                                        if (v->qn >= 2) {
+                                                f64 npts = pts_seconds(
+                                                        v->q[1]->pts,
+                                                        st->time_base);
+                                                if (npts < -1e17)
+                                                        npts = pts + 1.0 / 30.0;
+                                                if (npts > end)
+                                                        end = npts;
+                                        }
+                                        v->cur_end = end;
                                 }
                                 if (v->cur->format == AV_PIX_FMT_RGBA) {
                                         /* normalized RGB-family frame:
