@@ -141,6 +141,58 @@ every GPU. The upload itself is bounded: 1080p YUV420P = 3.1 MB/frame
   a message; decode errors drop the layer (one diagnostic), never the
   engine; shutdown joins the decode thread.
 
+## 4b. The `--video` media mode (2026-10)
+
+`reverie --video PATH` plays a video or animated GIF as the wallpaper
+**without any scene file** — the second, independent content mode. The
+scene and media modes share only the infrastructure (backends,
+renderers, presentation, IPC socket, screenshots, idle power-save);
+neither requires the other.
+
+* **CLI**: `--video PATH` (mutually exclusive with any scene —
+  positional, `--scene`, or a second `--video` is a hard error),
+  `--scale fill|fit|stretch|center` (default **fill**: cover the
+  viewport, center-crop the excess), `--no-loop` (hold the last frame at
+  EOF; the default loops), `--fps N` (pacing override).
+* **Scaling math** (`rev_scale_place()` in geom.c, unit-tested in
+  tests/test_scale.c): `fill` covers and crops (negative placement
+  offsets are legal — the GPU tiers clip natively); `fit` contains and
+  letterboxes; `stretch` ignores aspect; `center` keeps native size and
+  crops symmetrically when oversized. **Letterbox bars are opaque
+  black** — video-player semantics, byte-identical on every renderer
+  (the CPU tier pre-fills 0xFF000000; the GPU tiers draw a cached 1x1
+  black background layer). Transparent source texels (GIF) composite
+  over that black — the desktop never shows through in media mode; the
+  see-through-wallpaper trick remains a scene-mode feature.
+* **Bounded CPU placement**: cover-crop never materializes the placed
+  rect — a 100x10000 source under fill would be 1920x192000 — the
+  VISIBLE source sub-rect is converted directly into the viewport
+  (`rev_video_to_rgba_sub`), so allocation is bounded by the viewport.
+  All conversions go through a padded scratch: sws can spill up to one
+  extra output row past the last (measured: 8 u32 past the final row on
+  sub-rect SIMD paths; FFmpeg-internal, varies by build). The tight
+  `rev_video_to_rgba()` wrapper carries its own padding — the historical
+  dw*dh-exact contract of every existing caller holds, and the latent
+  write-past-the-buffer hazard in the scene-layer path is closed.
+* **Playback**: the loop paces at the source's average frame rate
+  (`rev_video_fps()`), so uploads happen at video speed; the playhead
+  freezes while the surface is hidden (idle power-save) and resumes
+  exactly where it stopped. Looping wraps at the LAST FRAME'S END
+  (pts + duration), not when the decode queue drains — wrapping on a
+  queue drain truncates the final frame to a single tick.
+* **GPU tiers**: YUV frames ride the plane path (vsim); RGB-family
+  frames ride the standard pixel-layer path. The CPU tier converts
+  through the padded scratch and copies/composites into the framebuffer.
+* **IPC**: `PING`/`STATUS`/`QUIT` work; `STATUS` reports `mode=video`
+  with path/renderer/scale/loop; theme/playlist commands answer with a
+  clear "scene-mode-only" error.
+* `--once` + `--video` renders the first decoded frame offline (no
+  display server) with the requested scaling — the deterministic
+  pixel-test path (e2e: transparent GIF frame → opaque black;
+  `--scale fit` → black bars + placed content).
+* No hot reload in media mode (a changed video file is not re-opened
+  mid-playback); no audio, ever.
+
 ## 5. Measured on this sandbox (2-core, software GL, degraded window)
 
 * 320x180 H.264 30fps loop: decode thread CPU ≈ 2-4% of one core,

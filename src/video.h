@@ -83,9 +83,30 @@ bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh);
 
 /* The same, into a caller-placed rectangle: `dst` may sit at an offset
  * inside a larger buffer whose row length is `dst_stride` u32 ELEMENTS
- * (dst_stride >= dw). One conversion, no intermediate blit — the media
- * mode letterboxes straight into the framebuffer. */
+ * (dst_stride >= dw). One conversion, no intermediate blit.
+ *
+ * PADDING CONTRACT: sws may write up to ONE EXTRA OUTPUT ROW past the
+ * last (observed 8 u32 past the final row on sub-rect SIMD paths —
+ * FFmpeg-internal, varies by build). Callers of _at/_sub must provide
+ * dst_stride * (dh + 1) + 16 u32 of capacity. rev_video_to_rgba() wraps
+ * this with its own padding and keeps the exact dw*dh contract. */
 bool rev_video_to_rgba_at(const RVideoFrame *f, u32 *dst, u32 dst_stride,
                           u32 dw, u32 dh);
+
+/* Scales the SOURCE SUB-RECT [sx, sy, sw x sh] of the frame into dw x dh
+ * at dst (row length dst_stride u32 elements, same padding contract as
+ * _at). This is how cover-crop stays bounded on the CPU tier: instead
+ * of scaling 100x10000 to 1920x192000 and blitting the visible strip,
+ * the visible source region is scaled directly into the viewport.
+ * Chroma planes are offset by sx/2, sy/2 (rounded down). */
+bool rev_video_to_rgba_sub(const RVideoFrame *f, u32 sx, u32 sy,
+                           u32 sw, u32 sh, u32 *dst, u32 dst_stride,
+                           u32 dw, u32 dh);
+
+/* Playback pacing rate: the stream's average frame rate (Hz), falling
+ * back to the codec's declared rate, then to 30 — the media-mode render
+ * loop paces to this so uploads happen at source speed, not render
+ * speed. Set once at open; the loop-reopen path re-reads the same file. */
+f64 rev_video_fps(const RevVideo *v);
 
 #endif /* REV_VIDEO_H */

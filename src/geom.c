@@ -8,6 +8,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "cli.h"
+
 #define REV_PI 3.14159265358979323846
 
 /* --------------------------------------------------------------------------
@@ -407,4 +409,46 @@ void rpath_arc_to(RPath *p, f64 rx, f64 ry, f64 xrot_deg,
 		rpath_cubic_to(p, c1p, c2p, e2);
 		ang = ang2;
 	}
+}
+
+/* ---- media scaling (the --video modes) ------------------------------------ */
+
+RScaleRect rev_scale_place(int mode, u32 W, u32 H, u32 iw, u32 ih)
+{
+	RScaleRect r;
+	memset(&r, 0, sizeof r);
+	if (!W || !H || !iw || !ih)
+		return r;
+	const f64 fw = (f64)W, fh = (f64)H;
+	const f64 sw = (f64)iw, sh = (f64)ih;
+	switch (mode) {
+	case REV_SCALE_STRETCH:
+		r.w = W;
+		r.h = H;
+		r.dx = 0;
+		r.dy = 0;
+		break;
+	case REV_SCALE_CENTER:
+		r.w = iw;
+		r.h = ih;
+		r.dx = (i32)((fw - sw) / 2.0);
+		r.dy = (i32)((fh - sh) / 2.0);
+		break;
+	case REV_SCALE_FIT:
+	default: { /* REV_SCALE_FILL */
+		f64 s = (mode == REV_SCALE_FIT)
+		            ? (fw / sw < fh / sh ? fw / sw : fh / sh)
+		            : (fw / sw > fh / sh ? fw / sw : fh / sh);
+		u32 pw = (u32)(sw * s + 0.5);
+		u32 ph = (u32)(sh * s + 0.5);
+		if (pw < 1) pw = 1;
+		if (ph < 1) ph = 1;
+		r.w = pw;
+		r.h = ph;
+		r.dx = (i32)((fw - (f64)pw) / 2.0);
+		r.dy = (i32)((fh - (f64)ph) / 2.0);
+		break;
+	}
+	}
+	return r;
 }

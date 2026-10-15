@@ -308,6 +308,191 @@ else
     SKIP=$((SKIP+1))
 fi
 
+# ---- Media mode (--video): CLI contract, placement, playback, IPC ----------
+# Independent of the scene-video legs above: the GIF fixture is checked in
+# (tests/fixtures/gif_anim_transparent.gif), so these run wherever the
+# FFmpeg libraries are usable — and the refusal path is verified where
+# they are not (stub builds).
+GIF_FIX="tests/fixtures/gif_anim_transparent.gif"
+
+# CLI contract first: content-mode conflicts are deterministic, display-free
+MCOK=1
+./build/reverie --video x.mp4 --scene y.rev >/dev/null 2>&1 && MCOK=0
+./build/reverie --scene y.rev --video x.mp4 >/dev/null 2>&1 && MCOK=0
+./build/reverie --video x.mp4 positional.rev >/dev/null 2>&1 && MCOK=0
+./build/reverie --scale fill >/dev/null 2>&1 && MCOK=0
+./build/reverie --no-loop >/dev/null 2>&1 && MCOK=0
+./build/reverie --video x.mp4 --scale bogus >/dev/null 2>&1 && MCOK=0
+if [ "$MCOK" = 1 ]; then
+    echo "    media(cli):   PASS (content-mode conflicts rejected)"
+    PASS=$((PASS+1))
+else
+    echo "    media(cli):   FAIL (a conflicting command line was accepted)"
+    FAIL=$((FAIL+1))
+fi
+
+# probe: does this build's video stack open the GIF at all?
+VMEDIA=probe
+if ./build/reverie --video "$GIF_FIX" -o -s 8x8 -O "$OUT/vprobe.png" \
+        > "$OUT/vprobe.log" 2>&1; then
+    VMEDIA=ok
+else
+    # refused (stub build / unusable libraries): must be a CLEAN refusal
+    if grep -q "no video support\|cannot open" "$OUT/vprobe.log" 2>/dev/null; then
+        VMEDIA=refused
+    else
+        VMEDIA=broken
+    fi
+fi
+
+if [ "$VMEDIA" = "refused" ]; then
+    echo "    media:        SKIP (video support refused in this build)"
+    SKIP=$((SKIP+1))
+elif [ "$VMEDIA" = "broken" ]; then
+    echo "    media:        FAIL (probe crashed instead of refusing)"
+    cat "$OUT/vprobe.log"
+    FAIL=$((FAIL+1))
+else
+    # offline placement: --once with the transparent GIF frame 0 must be
+    # fully opaque black (transparency composites over the black bg)
+    ./build/reverie --video "$GIF_FIX" -o -s 160x120 -O "$OUT/monce.png" \
+        > "$OUT/monce.log" 2>&1
+    if python3 -c "
+import struct, zlib, sys
+d = open('$OUT/monce.png','rb').read(); pos, idat = 8, b''
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+    if typ == b'IDAT': idat += d[pos:pos+ln]
+    pos += ln + 4
+raw = zlib.decompress(idat); stride = 160*4+1
+ok = True
+for y in range(0, 120, 7):
+    for x in range(0, 160, 33):
+        if tuple(raw[y*stride+1+x*4:y*stride+5+x*4]) != (0,0,0,255): ok = False
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+        echo "    media(once):  PASS (transparent gif frame -> opaque black)"
+        PASS=$((PASS+1))
+    else
+        echo "    media(once):  FAIL (transparent texels did not composite black)"
+        FAIL=$((FAIL+1))
+    fi
+
+    # offline placement with --scale fit: letterbox bars must be black and
+    # the video area must carry the solid fixture color
+    if command -v ffmpeg >/dev/null 2>&1; then
+        ffmpeg -y -loglevel error -f lavfi -i "color=c=0x0080FF:s=400x100:r=10" \
+            -t 1 -pix_fmt yuv420p -c:v libx264 -preset ultrafast \
+            "$OUT/solid.mp4" 2>/dev/null
+        ./build/reverie --video "$OUT/solid.mp4" --scale fit -o -s 200x100 \
+            -O "$OUT/mfit.png" > "$OUT/mfit.log" 2>&1
+        if python3 -c "
+import struct, zlib, sys
+d = open('$OUT/mfit.png','rb').read(); pos, idat = 8, b''
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+    if typ == b'IDAT': idat += d[pos:pos+ln]
+    pos += ln + 4
+raw = zlib.decompress(idat); stride = 200*4+1
+def px(y, x): return tuple(raw[y*stride+1+x*4:y*stride+5+x*4])
+bar = px(2, 100) == (0,0,0,255) and px(97, 100) == (0,0,0,255)
+mid = px(50, 100)
+col = abs(mid[0]) < 12 and 110 < mid[1] < 145 and abs(mid[2]-255) < 12
+sys.exit(0 if bar and col else 1)
+" 2>/dev/null; then
+            echo "    media(fit):   PASS (letterbox bars black, video placed)"
+            PASS=$((PASS+1))
+        else
+            echo "    media(fit):   FAIL (--scale fit placement wrong)"
+            FAIL=$((FAIL+1))
+        fi
+        rm -f "$OUT/solid.mp4"
+    else
+        echo "    media(fit):   SKIP (no ffmpeg CLI for the solid fixture)"
+        SKIP=$((SKIP+1))
+    fi
+
+    # live playback under Xvfb: CPU tier — the red frame (t in [0.5,1.0))
+    # must reach the compositor; --fps 10 keeps the shot timing inside it
+    start_xvfb
+    DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --fps 10 \
+        --video "$GIF_FIX" --shot 0.75 "$OUT/mtv" > "$OUT/mtv.log" 2>&1 || true
+    stop_xvfb
+    if grep -q "video mode" "$OUT/mtv.log" 2>/dev/null \
+       && python3 -c "
+import struct, zlib, sys
+d = open('$OUT/mtv.png','rb').read(); pos, idat = 8, b''
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+    if typ == b'IDAT': idat += d[pos:pos+ln]
+    pos += ln + 4
+w = struct.unpack('>I', d[16:20])[0]; h = struct.unpack('>I', d[20:24])[0]
+raw = zlib.decompress(idat); stride = w*4+1
+r = g = b = n = 0
+for y in range(0, h, 11):
+    for x in range(0, w, 47):
+        p = raw[y*stride+1+x*4:y*stride+5+x*4]
+        r += p[0]; g += p[1]; b += p[2]; n += 1
+# red frame: strong red dominance (allow slight compositor attenuation)
+sys.exit(0 if n and r/n > 180 and g/n < 70 and b/n < 70 else 1)
+" 2>/dev/null; then
+        echo "    media(cpu):   PASS (gif playback reaches the display)"
+        PASS=$((PASS+1))
+    else
+        echo "    media(cpu):   FAIL (no visible red frame during playback)"
+        cat "$OUT/mtv.log"
+        FAIL=$((FAIL+1))
+    fi
+
+    # GL tier: the RGBA pixel-layer path (same red-frame evidence)
+    start_xvfb
+    DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R opengl --fps 10 \
+        --video "$GIF_FIX" --shot 0.75 "$OUT/mtvgl" > "$OUT/mtvgl.log" 2>&1 || true
+    stop_xvfb
+    if grep -q "renderer: opengl" "$OUT/mtvgl.log" 2>/dev/null \
+       && [ -f "$OUT/mtvgl.png" ]; then
+        echo "    media(gl):    PASS (GPU pixel-layer playback)"
+        PASS=$((PASS+1))
+    elif grep -q "renderer: opengl" "$OUT/mtvgl.log" 2>/dev/null; then
+        echo "    media(gl):    FAIL (GL tier produced no frame)"
+        cat "$OUT/mtvgl.log"
+        FAIL=$((FAIL+1))
+    else
+        echo "    media(gl):    SKIP (no libEGL / GL vendor on this system)"
+        SKIP=$((SKIP+1))
+    fi
+
+    # media-mode IPC: PING/STATUS (mode=video)/QUIT through the socket
+    start_xvfb
+    MSOCK="$OUT/media.sock"
+    DISPLAY="$XDISPLAY" REV_IPC_SOCK="$MSOCK" timeout 16 ./build/reverie -R cpu \
+        --video "$GIF_FIX" > "$OUT/mipc.log" 2>&1 &
+    MPID=$!
+    sleep 2
+    ./build/revtool ipc -s "$MSOCK" PING > "$OUT/mipc1.out" 2>&1
+    ./build/revtool ipc -s "$MSOCK" STATUS > "$OUT/mipc2.out" 2>&1
+    ./build/revtool ipc -s "$MSOCK" "THEME themes/ripple-lake" > "$OUT/mipc3.out" 2>&1
+    ./build/revtool ipc -s "$MSOCK" QUIT > "$OUT/mipc4.out" 2>&1
+    sleep 1
+    MIP=1
+    grep -q "OK PONG" "$OUT/mipc1.out" 2>/dev/null || MIP=0
+    grep -q "mode=video" "$OUT/mipc2.out" 2>/dev/null || MIP=0
+    grep -q "ERR" "$OUT/mipc3.out" 2>/dev/null || MIP=0
+    grep -q "shutting down" "$OUT/mipc.log" 2>/dev/null || MIP=0
+    kill -0 $MPID 2>/dev/null && MIP=0
+    if [ "$MIP" = 1 ]; then
+        echo "    media(ipc):   PASS (ping/status mode=video/theme-refused/quit)"
+        PASS=$((PASS+1))
+    else
+        echo "    media(ipc):   FAIL (media control session incomplete)"
+        cat "$OUT/mipc.log" "$OUT/mipc1.out" "$OUT/mipc2.out" \
+            "$OUT/mipc3.out" "$OUT/mipc4.out" 2>/dev/null
+        kill $MPID 2>/dev/null; wait $MPID 2>/dev/null
+        FAIL=$((FAIL+1))
+    fi
+    stop_xvfb
+fi
+
 # ---- Vulkan tier: GPU compute compositing, platform present -----------------
 # The tier composites every layer as a compute kernel; the finished frame is
 # copied out and presented via wl_shm/MIT-SHM.

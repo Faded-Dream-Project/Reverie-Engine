@@ -186,11 +186,23 @@ reverie [options] <scene.rev | theme dir | theme.revpack>
 reverie themes/ripple-lake            # folder theme (hot-reloads)
 reverie ripple-lake.revpack           # packed theme — no extraction
 reverie --scene themes/ripple-lake    # the same, spelled out
+reverie --video loops/waves.mp4       # media mode: video/GIF wallpaper
+reverie --video loop.gif --scale fit  # letterbox instead of cover-crop
+reverie --video demo.mp4 --no-loop    # hold the last frame at EOF
 
 Scene layers: image, gradient, solid, fluid, ripple, particles, video —
 with blend modes, blur, opacity, parallax, monitor selection, and
 keyframe animations. Video layers: `type = video; src = "loop.mp4";
 loop = true; paused = false; fit = fill`.
+
+The `--video` media mode is fully independent of the scene system: it
+needs no `.rev` file, and scenes need no FFmpeg. It reuses the same
+backends, renderers, IPC socket, screenshot hook and idle power-save
+(payback freezes while hidden); media placement is `--scale
+fill|fit|stretch|center` (default fill — cover and crop), letterbox
+bars are opaque black, and playback paces at the source's own frame
+rate. `THEME`/playlist IPC commands report a clear error in media mode;
+`PING`/`STATUS`/`QUIT` work as usual.
 
 revtool validate <scene.rev | theme>  # check a scene or theme
 revtool render  <scene.rev> ...       # offline PNG rendering (with simulated

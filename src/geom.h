@@ -29,6 +29,22 @@ RMat rmat_rotate_at(f64 radians, f64 cx, f64 cy);
 RMat rmat_skew_x(f64 radians);
 RMat rmat_skew_y(f64 radians);
 
+/* ---- media scaling (the --video modes) ---------------------------------
+ * Placement of an iw x ih source inside a W x H viewport, in DEVICE
+ * pixels. fill covers and center-crops (negative offsets are legal and
+ * mean "cropped by the viewport"); fit contains and centers (the bars
+ * around it are the caller's clear color); stretch ignores aspect;
+ * center keeps native size, centered, cropping symmetrically when the
+ * source exceeds the viewport. Kept separate from the scene layer `fit`
+ * vocabulary on purpose: scenes own their coordinate semantics.
+ * ------------------------------------------------------------------------*/
+typedef struct {
+	u32 w, h;            /* placed size                                  */
+	i32 dx, dy;          /* top-left offset into the viewport (may be <0) */
+} RScaleRect;
+
+RScaleRect rev_scale_place(int mode, u32 W, u32 H, u32 iw, u32 ih);
+
 /* ---- path --------------------------------------------------------------------
  * Paths are sequences of segments; curve segments reference the implicit
  * current point (standard vector-path model). Stored in an arena owned by

@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "arena.h"
 #include "cli.h"
+#include "geom.h"
 #include "ipc.h"
 #include "log.h"
 #include "pack.h"
@@ -25,6 +27,7 @@
 #include "scene.h"
 #include "theme.h"
 #include "util.h"
+#include "video.h"
 
 static volatile sig_atomic_t g_run = 1;
 
@@ -70,12 +73,21 @@ static void usage(void)
 "reverie " REV_VERSION " — interactive wallpaper engine\n"
 "\n"
 "usage: reverie [options] <scene.rev | theme dir | theme.revpack>\n"
+"       reverie [options] --video <file.mp4 | file.gif | ...>\n"
 "\n"
 "options:\n"
 "  -R, --renderer R    force renderer: auto | vulkan | opengl | cpu\n"
 "  -B, --backend B     force backend: auto | x11 | wayland\n"
 "      --scene PATH    explicit scene/theme path (same slot as the\n"
 "                       positional; giving both is an error)\n"
+"      --video PATH    media mode: play a video / animated GIF as the\n"
+"                       wallpaper (independent of .rev scenes; needs the\n"
+"                       FFmpeg libraries at runtime, which are OPTIONAL\n"
+"                       at build time)\n"
+"      --scale MODE    media placement: fill (cover, crop — default) |\n"
+"                       fit (letterbox) | stretch | center (native size)\n"
+"      --no-loop       media mode: hold the last frame at end-of-file\n"
+"                       instead of looping (the default loops)\n"
 "      --exit-if-running\n"
 "                       exit 0 when another daemon already owns the\n"
 "                       control socket — the duplicate-instance guard\n"
@@ -585,6 +597,248 @@ static void ipc_handler(void *ctx, const IpcMsg *msg, IpcReply *rep)
         }
 }
 
+/* ---- media mode (--video): playback state, IPC, placement ------------------- */
+
+static const char *scale_name(int mode)
+{
+        switch (mode) {
+        case REV_SCALE_FIT:      return "fit";
+        case REV_SCALE_STRETCH:  return "stretch";
+        case REV_SCALE_CENTER:   return "center";
+        default:                 return "fill";
+        }
+}
+
+typedef struct {
+        const char *path;      /* the media file                        */
+        bool loop;
+        int scale;
+        RRenderer *rend;
+        RPlatform *plat;
+        volatile int *run;     /* QUIT clears it                        */
+} MediaIpc;
+
+/* The media-mode IPC subset: PING/STATUS/QUIT work everywhere; the theme
+ * machinery is scene-mode-only and reports that clearly instead of
+ * silently doing nothing. */
+static void ipc_handler_media(void *ctx, const IpcMsg *msg, IpcReply *rep)
+{
+        MediaIpc *m = (MediaIpc *)ctx;
+        const char *cmd = msg->argv[0];
+
+        rep->ok = false;
+        snprintf(rep->text, sizeof rep->text, "?");
+
+        if (!strcmp(cmd, "PING")) {
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "PONG");
+        } else if (!strcmp(cmd, "STATUS")) {
+                bool vis = !m->plat->surface_visible ||
+                           m->plat->surface_visible(m->plat);
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text,
+                         "mode=video path=%.200s renderer=%s backend=%s "
+                         "visible=%d scale=%s loop=%d",
+                         m->path, m->rend->name, m->plat->name,
+                         vis ? 1 : 0, scale_name(m->scale), m->loop ? 1 : 0);
+        } else if (!strcmp(cmd, "QUIT")) {
+                rep->ok = true;
+                snprintf(rep->text, sizeof rep->text, "bye");
+                *m->run = 0;
+                LOGI("ipc: QUIT — shutting down");
+        } else {
+                snprintf(rep->text, sizeof rep->text,
+                         "scene-mode-only command (media mode: restart "
+                         "with a scene to use %s)", cmd);
+        }
+}
+
+/* Media-mode scratch (grown on demand, bounded by the viewport because
+ * cropped placements only convert the VISIBLE region). One video: one
+ * scratch is enough; freed by media_scratch_free() at exit. */
+static u32 *g_media_scratch;
+static size_t g_media_scratch_cap;      /* u32 elements */
+
+static void media_scratch_free(void)
+{
+        free(g_media_scratch);
+        g_media_scratch = NULL;
+        g_media_scratch_cap = 0;
+}
+
+static bool media_scratch_grow(size_t need_u32)
+{
+        if (need_u32 <= g_media_scratch_cap)
+                return true;
+        u32 *np = (u32 *)realloc(g_media_scratch, need_u32 * 4);
+        if (!np)
+                return false;
+        g_media_scratch = np;
+        g_media_scratch_cap = need_u32;
+        return true;
+}
+
+/* The visible region of a placed rect, in both destination and source
+ * coordinates. Bounds every allocation to the viewport: a 100x10000
+ * source under fill would scale to 1920x192000 — the visible strip is
+ * converted instead, never the whole placed rect. */
+typedef struct {
+        i32 dx0, dy0;          /* destination top-left (>= 0)             */
+        u32 dw, dh;            /* visible size (<= viewport)             */
+        u32 sx, sy, sw, sh;    /* source region mapping onto it          */
+} RMediaClip;
+
+static bool media_visible_rect(const RVideoFrame *vf, const RScaleRect *r,
+                               u32 W, u32 H, RMediaClip *c)
+{
+        const i32 dx1 = (i32)W < r->dx + (i32)r->w ? (i32)W : r->dx + (i32)r->w;
+        const i32 dy1 = (i32)H < r->dy + (i32)r->h ? (i32)H : r->dy + (i32)r->h;
+        c->dx0 = r->dx > 0 ? r->dx : 0;
+        c->dy0 = r->dy > 0 ? r->dy : 0;
+        if (dx1 <= c->dx0 || dy1 <= c->dy0)
+                return false;
+        c->dw = (u32)(dx1 - c->dx0);
+        c->dh = (u32)(dy1 - c->dy0);
+        const f64 kx = (f64)vf->w / (f64)r->w;    /* source px per placed px */
+        const f64 ky = (f64)vf->h / (f64)r->h;
+        c->sx = (u32)(((f64)c->dx0 - (f64)r->dx) * kx + 0.5);
+        c->sy = (u32)(((f64)c->dy0 - (f64)r->dy) * ky + 0.5);
+        c->sw = (u32)((f64)c->dw * kx + 0.5);
+        c->sh = (u32)((f64)c->dh * ky + 0.5);
+        if (c->sx + c->sw > vf->w) c->sw = vf->w > c->sx ? vf->w - c->sx : 0;
+        if (c->sy + c->sh > vf->h) c->sh = vf->h > c->sy ? vf->h - c->sy : 0;
+        return c->sw && c->sh;
+}
+
+/* Places a video frame into a CPU framebuffer under a scaling mode. The
+ * pre-clear is the letterbox/pillarbox color (black).
+ *
+ * EVERYTHING goes through the padded scratch: sws can spill up to one
+ * extra output row past the last (observed 8 u32 on sub-rect SIMD paths
+ * — an FFmpeg-internal behavior that varies by build), so conversions
+ * never target the framebuffer directly. The scratch is bounded by the
+ * VISIBLE region, which is bounded by the viewport — a 100x10000 source
+ * under fill converts the visible strip, not a 1920x192000 intermediate.
+ *
+ * Media mode uses video-player semantics: the background is OPAQUE
+ * black — letterbox/pillarbox bars are black (not see-through to the
+ * desktop), and transparent source texels (animated GIFs) composite
+ * over that black. Scenes keep the opposite convention (transparent
+ * background = desktop shows through); the two modes stay separate by
+ * design.
+ *
+ * YUV frames carry no alpha — the row copy into the framebuffer IS the
+ * composite against black. RGB-family frames may carry transparency
+ * (animated GIFs); they go through the engine compositor so a
+ * transparent texel shows the black background instead of leaking its
+ * underlying RGB. */
+static void place_media_rgba(const RVideoFrame *vf, int mode, RFb *fb)
+{
+        const u32 W = fb->w, H = fb->h;
+        /* opaque black, not transparent: the bars are BLACK on every
+         * renderer, byte-identically */
+        for (size_t i = 0; i < (size_t)W * H; i++)
+                fb->px[i] = 0xFF000000u;
+        if (!vf || !vf->w || !vf->h)
+                return;
+        RScaleRect r = rev_scale_place(mode, W, H, vf->w, vf->h);
+        RMediaClip c;
+        if (!media_visible_rect(vf, &r, W, H, &c))
+                return;
+        if (!media_scratch_grow((size_t)c.dw * (c.dh + 1) + 16))
+                return;
+        if (!rev_video_to_rgba_sub(vf, c.sx, c.sy, c.sw, c.sh,
+                                   g_media_scratch, c.dw, c.dw, c.dh))
+                return;
+        if (vf->rgb) {
+                RFb src = { g_media_scratch, c.dw, c.dh };
+                rev_comp_blend_at(fb, &src, c.dx0, c.dy0,
+                                  REV_BLEND_NORMAL, 1.0);
+        } else {
+                for (u32 y = 0; y < c.dh; y++)
+                        memcpy(fb->px + (size_t)(c.dy0 + (i32)y) * W + (u32)c.dx0,
+                               g_media_scratch + (size_t)y * c.dw,
+                               (size_t)c.dw * 4);
+        }
+}
+
+/* One media frame through the active renderer. GPU tiers receive a
+ * single layer command (YUV planes as vsim, RGBA frames as a pixel
+ * layer); the CPU tier converts straight into the framebuffer. A frame
+ * that is not decoded yet still presents — black on the CPU tier, the
+ * cleared accumulation on GPU tiers — so the compositor always has a
+ * buffer. `vd` must be address-stable across frames (renderers key
+ * per-layer GPU state on the descriptor's address). */
+static void render_media_frame(RRenderer *rend, const RVideoFrame *vf,
+                               int mode, RFb *fb, int win)
+{
+        const u32 W = fb->w, H = fb->h;
+        const bool gpu_layers = rend->wants_layers && rend->wants_video;
+        if (!gpu_layers) {
+                if (!rend->begin(rend, win, W, H))
+                        return;
+                place_media_rgba(vf, mode, fb);
+                rend->end(rend, fb);
+                return;
+        }
+        if (!rend->begin(rend, win, W, H))
+                return;
+        /* opaque black background first — the same 1x1-black-layer trick
+         * the theme fade uses (cached upload, reserved id next to it), so
+         * GPU-tier letterbox bars are black exactly like the CPU tier's
+         * and transparent source texels composite over black, never
+         * through to the desktop */
+        {
+                static const u32 black_px[1] = { 0xFF000000u };
+                RLayerCmd bg;
+                memset(&bg, 0, sizeof bg);
+                bg.px = black_px;
+                bg.w = 1;
+                bg.h = 1;
+                bg.place_w = W;
+                bg.place_h = H;
+                bg.blend = REV_BLEND_NORMAL;
+                bg.opacity = 1.0;
+                bg.linear = false;
+                bg.content_id = REV_FADE_CID - 1;
+                rend->layer(rend, &bg);
+        }
+        if (vf && vf->w) {
+                static RSimVideo vd;    /* one video: one stable descriptor */
+                RScaleRect r = rev_scale_place(mode, W, H, vf->w, vf->h);
+                RLayerCmd cmd;
+                memset(&cmd, 0, sizeof cmd);
+                if (vf->rgb) {
+                        cmd.px = (const u32 *)vf->rgba;
+                        cmd.w = vf->w;
+                        cmd.h = vf->h;
+                } else {
+                        vd.y = vf->y;
+                        vd.u = vf->u;
+                        vd.v = vf->v;
+                        vd.ls_y = vf->ls_y;
+                        vd.ls_u = vf->ls_u;
+                        vd.ls_v = vf->ls_v;
+                        vd.w = vf->w;
+                        vd.h = vf->h;
+                        cmd.vsim = &vd;
+                        cmd.w = vf->w;
+                        cmd.h = vf->h;
+                }
+                cmd.place_w = r.w;
+                cmd.place_h = r.h;
+                cmd.dx = r.dx;
+                cmd.dy = r.dy;
+                cmd.blend = REV_BLEND_NORMAL;
+                cmd.opacity = 1.0;
+                cmd.blur = 0.0;
+                cmd.linear = true;
+                cmd.content_id = 0;
+                rend->layer(rend, &cmd);
+        }
+        rend->end(rend, NULL);
+}
+
 int main(int argc, char **argv)
 {
         char err[512] = { 0 };
@@ -655,25 +909,41 @@ int main(int argc, char **argv)
                 return 0;
         }
 
-        if (!scene_path) {
+        if (!scene_path && !a.video_path) {
                 usage();
                 return 1;
         }
 
         LOGI("reverie %s — backend=%s renderer=%s", REV_VERSION, backend_pref, renderer_pref);
 
+        /* ---- content: a scene/theme, or the --video media mode ---------- */
+        const bool media = a.video_path != NULL;
         SceneFile sf;
         memset(&sf, 0, sizeof sf);
-        char *base_dir = rev_path_dirname(scene_path);
-        if (!scene_load(&sf, scene_path, base_dir, err, sizeof err)) {
-                fprintf(stderr, "reverie: %s\n", err);
-                free(base_dir);
-                return 1;
+        char *base_dir = NULL;
+        RevVideo *vid = NULL;
+        if (media) {
+                RVideoSource vsrc = { .path = a.video_path };
+                vid = rev_video_open(&vsrc, !a.no_loop, err, sizeof err);
+                if (!vid) {
+                        fprintf(stderr, "reverie: %s\n", err);
+                        return 1;
+                }
+                LOGI("media '%s': video mode, scale=%s, loop=%s",
+                     a.video_path, scale_name(a.scale),
+                     a.no_loop ? "off (hold last frame at EOF)" : "on");
+        } else {
+                base_dir = rev_path_dirname(scene_path);
+                if (!scene_load(&sf, scene_path, base_dir, err, sizeof err)) {
+                        fprintf(stderr, "reverie: %s\n", err);
+                        free(base_dir);
+                        return 1;
+                }
+                LOGI("scene '%s': %d layer(s), %d fps, %s%s",
+                     scene_path, rtscene_layer_count(sf.sc), rtscene_fps(sf.sc),
+                     rtscene_is_animated(sf.sc) ? "animated" : "static",
+                     sf.pack_used ? " [packed]" : "");
         }
-        LOGI("scene '%s': %d layer(s), %d fps, %s%s",
-             scene_path, rtscene_layer_count(sf.sc), rtscene_fps(sf.sc),
-             rtscene_is_animated(sf.sc) ? "animated" : "static",
-             sf.pack_used ? " [packed]" : "");
         if (fps_override > 0)
                 LOGI("fps override: %d", fps_override);
 
@@ -684,16 +954,33 @@ int main(int argc, char **argv)
                         fprintf(stderr, "reverie: out of memory\n");
                         return 1;
                 }
-                rtscene_render(sf.sc, &fb, 0, 0.0, 1.0 / 60.0);
+                if (media) {
+                        /* first decoded frame, placed per --scale; the
+                         * decode thread needs a moment to start */
+                        const RVideoFrame *vf = NULL;
+                        for (int i = 0; i < 100 && !vf; i++) {
+                                vf = rev_video_display(vid, 0.0);
+                                usleep(2000);
+                        }
+                        place_media_rgba(vf, a.scale, &fb);
+                } else {
+                        rtscene_render(sf.sc, &fb, 0, 0.0, 1.0 / 60.0);
+                }
                 RevImage img = { out_w, out_h, fb.px };
                 if (!rev_png_encode_file(out_png, &img, err, sizeof err)) {
                         fprintf(stderr, "reverie: %s\n", err);
+                        free(fb.px);
+                        if (vid)
+                                rev_video_close(vid);
+                        free(base_dir);
                         return 1;
                 }
                 printf("wrote %s (%ux%u)\n", out_png, out_w, out_h);
                 free(fb.px);
-                rtscene_free(sf.sc);
-                arena_destroy(sf.ir_arena);
+                if (vid)
+                        rev_video_close(vid);
+                media_scratch_free();
+                scene_file_free(&sf);
                 free(base_dir);
                 return 0;
         }
@@ -747,12 +1034,9 @@ int main(int argc, char **argv)
                 for (int i = 0; i < nmon; i++)
                         free(fbs[i].px);
                 platform_destroy(plat);
-                rtscene_free(sf.sc);
-                if (sf.pack_used)
-                        rev_pack_free(&sf.pack);
-                if (sf.theme)
-                        theme_free(sf.theme);
-                arena_destroy(sf.ir_arena);
+                if (vid)
+                        rev_video_close(vid);
+                scene_file_free(&sf);
                 free(base_dir);
                 return 1;
         }
@@ -766,25 +1050,25 @@ int main(int argc, char **argv)
                 for (int i = 0; i < nmon; i++)
                         free(fbs[i].px);
                 platform_destroy(plat);
-                rtscene_free(sf.sc);
-                if (sf.pack_used)
-                        rev_pack_free(&sf.pack);
-                if (sf.theme)
-                        theme_free(sf.theme);
-                arena_destroy(sf.ir_arena);
+                if (vid)
+                        rev_video_close(vid);
+                scene_file_free(&sf);
                 free(base_dir);
                 return 1;
         }
 
         /* sim offload: only when the renderer owns simulations (GL tier with
          * float render targets) — the scene then skips the CPU fluid/ripple
-         * solvers entirely and emits GPU descriptors instead */
+         * solvers entirely and emits GPU descriptors instead. Media mode
+         * has no scene — its GPU path is decided per frame in
+         * render_media_frame(). */
         const bool sim_offload = rend->wants_sims;
-        const bool gpu_layers = rend->wants_layers && rtscene_gpu_capable(sf.sc, sim_offload);
-        if (rend->wants_layers && !gpu_layers)
+        const bool gpu_layers = !media && rend->wants_layers &&
+                                rtscene_gpu_capable(sf.sc, sim_offload);
+        if (!media && rend->wants_layers && !gpu_layers)
                 LOGI("scene needs CPU compositing (ripple layers need GPU sims "
                      "this renderer declined)");
-        if (gpu_layers)
+        if (!media && gpu_layers)
                 LOGI("simulations: %s",
                      sim_offload ? "GPU (no per-pixel CPU work)"
                                  : "CPU (renderer declined GPU sims)");
@@ -806,13 +1090,22 @@ int main(int argc, char **argv)
 
         /* ---- runtime IPC: theme switching / playlists / QUIT ------------------
          * REV_IPC=0 opts out. A live socket owned by another daemon is left
-         * alone ("in-use") — this instance just runs without control. */
+         * alone ("in-use") — this instance just runs without control.
+         * Media mode serves its own PING/STATUS/QUIT subset. */
         IpcState st;
         memset(&st, 0, sizeof st);
         st.sf = &sf;
         st.rend = rend;
         st.plat = plat;
         st.run = &g_run;
+        MediaIpc mipc;
+        memset(&mipc, 0, sizeof mipc);
+        mipc.path = a.video_path;
+        mipc.loop = !a.no_loop;
+        mipc.scale = a.scale;
+        mipc.rend = rend;
+        mipc.plat = plat;
+        mipc.run = &g_run;
         {
                 const char *fm = getenv("REV_FADE_MS");
                 st.fade_ms_default = (fm && *fm) ? atof(fm) : 400.0;
@@ -1050,11 +1343,15 @@ int main(int argc, char **argv)
 
                 /* runtime IPC: bounded non-blocking pump — theme switches,
                  * playlist commands and QUIT arrive here (works while hidden
-                 * too: the loop still ticks at the idle pace). */
+                 * too: the loop still ticks at the idle pace). Media mode
+                 * serves its PING/STATUS/QUIT subset. */
                 if (ipc) {
-                        ipc_serve_poll(ipc, ipc_handler, &st);
+                        if (media)
+                                ipc_serve_poll(ipc, ipc_handler_media, &mipc);
+                        else
+                                ipc_serve_poll(ipc, ipc_handler, &st);
                         fade_advance(&st, now);
-                        if (st.rotate_s > 0 && st.pl_n > 0 &&
+                        if (!media && st.rotate_s > 0 && st.pl_n > 0 &&
                             now - st.last_advance >= st.rotate_s) {
                                 char rerr[512] = { 0 };
                                 int r = playlist_advance(&st, 1, now,
@@ -1085,15 +1382,17 @@ int main(int argc, char **argv)
                                         fbs[i].px = (u32 *)calloc((size_t)nw * nh, 4);
                                         plat->resize_window(plat, winidx[i], g);
                                         rend->resize(rend, i, nw, nh);
-                                        rtscene_flush_caches(sf.sc);
+                                        if (!media)
+                                                rtscene_flush_caches(sf.sc);
                                 }
                         }
                 }
 
                 /* pointer (consume-on-read: dx/dy and click edges are each
-                 * delivered exactly once by the platform layer) */
+                 * delivered exactly once by the platform layer) — scenes
+                 * only; media playback has no interaction */
                 RPointerState ptr;
-                if (plat->pointer(plat, &ptr)) {
+                if (!media && plat->pointer(plat, &ptr)) {
                         for (int i = 0; i < nmon; i++) {
                                 f64 lx = (ptr.x - mons[i].x) * fb_scale[i];
                                 f64 ly = (ptr.y - mons[i].y) * fb_scale[i];
@@ -1115,7 +1414,7 @@ int main(int argc, char **argv)
                  * 0.3 s + 0.2 s spacing) — same entry point a real click takes
                  * (rtscene_click), at the same device-pixel transform main.c
                  * applies to real clicks */
-                while (fc_next < fc_n && t >= fc_t[fc_next]) {
+                while (!media && fc_next < fc_n && t >= fc_t[fc_next]) {
                         for (int i = 0; i < nmon; i++)
                                 rtscene_click(sf.sc, i,
                                               fc_x[fc_next] * (f64)fbs[i].w,
@@ -1125,7 +1424,7 @@ int main(int argc, char **argv)
 
                 /* synthetic pointer (test hook): overrides the real one —
                  * benchmarks need a deterministic drag, not a resting cursor */
-                if (fake_ptr_speed > 0) {
+                if (!media && fake_ptr_speed > 0) {
                         f64 nx = 0.5 + 0.36 * sin(2.0 * M_PI * 0.13 * fake_ptr_speed * t);
                         f64 ny = 0.5 + 0.30 * sin(2.0 * M_PI * 0.21 * fake_ptr_speed * t);
                         for (int i = 0; i < nmon; i++) {
@@ -1142,14 +1441,22 @@ int main(int argc, char **argv)
                  * itself must carry the compositor probe (wsi_probe — one
                  * frozen-clock frame per idle tick) or an audit burst is
                  * running. wlshim's idle probe re-draws when the compositor
-                 * comes back, and the frozen scene clock resumes the scene
-                 * exactly where it stopped. */
+                 * comes back, and the frozen clock resumes the scene or the
+                 * video exactly where it stopped. */
                 if (render_now) {
+                        /* media mode: advance the playhead ONCE per frame
+                         * (frozen while hidden — dt is 0 above), then the
+                         * same per-monitor present machinery */
+                        const RVideoFrame *vf = media
+                                ? rev_video_display(vid, dt) : NULL;
                         for (int i = 0; i < nmon; i++) {
                                 if (winidx[i] < 0 || !fbs[i].px)
                                         continue;
                                 f64 r_t0 = rev_monotonic();
-                                if (gpu_layers) {
+                                if (media) {
+                                        render_media_frame(rend, vf, a.scale,
+                                                           &fbs[i], winidx[i]);
+                                } else if (gpu_layers) {
                                         fl.w = fbs[i].w;
                                         fl.h = fbs[i].h;
                                         fl.n = 0;
@@ -1279,8 +1586,10 @@ int main(int argc, char **argv)
                 /* hot reload — themes poll every file in the folder: a
                  * directory's own mtime never moves on an in-place edit,
                  * which silently killed theme hot-reload until now. Plain
-                 * .rev scenes and .revpacks keep the single-file check. */
-                if (now - last_reload_check > 0.5) {
+                 * .rev scenes and .revpacks keep the single-file check.
+                 * (Media mode has no hot reload — a changed video file is
+                 * not re-opened mid-playback; documented limitation.) */
+                if (!media && now - last_reload_check > 0.5) {
                         last_reload_check = now;
                         bool scene_changed;
                         if (sf.theme) {
@@ -1370,8 +1679,12 @@ int main(int argc, char **argv)
                  * flowing during the wait and (Wayland) the wake aligns with
                  * the compositor's repaint cycle instead of a blind nanosleep.
                  * A slow frame can no longer swallow the events that arrived
-                 * while it rendered. */
-                int fps = fps_override > 0 ? fps_override : rtscene_fps(sf.sc);
+                 * while it rendered. Media mode paces at the SOURCE rate
+                 * (uploads happen at video speed, not render speed). */
+                int fps = fps_override > 0
+                        ? fps_override
+                        : (media ? (int)(rev_video_fps(vid) + 0.5)
+                                 : rtscene_fps(sf.sc));
                 if (fps_override <= 0 && plat->monitor_refresh) {
                         /* cap scene fps to the fastest connected display — the
                          * extra frames could never be shown (they would just
@@ -1438,6 +1751,9 @@ int main(int argc, char **argv)
         for (int i = 0; i < nmon; i++)
                 free(fbs[i].px);
         platform_destroy(plat);
+        if (vid)
+                rev_video_close(vid);
+        media_scratch_free();
         scene_file_free(&sf);
         scene_file_free(&st.next);
         free(base_dir);

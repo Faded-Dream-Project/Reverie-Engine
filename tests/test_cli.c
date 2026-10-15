@@ -3,8 +3,8 @@
  * Unit tests for the extracted argument parser (src/cli.c): the historical
  * contract must hold byte-for-byte (positional scenes, --shot legacy form,
  * the NAME=VALUE env-var guard, every error message), plus the new
- * --scene and --exit-if-running options. The media-mode legs (--video,
- * --scale, --no-loop) land with the media mode itself.
+ * --scene, --exit-if-running, and the media-mode family (--video,
+ * --scale, --no-loop) with all its conflict rules.
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -148,6 +148,50 @@ int main(void)
         CHECK(rev_scale_mode("tile") < 0 && rev_scale_mode("") < 0 &&
               rev_scale_mode(NULL) < 0,
               "unknown scale names rejected (tile stays scene-only)");
+
+        /* ---- media mode: --video / --scale / --no-loop ------------------- */
+
+        CHECK(parse("--video loop.mp4", &a, err, sizeof err, &usage_hint) &&
+              !strcmp(a.video_path, "loop.mp4") && !a.scene_path &&
+              a.scale == REV_SCALE_FILL && !a.no_loop,
+              "--video sets the media slot (defaults: fill, loop)");
+        CHECK(!parse("--video a.mp4 --video b.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "multiple videos given"),
+              "--video twice rejected");
+        CHECK(!parse("--video a.mp4 --scene b.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--video + --scene rejected");
+        CHECK(!parse("--scene b.rev --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--scene + --video rejected (order independent)");
+        CHECK(!parse("--video a.mp4 b.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "positional after --video rejected");
+        CHECK(!parse("b.rev --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "positional before --video rejected");
+        CHECK(!parse("--scale fill", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--scale applies to --video media mode"),
+              "--scale without --video rejected");
+        CHECK(!parse("--no-loop", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--no-loop applies to --video media mode"),
+              "--no-loop without --video rejected");
+        CHECK(!parse("--video a.mp4 --scale bogus", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "bad --scale (want fill|fit|stretch|center)"),
+              "bad --scale value rejected");
+        CHECK(parse("--video a.mp4 --scale fit", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_FIT,
+              "--scale fit parses next to --video");
+        CHECK(parse("--video a.mp4 --scale center --no-loop", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_CENTER && a.no_loop,
+              "--scale center + --no-loop parse");
+        CHECK(parse("--video a.mp4 --exit-if-running -R cpu", &a, err, sizeof err, &usage_hint) &&
+              a.exit_if_running && !strcmp(a.renderer_pref, "cpu"),
+              "--video composes with the daemon flags");
+        CHECK(!parse("--video a.mp4 REV_VK_VALIDATE=1", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "looks like an environment variable") &&
+              strstr(err, "a video was already given"),
+              "env-var guard notes the earlier video");
 
         printf(failures ? "cli: %d FAILURE(S)\n" : "cli: OK\n", failures);
         return failures ? 1 : 0;

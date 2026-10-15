@@ -251,6 +251,10 @@ struct RevVideo {
                              * sources, memory-bounded for RGB sources  */
         AVFrame *cur;         /* frame being displayed (ref'd)            */
         f64 cur_pts;
+        f64 cur_end;          /* pts + duration of `cur` — the wrap check
+                               * needs the frame's END, not its start:
+                               * wrapping when the queue merely drains
+                               * truncates the last frame to one tick   */
         bool dead;            /* irrecoverable error / shutdown           */
         bool ended;           /* stream ended (non-loop)                  */
         bool wrap_pending;    /* loop mode: decoder hit EOF and waits for
@@ -271,6 +275,7 @@ struct RevVideo {
 
         /* display side (render thread) */
         f64 playhead;
+        f64 fps;              /* pacing rate, set once at open          */
         RVideoFrame disp;
 };
 
@@ -704,6 +709,22 @@ RevVideo *rev_video_open(const RVideoSource *src, bool loop,
                 v->qcap = by_mem < 2 ? 2 : (by_mem > VQ_MAX ? VQ_MAX : by_mem);
         }
 
+        /* pacing rate: the stream's average frame rate, else the codec's
+         * declared rate, else 30 — set before the thread spawns, never
+         * touched again (the loop-reopen path re-reads the same file) */
+        {
+                AVStream *st0 = v->fmt->streams[v->vstream];
+                AVRational fr = st0->avg_frame_rate;
+                f64 fps = (fr.num && fr.den) ? (f64)fr.num / (f64)fr.den : 0.0;
+                if (fps <= 0.0 || fps > 240.0) {
+                        fr = v->cdc->framerate;
+                        fps = (fr.num && fr.den) ? (f64)fr.num / (f64)fr.den : 0.0;
+                }
+                if (fps <= 0.0 || fps > 240.0)
+                        fps = 30.0;
+                v->fps = fps;
+        }
+
         v->pkt = g_ff.av_packet_alloc();
         if (!v->pkt) {
                 snprintf(err, errcap, "video: packet alloc failed");
@@ -820,6 +841,19 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
                                 g_ff.av_frame_unref(v->cur);
                                 g_ff.av_frame_ref(v->cur, f);
                                 v->cur_pts = pts;
+                                /* the frame's END drives the loop wrap:
+                                 * duration metadata when present, else one
+                                 * average frame period */
+                                {
+                                        f64 dur = f->duration > 0
+                                                ? pts_seconds(f->duration,
+                                                              st->time_base)
+                                                : -1.0;
+                                        if (dur <= 0.0 || dur > 10.0)
+                                                dur = v->fps > 0.0
+                                                        ? 1.0 / v->fps : 1.0 / 30.0;
+                                        v->cur_end = pts + dur;
+                                }
                                 if (v->cur->format == AV_PIX_FMT_RGBA) {
                                         /* normalized RGB-family frame:
                                          * packed straight-alpha RGBA8,
@@ -861,12 +895,14 @@ const RVideoFrame *rev_video_display(RevVideo *v, f64 dt)
                 pthread_cond_broadcast(&v->cv);
 
         /* loop wrap (consumer side): the decoder hit EOF and is asleep on
-         * wrap_pending. Once the queue is drained, the playhead is OURS
-         * to reset — this is the only place playback time wraps, so the
-         * decoder can never fast-forward or reset it mid-cycle. cur_pts
-         * resets too: the no-timestamp fallback derives the next pts
-         * from it and would otherwise start the new cycle 2 s in. */
-        if (v->wrap_pending && v->qn == 0) {
+         * wrap_pending. Wrap when the queue is drained AND the playhead has
+         * reached the last frame's END — wrapping on a mere queue drain
+         * truncates the final frame to a single tick (the last frame is
+         * consumed at its START; its duration still has to play out).
+         * cur_end == 0 covers "nothing ever decoded": wrap rather than
+         * deadlock the decoder's wait. cur_pts resets with the playhead —
+         * the no-timestamp fallback derives the next pts from it. */
+        if (v->wrap_pending && v->qn == 0 && v->playhead >= v->cur_end) {
                 v->playhead = 0;
                 v->cur_pts = -1e18;
                 v->wrap_pending = false;
@@ -933,8 +969,90 @@ bool rev_video_to_rgba_at(const RVideoFrame *f, u32 *dst, u32 dst_stride,
         return true;
 }
 
-/* Tight-buffer convenience wrapper (scene layers, tests). */
+/* Tight-buffer convenience wrapper (scene layers, tests). The direct
+ * at/sub conversions can spill up to one extra OUTPUT ROW past the last
+ * (observed: 8 u32 past the final row on sub-rect calls through sws's
+ * SIMD paths — an FFmpeg-internal behavior that varies by build and
+ * width), so callers of those must pad. This wrapper owns a padded
+ * internal buffer and copies out, keeping the historical dw*dh-exact
+ * contract every existing caller was written against. Single-threaded
+ * (render thread / --once only — never the decode thread). */
+static u32 *g_to_rgba_tmp;
+static size_t g_to_rgba_tmp_cap;      /* u32 elements */
+
 bool rev_video_to_rgba(const RVideoFrame *f, u32 *dst, u32 dw, u32 dh)
 {
-        return rev_video_to_rgba_at(f, dst, dw, dw, dh);
+        const size_t need = (size_t)dw * (dh + 1) + 16;
+        if (g_to_rgba_tmp_cap < need) {
+                u32 *np = (u32 *)realloc(g_to_rgba_tmp, need * 4);
+                if (!np)
+                        return false;
+                g_to_rgba_tmp = np;
+                g_to_rgba_tmp_cap = need;
+        }
+        if (!rev_video_to_rgba_at(f, g_to_rgba_tmp, dw, dw, dh))
+                return false;
+        memcpy(dst, g_to_rgba_tmp, (size_t)dw * dh * 4);
+        return true;
+}
+
+bool rev_video_to_rgba_sub(const RVideoFrame *f, u32 sx, u32 sy,
+                           u32 sw, u32 sh, u32 *dst, u32 dst_stride,
+                           u32 dw, u32 dh)
+{
+        if (!f || !dst || !dw || !dh || !g_ff_ok)
+                return false;
+        if (!sw || !sh || dst_stride < dw)
+                return false;
+        if (f->rgb) {
+                if (!f->rgba || f->ls_rgba < (int)(f->w * 4))
+                        return false;
+                if (sx + sw > f->w || sy + sh > f->h)
+                        return false;
+                const u8 *sub = f->rgba + (size_t)sy * (size_t)f->ls_rgba + (size_t)sx * 4;
+                struct SwsContext *sws = g_ff.sws_getContext(
+                        (int)sw, (int)sh, AV_PIX_FMT_RGBA,
+                        (int)dw, (int)dh, AV_PIX_FMT_RGBA,
+                        2 /* SWS_BILINEAR */, NULL, NULL, NULL);
+                if (!sws)
+                        return false;
+                const uint8_t *planes[1] = { sub };
+                const int strides[1] = { f->ls_rgba };
+                uint8_t *dstp = (uint8_t *)dst;
+                int dst_ls = (int)dst_stride * 4;
+                g_ff.sws_scale(sws, planes, strides, 0, (int)sh, &dstp, &dst_ls);
+                g_ff.sws_freeContext(sws);
+                return true;
+        }
+        /* YUV420P: chroma is half resolution — offset both planes; sws
+         * derives the chroma dimensions from the context's srcW/srcH */
+        if (!f->y || !f->u || !f->v)
+                return false;
+        if (sx + sw > f->w || sy + sh > f->h)
+                return false;
+        const u32 cx = sx / 2, cy = sy / 2;
+        struct SwsContext *sws = g_ff.sws_getContext((int)sw, (int)sh,
+                                                     AV_PIX_FMT_YUV420P,
+                                                     (int)dw, (int)dh,
+                                                     AV_PIX_FMT_RGBA,
+                                                     2 /* SWS_BILINEAR */,
+                                                     NULL, NULL, NULL);
+        if (!sws)
+                return false;
+        const uint8_t *planes[3] = {
+                f->y + (size_t)sy * (size_t)f->ls_y + (size_t)sx,
+                f->u + (size_t)cy * (size_t)f->ls_u + (size_t)cx,
+                f->v + (size_t)cy * (size_t)f->ls_v + (size_t)cx
+        };
+        const int strides[3] = { f->ls_y, f->ls_u, f->ls_v };
+        uint8_t *dstp = (uint8_t *)dst;
+        int dst_ls = (int)dst_stride * 4;
+        g_ff.sws_scale(sws, planes, strides, 0, (int)sh, &dstp, &dst_ls);
+        g_ff.sws_freeContext(sws);
+        return true;
+}
+
+f64 rev_video_fps(const RevVideo *v)
+{
+        return v ? v->fps : 0.0;
 }

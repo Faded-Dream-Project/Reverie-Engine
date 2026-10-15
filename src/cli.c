@@ -3,10 +3,10 @@
  * The argument parser (see cli.h). Behavior is byte-compatible with the
  * loop that used to live in main(): same option set, same accept/reject
  * messages, same legacy --shot N FILE form, same NAME=VALUE env-var guard.
- * New: --scene PATH (the explicit form of the positional) and
+ * Added: --scene PATH (the explicit form of the positional), --video PATH
+ * (the media mode, mutually exclusive with any scene), --scale
+ * fill|fit|stretch|center and --no-loop (media mode only), and
  * --exit-if-running (yield to a live daemon via the IPC probe).
- * The --video / --scale / --no-loop media-mode legs land with the media
- * mode itself; the RevArgs fields they fill already exist (cli.h).
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -22,7 +22,28 @@ static void set_scene(RevArgs *a, const char *path, char *err, size_t errcap)
                 snprintf(err, errcap, "multiple scenes given");
                 return;
         }
+        if (a->video_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --video and a scene "
+                         "cannot be combined");
+                return;
+        }
         a->scene_path = path;
+}
+
+static void set_video(RevArgs *a, const char *path, char *err, size_t errcap)
+{
+        if (a->video_path) {
+                snprintf(err, errcap, "multiple videos given");
+                return;
+        }
+        if (a->scene_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --video and a scene "
+                         "cannot be combined");
+                return;
+        }
+        a->video_path = path;
 }
 
 int rev_scale_mode(const char *name)
@@ -88,6 +109,33 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                         set_scene(a, argv[++i], err, errcap);
                         if (err[0])
                                 return false;
+                } else if (!strcmp(argv[i], "--video")) {
+                        NEED_VALUE(argv[i]);
+                        set_video(a, argv[++i], err, errcap);
+                        if (err[0])
+                                return false;
+                } else if (!strcmp(argv[i], "--scale")) {
+                        NEED_VALUE(argv[i]);
+                        const char *val = argv[++i];
+                        int m = rev_scale_mode(val);
+                        if (m < 0) {
+                                snprintf(err, errcap,
+                                         "bad --scale (want fill|fit|stretch|center)");
+                                return false;
+                        }
+                        if (!a->video_path) {
+                                snprintf(err, errcap,
+                                         "--scale applies to --video media mode");
+                                return false;
+                        }
+                        a->scale = m;
+                } else if (!strcmp(argv[i], "--no-loop")) {
+                        if (!a->video_path) {
+                                snprintf(err, errcap,
+                                         "--no-loop applies to --video media mode");
+                                return false;
+                        }
+                        a->no_loop = true;
                 } else if (!strcmp(argv[i], "--exit-if-running")) {
                         a->exit_if_running = true;
                 } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) {
@@ -151,6 +199,8 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                                          (int)(eq - argv[i] + 1), argv[i], argv[i],
                                          a->scene_path
                                                  ? " (a scene was already given)"
+                                         : a->video_path
+                                                 ? " (a video was already given)"
                                                  : "");
                                 return false;
                         }

@@ -234,7 +234,7 @@ int main(int argc, char **argv)
 				/* stride placement: convert into an offset rect of a wider
 				 * buffer — the letterbox path depends on it */
 				if (f && f->rgb) {
-					static u32 wide[100 * 60];
+					static u32 wide[100 * 61 + 16]; /* padded contract: +1 row */
 					memset(wide, 0xCD, sizeof wide);
 					bool ok = rev_video_to_rgba_at(f, wide + 5, 100, 80, 60);
 					CHECK(ok && wide[0] == 0xCDCDCDCDu,
