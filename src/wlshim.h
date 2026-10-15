@@ -30,7 +30,11 @@ int  wlshim_monitors(RRect *out, int max);
 f64  wlshim_monitor_scale(int mon);
 int  wlshim_monitor_refresh(int mon);   /* Hz, 0 unknown */
 int  wlshim_add_window(RRect geom);
-bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h);  /* unused in GPU mode */
+/* Present one CPU-readable frame through wl_shm. `premultiplied`: the bytes
+ * are already premultiplied against alpha (the Vulkan tier converts on the
+ * GPU) — the presenter then does a single memcpy; false = straight alpha and
+ * the presenter premultiplies per pixel itself (CPU tier path). */
+bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultiplied);
 void wlshim_pump(RPointerState *ptr);
 bool wlshim_pointer(RPointerState *out);
 bool wlshim_wait_frame(f64 seconds);

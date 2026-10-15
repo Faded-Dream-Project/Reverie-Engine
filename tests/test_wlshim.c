@@ -386,6 +386,11 @@ static bool closed_sent, pointer_sent, saw_configure_sent;
 static volatile int hold_releases;   /* test gate: server skips wl_buffer.release */
 static int frame_cb_replies;         /* wl_callback.done replies sent           */
 static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
+/* GPU-premul contract (vulkan tier hands premultiplied bytes): the next
+ * presented frame must appear in the pool VERBATIM — set before presenting,
+ * consumed by the server thread's pixel verification */
+static volatile int expect_verbatim;
+static u32 expect_px100, expect_px7;
 
 static int failures = 0;
 #define CHECK(cond, msg) \
@@ -487,6 +492,15 @@ static void verify_present_pixels(int slot)
                         return;
         }
         const u32 *px = (const u32 *)((const u8 *)map + (size_t)800 * 600 * 4 * slot);
+        if (expect_verbatim) {
+                /* premultiplied=true input: the presenter must memcpy without
+                 * touching a single pixel — a semi-transparent input survives
+                 * UN-premultiplied (double premul would darken it) */
+                CHECK(px[100] == expect_px100 && px[7] == expect_px7,
+                      "GPU-premultiplied frame copied VERBATIM (memcpy path, no double premultiply)");
+                expect_verbatim = 0;
+                return;
+        }
         if (attach_count == 1) {
                 CHECK(px[100] == 0xFF0000FF, "frame 1: opaque red pixel premultiplied-identical");
                 CHECK(px[7] == 0x80204020, "frame 1: semi-transparent pixel PREMULTIPLIED (0x80408040 -> 0x80204020)");
@@ -905,7 +919,7 @@ int main(void)
                         for (int i = 0; i < 800 * 600; i++)
                                 frame[i] = 0xFF0000FF;        /* opaque red */
                         frame[7] = 0x80408040;                 /* semi-transparent probe */
-                        CHECK(wlshim_present_cpu(win, frame, 800, 600),
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, false),
                               "frame 1 presented via wl_shm through libwayland");
                         CHECK(wlshim_wait_frame(1.0),
                               "wait_frame wakes on the frame callback (frame 1)");
@@ -913,7 +927,7 @@ int main(void)
                         usleep(100000);                        /* let the server see commit #1 */
                         for (int i = 0; i < 800 * 600; i++)
                                 frame[i] = 0xFF00FF00;        /* opaque green */
-                        CHECK(wlshim_present_cpu(win, frame, 800, 600),
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, false),
                               "frame 2 presented (slot 1 — slot 0 still in flight)");
                         CHECK(wlshim_wait_frame(1.0),
                               "wait_frame wakes again (per-present callbacks)");
@@ -927,7 +941,7 @@ int main(void)
                                 frame[i] = 0xFF0000FF;
                         bool third = false;
                         for (int i = 0; i < 100 && !third; i++) {
-                                wlshim_present_cpu(win, frame, 800, 600);
+                                wlshim_present_cpu(win, frame, 800, 600, false);
                                 usleep(20000);
                                 /* saw_cycling is set by the server thread when
                                  * the THIRD attach (buffer 0 again) commits */
@@ -944,14 +958,32 @@ int main(void)
                         hold_releases = 1;
                         usleep(100000);        /* server drains and stops releasing */
                         u64 drops_before = wlshim_dropped_frames();
-                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst A -> slot 0");
-                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst B -> slot 1");
-                        CHECK(wlshim_present_cpu(win, frame, 800, 600), "burst C — dropped");
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, false), "burst A -> slot 0");
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, false), "burst B -> slot 1");
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, false), "burst C — dropped");
                         CHECK(wlshim_dropped_frames() == drops_before + 1,
                               "dropped frame counted when both slots are held");
                         CHECK(frame_cb_replies >= 2,
                               "server saw and answered the frame callback requests");
                         hold_releases = 0;
+                        usleep(100000);        /* releases land; both slots free */
+
+                        /* 5c. GPU-premultiplied input (vulkan tier): the
+                         * presenter must take it VERBATIM — one memcpy, no
+                         * per-pixel work, no double premultiply. Probes are
+                         * semi-transparent so a stray premultiply pass would
+                         * darken them and fail the byte check. */
+                        frame[100] = 0x80FFFFFF;       /* a=0x80: premul would make 0x80808080 */
+                        frame[7] = 0x80408040;         /* a=0x80: premul would make 0x80204020 */
+                        expect_px100 = 0x80FFFFFF;
+                        expect_px7 = 0x80408040;
+                        expect_verbatim = 1;
+                        CHECK(wlshim_present_cpu(win, frame, 800, 600, true),
+                              "GPU-premultiplied frame presented via wl_shm");
+                        wlshim_wait_frame(1.0);
+                        usleep(100000);        /* server thread verifies + releases */
+                        frame[100] = 0xFF0000FF;
+                        frame[7] = 0x80408040;
                         free(frame);
                 }
 

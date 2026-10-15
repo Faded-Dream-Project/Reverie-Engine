@@ -70,8 +70,12 @@ static int px_add_window(RPlatform *p, RRect geom)
         return x11_add_window(c->x, geom);
 }
 
-static bool px_present_cpu(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h)
+static bool px_present_cpu(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h,
+                           bool premultiplied)
 {
+        /* X11 TrueColor presents have no alpha compositing convention: the
+         * byte order is all that matters, straight or premultiplied alike */
+        (void)premultiplied;
         PlatX11 *c = (PlatX11 *)p->ctx;
         return x11_present(c->x, win, rgba, w, h);
 }
@@ -172,6 +176,7 @@ RPlatform *plat_x11_create(void)
         p->monitor_refresh = px_monitor_refresh;
         p->add_window = px_add_window;
         p->present_cpu = px_present_cpu;
+        p->present_premul = false;    /* no premul convention on X11 presents */
         p->has_gpu = true;
         p->native_handle = px_native_handle;
         p->native_display = px_native_display;

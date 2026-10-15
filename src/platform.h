@@ -62,7 +62,19 @@ struct RPlatform {
 
         /* ---- windows ---- */
         int  (*add_window)(RPlatform *p, RRect geom);
-        bool (*present_cpu)(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h);
+        /* Present a CPU-readable RGBA frame. `premultiplied` says what the
+         * bytes in `rgba` already are: true = the caller premultiplied them
+         * against alpha (the Vulkan tier does this on the GPU); false =
+         * straight alpha, and a premul-expecting presenter (wl_shm
+         * ARGB8888) premultiplies itself. X11 has no premul convention and
+         * ignores the flag. */
+        bool (*present_cpu)(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h,
+                            bool premultiplied);
+        /* True when this platform's present path natively consumes
+         * PREMULTIPLIED input (wl_shm ARGB8888). Renderers check it to
+         * decide where the straight->premul conversion runs (GPU kernel +
+         * memcpy vs straight pass-through). */
+        bool present_premul;
 
         /* ---- GPU surface support ----
          * has_gpu:   accelerated present possible on this platform

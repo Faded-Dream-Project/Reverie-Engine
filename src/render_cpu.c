@@ -120,7 +120,7 @@ static bool cpu_end(RRenderer *r, const RFb *cpu_frame)
         if (!fb || !fb->px)
                 return false;
         f64 t0 = rev_monotonic();
-        bool ok = c->p->present_cpu(c->p, c->cur_win, fb->px, fb->w, fb->h);
+        bool ok = c->p->present_cpu(c->p, c->cur_win, fb->px, fb->w, fb->h, false);
         c->perf_present_ms += (rev_monotonic() - t0) * 1000.0;
         return ok;
 }

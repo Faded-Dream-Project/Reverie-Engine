@@ -110,11 +110,15 @@ static int pw_add_window(RPlatform *p, RRect geom)
         return win;
 }
 
-static bool pw_present_cpu(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h)
+static bool pw_present_cpu(RPlatform *p, int win, const u32 *rgba, u32 w, u32 h,
+                           bool premultiplied)
 {
         PlatWayland *c = (PlatWayland *)p->ctx;
         if (wlshim_active())
-                return wlshim_present_cpu(win, rgba, w, h);    /* shim owns surfaces; CPU present not used */
+                return wlshim_present_cpu(win, rgba, w, h, premultiplied);    /* shim owns surfaces; CPU present not used */
+        /* raw client: only the CPU renderer reaches this path (no usable
+         * native handles for GPU tiers) — its frames are straight alpha */
+        (void)premultiplied;
         return wl_present(c->wl, win, rgba, w, h);
 }
 
@@ -233,6 +237,9 @@ RPlatform *plat_wayland_create(void)
         p->monitor_refresh = pw_monitor_refresh;
         p->add_window = pw_add_window;
         p->present_cpu = pw_present_cpu;
+        /* wl_shm ARGB8888 is a premultiplied format: presenters on this
+         * platform can take GPU-premultiplied bytes as a verbatim copy */
+        p->present_premul = true;
         p->has_gpu = false;    /* set dynamically in init() */
         p->native_handle = pw_native_handle;
         p->native_display = pw_native_display;

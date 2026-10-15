@@ -53,21 +53,21 @@ renderer):
          docs/BACKENDS.md: neither software path is uniformly faster)
 ```
 
-* **vulkan** — PRESENT-ONLY today: the engine composites on CPU and the GPU
-  receives finished frames — uploaded to a host-visible staging buffer and
-  copied into the swapchain image with image barriers. Driven by
-  `dlopen("libvulkan.so.1")` plus a hand-vendored set of declarations
-  verified against the official Khronos headers. No Vulkan SDK is needed
-  to build or run. Device selection enumerates every physical device and
-  picks by hardware class (discrete > integrated > virtual > CPU), logging
-  the selected device name/type/driver and an honest hardware/software
-  verdict — initialization success is never conflated with acceleration.
-  Since 0.1.1 the swapchain present is opt-in (`REV_VK_PRESENT=wsi`): the
-  default presents through the platform's proven path (MIT-SHM / wl_shm)
-  after field reports of driver-specific XWayland black screens with no
-  error output. Both paths are E2E-tested and pixel-exact. Because this
-  tier does no GPU rendering, `auto` does not select it (opt in with
-  `REV_AUTO_VK=1`).
+* **vulkan** — full GPU compute compositing: every layer operation (blend,
+  blur, gradients, particles, video, fluid/ripple solvers) runs as a SPIR-V
+  compute kernel; the engine's CPU compositor is never in the frame path.
+  Driven by `dlopen("libvulkan.so.1")` plus a hand-vendored set of
+  declarations verified against the official Khronos headers. No Vulkan SDK
+  is needed to build or run. Device selection enumerates every physical
+  device and picks by hardware class (discrete > integrated > virtual >
+  CPU), logging the selected device name/type/driver and an honest
+  hardware/software verdict — initialization success is never conflated
+  with acceleration. Since 0.1.1 the swapchain present is opt-in
+  (`REV_VK_PRESENT=wsi`): the default presents through the platform's
+  proven path (MIT-SHM / wl_shm) after field reports of driver-specific
+  XWayland black screens with no error output — downloading finished frames
+  through HOST_CACHED staging with the premultiply on the GPU and a single
+  CPU memcpy. Both paths are E2E-tested and pixel-exact.
 * **opengl** — full GPU compositing **and GPU simulation**: layers are
   uploaded as textures (static rasters only re-upload when their content
   actually changes), blurred with a downsample + separable gaussian
@@ -204,6 +204,26 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **The Vulkan SHM present un-throttled (2026-10, fourth field report).**
+  "It's even worse and the CPU core is maxed out the second the command
+  runs": 0.9 fps, `render=1112 ms`, `gpu=2.1 ms` — the GPU finished each
+  frame in milliseconds and the CPU still burned a full second on it. Root
+  cause was in the copy-out, not the rendering: the readback buffer picked
+  DEVICE_LOCAL host-visible memory (on a discrete GPU that is a BAR window
+  into VRAM — *uncached* on the CPU), and the wl_shm presenter then read it
+  pixel-by-pixel to premultiply: 2.07 M serialized ~500 ns bus loads per
+  1080p frame. Software Vulkan (lavapipe) has one cached sysmem type, so
+  every sandbox test missed it. The staging buffer now tiers toward
+  HOST_CACHED memory (invalidating after the fence when the heap is
+  non-coherent, never preferring DEVICE_LOCAL for CPU reads), and the
+  straight→premultiplied conversion wl_shm needs runs as a GPU compute
+  kernel before the download — the presenter's entire CPU cost is one
+  `memcpy` (~1 ms at 1080p). X11 presents stay byte-identical straight
+  copies (E2E parity with the CPU tier is still byte-exact); the new
+  wl_shim contract (GPU-premul in → verbatim memcpy out, no double
+  premultiply) is pinned by a unit test against real libwayland, and the
+  chosen memory class is logged (`frame download staging: memory type …`)
+  so the next field report shows it at a glance.
 * **The Vulkan tier renders on the GPU (2026-10, third field report).**
   "Vulkan still falls back on the CPU for the rendering — it needs to use
   the GPU specifically." It does now: the tier is a full GPU compute
@@ -297,12 +317,15 @@ Still no tags and no GitHub releases. This dev cycle:
   GPU color conversion. docs/VIDEO.md records the full decoder
   architecture assessment (why a from-scratch H.264 decoder is the
   wrong project, licensing notes, and the phase-2 hardware-decode plan).
-* **Verification.** 9 unit suites, e2e 19/19 under
+* **Verification.** 9 unit suites (new this cycle: the wl_shm presenter's
+  GPU-premultiplied contract — premul input must land in the pool VERBATIM,
+  no double premultiply — pinned against real libwayland), e2e 19/19 under
   Xvfb (new this cycle: Vulkan GPU-compositing pixel parity vs the CPU
   renderer on both present paths, GPU sims forced on lavapipe, GPU ripple
   click parity; earlier legs: GPU ripple, folder/packed theme parity,
   corrupt-pack rejection, video on CPU and GL tiers, delayed
-  click-after-calm on CPU and GL tiers), plus a clean run under the
+  click-after-calm on CPU and GL tiers), e2e-wayland 4/4 against real
+  headless weston, plus a clean run under the
   Vulkan validation layer (REV_VK_VALIDATE=1). ASan+UBSan clean including
   daemon smokes with clicks on the CPU and Vulkan tiers. Field
   validation on the 1050 Ti box remains open: the GPU-path performance

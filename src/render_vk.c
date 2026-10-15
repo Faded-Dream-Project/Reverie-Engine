@@ -102,6 +102,7 @@ enum {
         ST_DEVICE_CREATE_INFO = 3,
         ST_SUBMIT_INFO = 4,
         ST_MEMORY_ALLOCATE_INFO = 5,
+        ST_MAPPED_MEMORY_RANGE = 6,
         ST_FENCE_CREATE_INFO = 8,
         ST_SEMAPHORE_CREATE_INFO = 9,
         ST_BUFFER_CREATE_INFO = 12,
@@ -136,15 +137,18 @@ enum {
 #define VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_ 0x1u
 #define VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ 0x2u
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_ 0x4u
+#define VK_MEMORY_PROPERTY_HOST_CACHED_BIT_ 0x8u
 #define VK_ACCESS_TRANSFER_WRITE_BIT_ 0x1000u
 #define VK_ACCESS_TRANSFER_READ_BIT_ 0x800u
 #define VK_ACCESS_MEMORY_READ_BIT_ 0x8000u
+#define VK_ACCESS_HOST_READ_BIT_ 0x2000u
 #define VK_ACCESS_SHADER_READ_BIT_ 0x20u
 #define VK_ACCESS_SHADER_WRITE_BIT_ 0x40u
 #define VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT_ 0x1u
 #define VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT_ 0x800u
 #define VK_PIPELINE_STAGE_TRANSFER_BIT_ 0x1000u
 #define VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_ 0x2000u
+#define VK_PIPELINE_STAGE_HOST_BIT_ 0x4000u
 #define VK_IMAGE_ASPECT_COLOR_BIT_ 0x1u
 #define VK_IMAGE_LAYOUT_UNDEFINED_ 0
 #define VK_IMAGE_LAYOUT_GENERAL_ 1
@@ -321,6 +325,26 @@ typedef struct {
         VkImage_ image;
         struct { u32 aspectMask, baseMipLevel, levelCount, baseArrayLayer, layerCount; } subresourceRange;
 } VkImageMemoryBarrier_;
+
+typedef struct {
+        u32 sType_;
+        const void *pNext;
+        u32 srcAccessMask;
+        u32 dstAccessMask;
+        u32 srcQueueFamilyIndex;    /* VK_QUEUE_FAMILY_IGNORED_ = 0 */
+        u32 dstQueueFamilyIndex;
+        VkBuffer_ buffer;
+        u64 offset;
+        u64 size;
+} VkBufferMemoryBarrier_;
+
+typedef struct {
+        u32 sType_;
+        const void *pNext;
+        VkDeviceMemory_ memory;
+        u64 offset;
+        u64 size;
+} VkMappedMemoryRange_;
 
 typedef struct {
         u64 bufferOffset;
@@ -607,6 +631,7 @@ typedef void (*PFN_getPhysDevMemProps_)(VkPhysicalDevice_, VkPhysicalDeviceMemor
 typedef u32 (*PFN_allocMemory_)(VkDevice_, const VkMemoryAllocateInfo_ *, const void *, VkDeviceMemory_ *);
 typedef u32 (*PFN_mapMemory_)(VkDevice_, VkDeviceMemory_, u64, u64, u32, void **);
 typedef void (*PFN_unmapMemory_)(VkDevice_, VkDeviceMemory_);
+typedef u32 (*PFN_invalidateMemRanges_)(VkDevice_, u32, const VkMappedMemoryRange_ *);
 typedef u32 (*PFN_bindBufferMemory_)(VkDevice_, VkBuffer_, VkDeviceMemory_, u64);
 typedef u32 (*PFN_bindImageMemory_)(VkDevice_, VkImage_, VkDeviceMemory_, u64);
 typedef u32 (*PFN_createFence_)(VkDevice_, const VkFenceCreateInfo_ *, const void *, VkFence_ *);
@@ -735,6 +760,7 @@ typedef struct {
         VkDeviceMemory_ readback_mem;
         u8 *rb_map;
         u64 rb_size;
+        bool rb_coherent;        /* HOST_COHERENT? else invalidate needed */
         VkSync_ sync[2];
         int sync_slot;
         bool ready;
@@ -881,6 +907,7 @@ typedef struct {
         PFN_allocMemory_ vkAllocateMemory;
         PFN_mapMemory_ vkMapMemory;
         void (*vkUnmapMemory)(VkDevice_, VkDeviceMemory_);
+        PFN_invalidateMemRanges_ vkInvalidateMappedMemoryRanges;
         PFN_bindBufferMemory_ vkBindBufferMemory;
         u32 (*vkBindImageMemory)(VkDevice_, VkImage_, VkDeviceMemory_, u64);
         PFN_createFence_ vkCreateFence;
@@ -975,6 +1002,56 @@ static i32 vk_pick_memtype(RenderVK *v, u32 type_bits, u32 need, u32 want)
                         want_idx = (i32)i;
         }
         return want_idx;
+}
+
+/* CPU-read staging (frame download) memory: HOST_CACHED dominates the
+ * cost model. An uncached host-visible heap — e.g. a discrete GPU's BAR
+ * window, which vk_pick_memtype's DEVICE_LOCAL preference used to select —
+ * serializes every CPU read over the bus: ~500ns per 4-byte load turned
+ * the wl_shm premultiply loop into 1.1 s per 1080p frame on a GTX 1050 Ti
+ * (field report #4: render=1112ms, gpu=2.1ms, one core pegged). Tiers:
+ *   0. HOST_VISIBLE|HOST_CACHED|HOST_COHERENT  (sysmem: fast + simple)
+ *   1. HOST_VISIBLE|HOST_CACHED                (needs invalidate after fence)
+ *   2. HOST_VISIBLE|HOST_COHERENT, non-DEVICE_LOCAL first (uncached, but
+ *      system RAM beats a BAR window; never prefer DEVICE_LOCAL here)
+ *   3. HOST_VISIBLE (any)
+ * Returns the type index and reports whether it is coherent. */
+static i32 vk_pick_download_memtype(RenderVK *v, u32 type_bits, bool *coherent)
+{
+        static const u32 tiers[4] = {
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
+                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT_ |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
+                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT_,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_,
+        };
+        VkPhysicalDeviceMemoryProperties_ mp;
+        v->vkGetPhysicalDeviceMemoryProperties(v->phys, &mp);
+        for (int t = 0; t < 4; t++) {
+                for (int pass = 0; pass < 2; pass++) {
+                        for (u32 i = 0; i < mp.memoryTypeCount && i < VK_MAX_MEMORY_TYPES_; i++) {
+                                if (!(type_bits & (1u << i)))
+                                        continue;
+                                u32 props = mp.memoryTypes[i].propertyFlags;
+                                if ((props & tiers[t]) != tiers[t])
+                                        continue;
+                                /* tiers 2-3: avoid DEVICE_LOCAL host-visible
+                                 * types (BAR windows) unless nothing else
+                                 * matches */
+                                if (pass == 0 && t >= 2 &&
+                                    (props & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_))
+                                        continue;
+                                if (coherent)
+                                        *coherent = (props &
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_) != 0;
+                                return (i32)i;
+                        }
+                }
+        }
+        return -1;
 }
 
 static void vk_grave_add(RenderVK *v, VkImage_ img, VkImageView_ view,
@@ -1182,7 +1259,8 @@ static void vk_img_barrier(RenderVK *v, VkCommandBuffer_ cmd, VkImage_ img,
  * ========================================================================== */
 
 static bool vkbuf_new(RenderVK *v, VkBuffer_ *buf, VkDeviceMemory_ *mem,
-                      u8 **map, u64 size, u32 usage)
+                      u8 **map, u64 size, u32 usage, bool cpu_read,
+                      bool *coherent_out)
 {
         VkBufferCreateInfo_ bci;
         memset(&bci, 0, sizeof bci);
@@ -1196,14 +1274,22 @@ static bool vkbuf_new(RenderVK *v, VkBuffer_ *buf, VkDeviceMemory_ *mem,
         struct { u64 size, alignment; u32 memoryTypeBits; } reqs;
         memset(&reqs, 0, sizeof reqs);
         v->vkGetBufferMemoryRequirements(v->dev, *buf, &reqs);
-        i32 mt = vk_pick_memtype(v, reqs.memoryTypeBits,
-                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
-                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_,
-                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_);
-        if (mt < 0)
+        i32 mt;
+        if (cpu_read) {
+                bool coh = true;
+                mt = vk_pick_download_memtype(v, reqs.memoryTypeBits, &coh);
+                if (coherent_out)
+                        *coherent_out = coh;
+        } else {
                 mt = vk_pick_memtype(v, reqs.memoryTypeBits,
                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
-                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_, 0);
+                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_,
+                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_);
+                if (mt < 0)
+                        mt = vk_pick_memtype(v, reqs.memoryTypeBits,
+                                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT_ |
+                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_, 0);
+        }
         if (mt < 0) {
                 v->vkDestroyBuffer(v->dev, *buf, NULL);
                 *buf = 0;
@@ -1273,11 +1359,11 @@ static bool vk_frame_create(RenderVK *v, int win)
                 return false;
 
         if (!vkbuf_new(v, &fr->ubo, &fr->ubo_mem, &fr->ubo_map, VK_UBO_CAP,
-                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT_))
+                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT_, false, NULL))
                 return false;
 
         if (!vkbuf_new(v, &fr->arena, &fr->arena_mem, &fr->arena_map,
-                       8u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT_))
+                       8u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT_, false, NULL))
                 return false;
         fr->arena_cap = 8u << 20;
 
@@ -1304,7 +1390,8 @@ static bool vk_arena_grow(RenderVK *v, int win, u64 need)
         VkBuffer_ nb = 0;
         VkDeviceMemory_ nm = 0;
         u8 *nmap = NULL;
-        if (!vkbuf_new(v, &nb, &nm, &nmap, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT_))
+        if (!vkbuf_new(v, &nb, &nm, &nmap, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT_,
+                       false, NULL))
                 return false;
         if (fr->arena) {
                 vk_grave_add(v, 0, 0, fr->arena, fr->arena_mem);
@@ -2688,10 +2775,35 @@ static bool vk_ensure_readback(RenderVK *v, int win, u32 w, u32 h)
                 w_->readback_mem = 0;
                 w_->rb_map = NULL;
         }
+        bool coh = true;
         if (!vkbuf_new(v, &w_->readback, &w_->readback_mem, &w_->rb_map, need,
-                       VK_BUFFER_USAGE_TRANSFER_DST_BIT_))
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT_, true, &coh))
                 return false;
         w_->rb_size = need;
+        w_->rb_coherent = coh;
+        {
+                /* log the memory class once per (re)allocation — an uncached
+                 * heap is the field-report-#4 failure signature, and this
+                 * line makes it visible without vulkaninfo */
+                struct { u64 size, alignment; u32 memoryTypeBits; } reqs;
+                memset(&reqs, 0, sizeof reqs);
+                v->vkGetBufferMemoryRequirements(v->dev, w_->readback, &reqs);
+                i32 idx = vk_pick_download_memtype(v, reqs.memoryTypeBits, NULL);
+                if (idx >= 0) {
+                        VkPhysicalDeviceMemoryProperties_ mp;
+                        v->vkGetPhysicalDeviceMemoryProperties(v->phys, &mp);
+                        u32 props = mp.memoryTypes[idx].propertyFlags;
+                        LOGI("vulkan: frame download staging: memory type %d "
+                             "(%s%s, %s)",
+                             idx,
+                             props & VK_MEMORY_PROPERTY_HOST_CACHED_BIT_
+                                     ? "host-cached" : "UNCACHED",
+                             props & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT_
+                                     ? "+device-local" : "",
+                             props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT_
+                                     ? "coherent" : "non-coherent: invalidated per frame");
+                }
+        }
         return true;
 }
 
@@ -2717,7 +2829,8 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                         v->frame_no++;
                         return v->plat->present_cpu(v->plat, win,
                                                     cpu_frame->px,
-                                                    cpu_frame->w, cpu_frame->h);
+                                                    cpu_frame->w, cpu_frame->h,
+                                                    false);
                 }
                 /* WSI: upload the CPU frame into accum[0] and blit-present */
                 if (w->accum[0].img &&
@@ -2749,7 +2862,40 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                         return false;
                 if (!vk_ensure_readback(v, win, acc->w, acc->h))
                         return false;
-                vk_img_barrier(v, fr->cmd, acc->img,
+
+                /* wl_shm ARGB8888 is PREMULTIPLIED: when the platform
+                 * presenter wants premultiplied input, run the
+                 * straight->premul pass as a compute kernel (the accum
+                 * ping-pong twin is free scratch at this point — next
+                 * frame's first composite re-initializes every texel), so
+                 * the CPU-side presenter is a single memcpy instead of a
+                 * 2M-iteration scalar loop over GPU memory. X11 has no
+                 * premul convention: copy the straight bytes through. */
+                VImg *copy_src = acc;
+                bool pre_premul = false;
+                if (v->plat->present_premul) {
+                        VImg *pre = &w->accum[w->accum_cur ^ 1];
+                        if (!pre->img)
+                                return false;
+                        f32 par[2 * 4];
+                        memset(par, 0, sizeof par);
+                        par[0] = (f32)acc->w;
+                        par[1] = (f32)acc->h;
+                        par[4] = 1.0f;    /* premul on */
+                        VDisp d;
+                        memset(&d, 0, sizeof d);
+                        d.kernel = K_COPYPREMUL;
+                        d.A = acc;
+                        d.A_lin = false;    /* nearest: exact texel centers */
+                        d.out8 = pre;
+                        d.par = par;
+                        d.npar = 2;
+                        if (!vk_run(v, win, &d))
+                                return false;
+                        copy_src = pre;
+                        pre_premul = true;
+                }
+                vk_img_barrier(v, fr->cmd, copy_src->img,
                                VK_ACCESS_SHADER_READ_BIT_ |
                                VK_ACCESS_SHADER_WRITE_BIT_ |
                                VK_ACCESS_TRANSFER_WRITE_BIT_,
@@ -2763,8 +2909,25 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                 cp.imageExtent.width = acc->w;
                 cp.imageExtent.height = acc->h;
                 cp.imageExtent.depth = 1;
-                v->vkCmdCopyImageToBuffer(fr->cmd, acc->img, VK_IMAGE_LAYOUT_GENERAL_,
+                v->vkCmdCopyImageToBuffer(fr->cmd, copy_src->img,
+                                          VK_IMAGE_LAYOUT_GENERAL_,
                                           w->readback, 1, &cp);
+                {
+                        /* transfer -> host visibility (matters for the
+                         * HOST_CACHED non-coherent tier; harmless otherwise) */
+                        VkBufferMemoryBarrier_ bb;
+                        memset(&bb, 0, sizeof bb);
+                        bb.sType_ = ST_BUFFER_MEMORY_BARRIER;
+                        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT_;
+                        bb.dstAccessMask = VK_ACCESS_HOST_READ_BIT_;
+                        bb.buffer = w->readback;
+                        bb.offset = 0;
+                        bb.size = VK_WHOLE_SIZE_;
+                        v->vkCmdPipelineBarrier(fr->cmd,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT_,
+                                                VK_PIPELINE_STAGE_HOST_BIT_, 0,
+                                                0, NULL, 1, &bb, 0, NULL);
+                }
                 if (v->tq_ok)
                         v->vkCmdWriteTimestamp(fr->cmd,
                                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT_,
@@ -2802,10 +2965,19 @@ static bool vk_end(RRenderer *rr, const RFb *cpu_frame)
                         }
                         return false;
                 }
+                if (!w->rb_coherent && v->vkInvalidateMappedMemoryRanges) {
+                        VkMappedMemoryRange_ range;
+                        memset(&range, 0, sizeof range);
+                        range.sType_ = ST_MAPPED_MEMORY_RANGE;
+                        range.memory = w->readback_mem;
+                        range.offset = 0;
+                        range.size = w->rb_size;
+                        v->vkInvalidateMappedMemoryRanges(v->dev, 1, &range);
+                }
                 v->frame_no++;
                 return v->plat->present_cpu(v->plat, win,
                                             (const u32 *)w->rb_map,
-                                            acc->w, acc->h);
+                                            acc->w, acc->h, pre_premul);
         }
 
         /* ---- WSI present: blit into the swapchain, FIFO present --------- */
@@ -3727,6 +3899,7 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
         DSYM(vkAllocateMemory, "vkAllocateMemory");
         DSYM(vkMapMemory, "vkMapMemory");
         DSYM(vkUnmapMemory, "vkUnmapMemory");
+        DSYM(vkInvalidateMappedMemoryRanges, "vkInvalidateMappedMemoryRanges");
         DSYM(vkBindBufferMemory, "vkBindBufferMemory");
         DSYM(vkBindImageMemory, "vkBindImageMemory");
         DSYM(vkCreateFence, "vkCreateFence");
@@ -4003,7 +4176,9 @@ static bool vk_init(RRenderer *rr, RPlatform *p, char *err, size_t errcap)
                         v->vkDestroySurfaceKHR(v->inst, probe, NULL);
                 }
                 LOGI("vulkan: device present-capable (queue family %u); finished "
-                     "frames copy out and present via the platform SHM path — "
+                     "frames download through HOST_CACHED staging — the "
+                     "premultiply runs as a GPU kernel and the presenter does "
+                     "one memcpy — and present via the platform SHM path — "
                      "set REV_VK_PRESENT=wsi for zero-copy swapchain present",
                      v->queue_family);
                 return true;

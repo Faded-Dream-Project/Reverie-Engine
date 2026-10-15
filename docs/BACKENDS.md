@@ -134,11 +134,37 @@ selects.
   compute; `REV_PROFILE` reports them asynchronously (several frames
   behind) exactly like the GL tier's timer queries — labeled `gpu=...*`,
   never conflated with CPU wall time.
-* **Present paths (mechanism unchanged since 0.1.1, fed by GPU frames):**
+* **Present paths (mechanism unchanged since 0.1.1, fed by GPU frames —
+  staging fixed in 0.2.0 after the fourth field report):**
   - *platform present (default)* — the finished image is copied to a
     host-visible buffer and handed to the backend's proven presenter
     (MIT-SHM on X11, wl_shm on Wayland). Same pixels, same window, the
     mechanism every field report confirmed; the GPU does all the rendering.
+    The 0.2.0 fix, in two parts:
+    - **The staging buffer is HOST_CACHED memory.** It used to prefer
+      DEVICE_LOCAL among host-visible types, which on a discrete GPU means
+      a BAR window into VRAM: *uncached* CPU reads, ~500 ns per 4-byte
+      load. The wl_shm presenter's per-pixel premultiply read that memory
+      pixel-by-pixel — 2.07 M serialized bus reads ≈ **1.1 s per 1080p
+      frame** on a GTX 1050 Ti (field report #4: `render=1112 ms`,
+      `gpu=2.1 ms`, one core pegged; software devices never see this —
+      lavapipe's single memory type is cached sysmem, which is why E2E
+      missed it). Selection now tiers: HOST_VISIBLE|HOST_CACHED|COHERENT →
+      HOST_CACHED (+`vkInvalidateMappedMemoryRanges` after the fence when
+      non-coherent) → HOST_VISIBLE|COHERENT *preferring non-DEVICE-LOCAL*
+      → any. The chosen class is logged (`frame download staging: memory
+      type …`).
+    - **The premultiply runs on the GPU.** wl_shm ARGB8888 is premultiplied;
+      the straight→premul conversion is one extra `copypremul` compute
+      dispatch into the accum ping-pong twin, downloaded after it, and the
+      presenter receives `premultiplied=true` → a single `memcpy` (~1 ms
+      at 1080p) — the CPU never touches a per-pixel loop on the Vulkan
+      tier. X11 has no premul convention (`present_premul=false`): bytes
+      copy through straight, bit-identical to the CPU tier (E2E parity
+      stays byte-exact). The CPU tier still premultiplies on the CPU —
+      its source is plain RAM (~5 ms at 1080p, cached).
+    GPU-side cost of the present download at 1080p: one 8.3 MB DMA + one
+    tiny kernel, both inside the timestamped region — reported in `gpu=`.
   - *WSI present (`REV_VK_PRESENT=wsi`)* — the image is blitted into the
     swapchain (UNORM formats preferred; the blit handles the BGRA
     component swizzle) and presented FIFO, zero-copy. Surfaces that only

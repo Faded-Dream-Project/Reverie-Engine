@@ -1019,7 +1019,7 @@ static bool shim_pool_create(ShimWin *win, u32 w, u32 h)
         return true;
 }
 
-bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
+bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultiplied)
 {
         if (!S.active || !S.display || win < 0 || win >= S.nwins)
                 return false;
@@ -1068,22 +1068,31 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
                 return true;    /* compositor still holds both slots — drop frame */
         }
 
-        /* premultiply into the pool slot (ARGB8888 is premultiplied alpha) */
+        /* fill the pool slot. premultiplied input (the Vulkan tier converts
+         * on the GPU): one verbatim memcpy — the entire CPU cost of an SHM
+         * present, ~1ms at 1080p, and no per-pixel loop over GPU memory
+         * (reading an uncached staging heap per pixel was field report #4:
+         * 1.1 s/frame on a GTX 1050 Ti). straight input (CPU tier): the
+         * scalar premultiply below — the source is plain RAM, ~5ms. */
         u32 *dst = (u32 *)((u8 *)winp->pool_mem + (size_t)w * h * 4 * b);
         size_t n = (size_t)w * h;
-        for (size_t i = 0; i < n; i++) {
-                u32 p = rgba[i];
-                u32 a = p >> 24;
-                if (a == 255) {
-                        dst[i] = p;
-                } else if (a == 0) {
-                        dst[i] = 0;
-                } else {
-                        u32 r = (p & 0xff), g = (p >> 8) & 0xff, bl = (p >> 16) & 0xff;
-                        dst[i] = (a << 24) |
-                                 (((bl * a + 127) / 255) << 16) |
-                                 (((g * a + 127) / 255) << 8) |
-                                 ((r * a + 127) / 255);
+        if (premultiplied) {
+                memcpy(dst, rgba, n * 4);
+        } else {
+                for (size_t i = 0; i < n; i++) {
+                        u32 p = rgba[i];
+                        u32 a = p >> 24;
+                        if (a == 255) {
+                                dst[i] = p;
+                        } else if (a == 0) {
+                                dst[i] = 0;
+                        } else {
+                                u32 r = (p & 0xff), g = (p >> 8) & 0xff, bl = (p >> 16) & 0xff;
+                                dst[i] = (a << 24) |
+                                         (((bl * a + 127) / 255) << 16) |
+                                         (((g * a + 127) / 255) << 8) |
+                                         ((r * a + 127) / 255);
+                        }
                 }
         }
 
@@ -1116,8 +1125,9 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h)
         winp->cur = b;
 
         if (++S.presents == 1)
-                LOGI("wlshim: wl_shm present active (%ux%u, scale %d, double-buffered)",
-                     w, h, scale);
+                LOGI("wlshim: wl_shm present active (%ux%u, scale %d, double-buffered, "
+                     "%s)", w, h, scale,
+                     premultiplied ? "GPU-premul memcpy" : "CPU premultiply");
         else if (S.presents == 1000)
                 LOGD("wlshim: 1000 frames presented");
         return true;
