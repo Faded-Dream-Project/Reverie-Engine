@@ -1,0 +1,13 @@
+{
+  "id": "light-lattice",
+  "name": "Light Lattice",
+  "description": "Abstract geometry: concentric arcs and radial spokes on near-black with a slow full-turn light sweep and a breathing core glow. Pure vector, no solvers.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0",
+  "quality": [
+    { "name": "low",    "fps": 30, "resolution_scale": 0.75 },
+    { "name": "medium", "fps": 60, "resolution_scale": 1.0 }
+  ]
+}

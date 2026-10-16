@@ -1,0 +1,56 @@
+/* Reverie Engine — "Aurora Veil"
+   Atmospheric polar curtains: three translucent veils at incommensurate
+   slow periods (37 s / 53 s / 29 s — the composition never repeats),
+   sparse drifting motes, no fluid solver at all. The near-static
+   register: cheap on every tier, calm by design. */
+
+scene "Aurora Veil" {
+    fps = 60
+
+    layer night {
+        type = gradient
+        shape = linear
+        angle = 180
+        stops = [#030c16, (#062033 0.55), (#08283d 0.8), (#04121f 1.0)]
+    }
+
+    layer veil_a {
+        type = gradient
+        shape = linear
+        angle = 84
+        stops = [#00000000, (#1d8a6e4d 0.35), (#35d9a870 0.5), (#1d8a6e4d 0.62), #00000000]
+        blend = screen
+        opacity = 0.75
+        anim angle { from = 76; to = 94; dur = 37s; ease = sine; mode = pingpong }
+    }
+
+    layer veil_b {
+        type = gradient
+        shape = linear
+        angle = 108
+        stops = [#00000000, (#7a3ab838 0.4), (#b465e855 0.52), (#7a3ab838 0.65), #00000000]
+        blend = screen
+        opacity = 0.55
+        anim angle { from = 122; to = 100; dur = 53s; ease = sine; mode = pingpong }
+    }
+
+    layer veil_c {
+        type = gradient
+        shape = linear
+        angle = 92
+        stops = [#00000000, (#9df2d926 0.46), (#d9fff28c 0.5), (#9df2d926 0.54), #00000000]
+        blend = screen
+        anim angle { from = 88; to = 96; dur = 29s; ease = sine; mode = pingpong }
+    }
+
+    layer motes {
+        type = particles
+        preset = fireflies
+        rate = 7
+        size = 1.7
+        drift = 10
+        color = #8dffd9
+        color2 = #d9a0ff
+        spawn = ambient
+    }
+}

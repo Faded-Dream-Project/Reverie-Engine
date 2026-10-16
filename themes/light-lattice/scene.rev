@@ -1,0 +1,61 @@
+/* Reverie Engine — "Light Lattice"
+   Abstract geometric: a hand-drawn SVG lattice of concentric arcs and
+   radial spokes on near-black, a slow full-turn light sweep flowing over
+   it (48 s loop), a breathing core glow, and a blurred deep-lattice twin
+   on parallax for depth. No solvers; the motion is the sweep and the
+   breathing glow. */
+
+scene "Light Lattice" {
+    fps = 60
+
+    layer void {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.5)
+        radius = 1.2
+        stops = [#05060a, (#0a0f1c 0.6), (#0c1322 1.0)]
+    }
+
+    layer core {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.5)
+        radius = 0.55
+        stops = [(#3d6ea559 0.0), (#1e3a5f26 0.5), #00000000]
+        blend = screen
+        anim opacity { from = 0.55; to = 1.0; dur = 13s; ease = sine; mode = pingpong }
+    }
+
+    layer lattice_deep {
+        type = image
+        src = "assets/lattice.svg"
+        fit = fill
+        opacity = 0.5
+        blur = 3
+        parallax = 0.16
+    }
+
+    layer lattice {
+        type = image
+        src = "assets/lattice.svg"
+        fit = fill
+        parallax = 0.05
+    }
+
+    layer sweep {
+        type = gradient
+        shape = linear
+        angle = 90
+        stops = [#00000000, (#bfeaff1e 0.42), (#eafaff38 0.5), (#bfeaff1e 0.58), #00000000]
+        blend = screen
+        anim angle { from = 0; to = 360; dur = 48s; ease = sine; mode = loop }
+    }
+
+    layer vignette {
+        type = gradient
+        shape = radial
+        center = (0.5, 0.5)
+        radius = 1.05
+        stops = [#00000000, (#02040acc 0.75), (#02040cdd 1.0)]
+    }
+}

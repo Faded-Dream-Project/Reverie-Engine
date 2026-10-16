@@ -1,0 +1,13 @@
+{
+  "id": "aurora-veil",
+  "name": "Aurora Veil",
+  "description": "Atmospheric polar curtains: three translucent veils swaying at incommensurate slow periods with sparse drifting motes. No fluid solver - calm and cheap by design.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0",
+  "quality": [
+    { "name": "low",    "fps": 30, "resolution_scale": 0.75 },
+    { "name": "medium", "fps": 60, "resolution_scale": 1.0 }
+  ]
+}

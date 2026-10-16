@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+  <!-- Reverie "Light Lattice" — concentric arcs + radial spokes + bright nodes.
+       Fully transparent background: the scene's gradients show through. -->
+  <g fill="none" stroke-linecap="round">
+    <!-- deep ring set, off-center for composition -->
+    <g stroke="#1e3a5f" stroke-width="2" opacity="0.85">
+      <circle cx="960" cy="540" r="120"/>
+      <circle cx="960" cy="540" r="240"/>
+      <circle cx="960" cy="540" r="360"/>
+      <circle cx="960" cy="540" r="480"/>
+      <circle cx="960" cy="540" r="600"/>
+      <circle cx="960" cy="540" r="720"/>
+      <circle cx="960" cy="540" r="840"/>
+      <circle cx="960" cy="540" r="960"/>
+    </g>
+    <!-- accent rings -->
+    <g stroke="#3d6ea5" stroke-width="3.5" opacity="0.9">
+      <circle cx="960" cy="540" r="180"/>
+      <circle cx="960" cy="540" r="420"/>
+      <circle cx="960" cy="540" r="660"/>
+      <circle cx="960" cy="540" r="900"/>
+    </g>
+    <!-- radial spokes -->
+    <g stroke="#1e3a5f" stroke-width="2" opacity="0.7">
+      <line x1="960" y1="540" x2="960" y2="-120"/>
+      <line x1="960" y1="540" x2="960" y2="1200"/>
+      <line x1="960" y1="540" x2="-180" y2="540"/>
+      <line x1="960" y1="540" x2="2100" y2="540"/>
+      <line x1="960" y1="540" x2="380" y2="-40"/>
+      <line x1="960" y1="540" x2="1540" y2="-40"/>
+      <line x1="960" y1="540" x2="380" y2="1120"/>
+      <line x1="960" y1="540" x2="1540" y2="1120"/>
+      <line x1="960" y1="540" x2="520" y2="100"/>
+      <line x1="960" y1="540" x2="1400" y2="100"/>
+      <line x1="960" y1="540" x2="520" y2="980"/>
+      <line x1="960" y1="540" x2="1400" y2="980"/>
+    </g>
+    <!-- bright nodes on the accent rings -->
+    <g fill="#7db8e8">
+      <circle cx="960" cy="360" r="6"/>
+      <circle cx="960" cy="720" r="6"/>
+      <circle cx="540" cy="540" r="6"/>
+      <circle cx="1380" cy="540" r="6"/>
+      <circle cx="1254" cy="246" r="5"/>
+      <circle cx="666" cy="834" r="5"/>
+      <circle cx="666" cy="246" r="5"/>
+      <circle cx="1254" cy="834" r="5"/>
+      <circle cx="960" cy="120" r="7"/>
+      <circle cx="960" cy="960" r="7"/>
+      <circle cx="240" cy="540" r="5"/>
+      <circle cx="1680" cy="540" r="7"/>
+    </g>
+    <!-- the core jewel -->
+    <g fill="#bfe4ff">
+      <circle cx="960" cy="540" r="9"/>
+    </g>
+    <circle cx="960" cy="540" r="22" fill="none" stroke="#7db8e8" stroke-width="2" opacity="0.6"/>
+  </g>
+</svg>

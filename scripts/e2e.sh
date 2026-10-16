@@ -313,6 +313,40 @@ else
     cat "$OUT/themep.log"
     FAIL=$((FAIL+1))
 fi
+# the three new themes (nebula-drift / aurora-veil / light-lattice):
+# offline render with pixel sanity (real content, not a flat frame) AND
+# per-theme packed parity — each theme is an independent, distributable unit
+for NEWT in nebula-drift aurora-veil light-lattice; do
+    ./build/reverie "themes/$NEWT" -o -s 480x270 -O "$OUT/nt_$NEWT.png" \
+        > "$OUT/nt_$NEWT.log" 2>&1 || true
+    ./build/revtool theme pack "themes/$NEWT" -o "$OUT/$NEWT.revpack" \
+        > /dev/null 2>&1
+    ./build/reverie "$OUT/$NEWT.revpack" -o -s 480x270 -O "$OUT/ntp_$NEWT.png" \
+        > "$OUT/ntp_$NEWT.log" 2>&1 || true
+    if [ -f "$OUT/nt_$NEWT.png" ] && cmp -s "$OUT/nt_$NEWT.png" "$OUT/ntp_$NEWT.png" \
+       && python3 -c "
+import struct, zlib, sys
+d = open('$OUT/nt_$NEWT.png','rb').read(); pos, idat = 8, b''
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+    if typ == b'IDAT': idat += d[pos:pos+ln]
+    pos += ln + 4
+raw = zlib.decompress(idat); stride = 480*4+1
+cols = set()
+for y in range(0, 270, 6):
+    for x in range(0, 480, 6):
+        o = y*stride + 1 + x*4
+        cols.add((raw[o], raw[o+1], raw[o+2]))
+sys.exit(0 if len(cols) > 40 else 1)
+" 2>/dev/null; then
+        echo "    theme(new-$NEWT): PASS (renders with content, packed parity)"
+        PASS=$((PASS+1))
+    else
+        echo "    theme(new-$NEWT): FAIL (flat render or pack mismatch)"
+        cat "$OUT/nt_$NEWT.log"
+        FAIL=$((FAIL+1))
+    fi
+done
 # corrupt pack: must exit with an error, never crash
 head -c 200 "$OUT/ripple-lake.revpack" > "$OUT/corrupt.revpack"
 DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu "$OUT/corrupt.revpack" \

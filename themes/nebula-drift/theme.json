@@ -1,0 +1,14 @@
+{
+  "id": "nebula-drift",
+  "name": "Nebula Drift",
+  "description": "Deep space: a starfield with one huge soft nebula billowing slowly through it, a faint distant glow, and a vignette. Dim, vast, calm.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev",
+  "engine_min": "0.1.0",
+  "quality": [
+    { "name": "low",    "fps": 30, "resolution_scale": 0.75 },
+    { "name": "medium", "fps": 60, "resolution_scale": 1.0 },
+    { "name": "high",   "fps": 60, "resolution_scale": 1.0 }
+  ]
+}

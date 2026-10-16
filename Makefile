@@ -167,6 +167,7 @@ test: $(TEST_BIN)
 assets: $(BUILD)/revtool
 	$(BUILD)/revtool mkpng scenes/assets/lake.png 512 512 soft-bands
 	$(BUILD)/revtool mkpng scenes/assets/stars.png 512 512 stars
+	$(BUILD)/revtool mkpng themes/nebula-drift/assets/stars.png 1920 1080 stars
 
 install: $(BINS)
 	install -d $(DESTDIR)$(PREFIX)/bin
