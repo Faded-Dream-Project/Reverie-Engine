@@ -27,10 +27,14 @@ const char *rev_inflate_strerror(int err);
 
 /* Inflates a raw DEFLATE stream.
  *
- *   expected: exact output size if known (PNG always knows); 0 = unknown,
- *             buffer grows geometrically from 64 KiB.
+ *   expected: exact output size if known — enforced as a HARD CAP: any
+ *             byte past it fails with REV_INF_TOOBIG instead of growing
+ *             the buffer (the decompression-bomb stop). PNG always knows
+ *             the exact scanline budget. 0 = unknown size, buffer grows
+ *             geometrically from 64 KiB (no cap).
  *   out:      receives a malloc'd buffer (caller frees). Unchanged on error.
- *   out_len:  receives the inflated size.
+ *   out_len:  receives the inflated size (may be < expected; the caller's
+ *             size check catches short streams).
  */
 int rev_inflate_raw(const u8 *in, size_t in_len, size_t expected,
                     u8 **out, size_t *out_len);

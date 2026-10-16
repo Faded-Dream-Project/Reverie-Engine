@@ -105,6 +105,22 @@ int main(void)
                 free(z);
         }
 
+        /* the exact-size contract is a HARD CAP: `expected` smaller than the
+         * real output must fail with REV_INF_TOOBIG (the decompression-bomb
+         * stop) — never grow past the caller's budget, never half-succeed */
+        {
+                size_t len = 0;
+                u8 *z = slurp("tests/fixtures/deflate_matches_dyn.zlib", &len);
+                u8 *out = NULL;
+                size_t outlen = 0;
+                int rc = rev_inflate_zlib(z, len, 159999, &out, &outlen);
+                CHECK(rc == REV_INF_TOOBIG,
+                      "expected < actual must hit the cap (rc=%d: %s)", rc,
+                      rev_inflate_strerror(rc));
+                CHECK(out == NULL, "capped inflate must not produce output");
+                free(z);
+        }
+
         if (g_fails == 0)
                 printf("  inflate: OK\n");
         return g_fails != 0;

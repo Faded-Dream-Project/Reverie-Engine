@@ -363,6 +363,9 @@ bool rev_png_decode(const u8 *data, size_t len, RevImage *out,
                                 return fail(err, errcap, "PNG: image too large (%u x %u)", pi.w, pi.h);
                         if (!depth_valid(pi.ctype, pi.depth))
                                 return fail(err, errcap, "PNG: bad depth %d for color type %d", pi.depth, pi.ctype);
+                        if (pi.ctype != 0 && pi.ctype != 2 && pi.ctype != 3 &&
+                            pi.ctype != 4 && pi.ctype != 6)
+                                return fail(err, errcap, "PNG: bad color type %d", pi.ctype);
                         if (compression != 0 || filter != 0)
                                 return fail(err, errcap, "PNG: unknown compression/filter method");
                         if (pi.interlace != 0 && pi.interlace != 1)

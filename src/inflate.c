@@ -53,6 +53,13 @@ typedef struct {
         /* output */
         u8       *out;
         size_t    out_pos, out_cap;
+        /* hard output cap: when non-zero (caller passed an exact `expected`),
+         * any write past it fails with REV_INF_TOOBIG instead of growing the
+         * buffer. This is the decompression-bomb stop: a 600-byte IDAT that
+         * claims to inflate to gigabytes dies at the first byte past the
+         * PNG's declared scanline budget, not at the OOM killer. */
+        size_t    hard_cap;
+        bool      cap_hit;
         /* two huffman table slots (lit, dist); code-length table reuses slot 0 */
         u32      *tbl_a;
         u32      *tbl_b;
@@ -103,6 +110,11 @@ static bool out_reserve(Infl *s, size_t extra)
 {
         if (s->out_pos + extra <= s->out_cap)
                 return true;
+        if (s->hard_cap) {
+                /* exact-size contract: never grow past the caller's cap */
+                s->cap_hit = true;
+                return false;
+        }
         size_t ncap = s->out_cap ? s->out_cap * 2 : (size_t)64 * 1024;
         while (ncap < s->out_pos + extra)
                 ncap *= 2;
@@ -217,7 +229,7 @@ static int inflate_stored(Infl *s)
                 return REV_INF_BADLEN;
 
         if (!out_reserve(s, len))
-                return REV_INF_NOMEM;
+                return s->cap_hit ? REV_INF_TOOBIG : REV_INF_NOMEM;
 
         /* drain any bytes still sitting in the bit buffer */
         while (len > 0 && s->bitcnt >= 8) {
@@ -246,7 +258,7 @@ static int inflate_codes(Infl *s, const u32 *lit_tbl, const u32 *dist_tbl)
                 if (sym < 256) {
                         TR("LIT %d bitpos=%zu\n", sym, bitpos(s));
                         if (!out_byte(s, (u8)sym))
-                                return REV_INF_NOMEM;
+                                return s->cap_hit ? REV_INF_TOOBIG : REV_INF_NOMEM;
                         continue;
                 }
                 if (sym == 256) {
@@ -282,7 +294,7 @@ static int inflate_codes(Infl *s, const u32 *lit_tbl, const u32 *dist_tbl)
                 if ((size_t)dist > s->out_pos)
                         return REV_INF_BADDIST;
                 if (!out_reserve(s, length))
-                        return REV_INF_NOMEM;
+                        return s->cap_hit ? REV_INF_TOOBIG : REV_INF_NOMEM;
 
                 u8 *dst = s->out + s->out_pos;
                 const u8 *src = s->out + s->out_pos - dist;
@@ -420,6 +432,9 @@ int rev_inflate_raw(const u8 *in, size_t in_len, size_t expected,
         memset(&s, 0, sizeof s);
         s.in = in;
         s.in_len = in_len;
+        /* exact expected size = hard cap (bomb stop); 0 = unknown size,
+         * geometric growth (see inflate.h) */
+        s.hard_cap = expected;
 
         if (expected) {
                 s.out = (u8 *)malloc(expected ? expected : 1);
