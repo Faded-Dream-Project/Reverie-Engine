@@ -43,6 +43,10 @@
 #include "util.h"
 #include "wlshim.h"
 
+/* CPU-side fluid scheduling (cadence/trajectory/ambient breathing) shared
+ * with fluid.c and render_vk.c — see fluid_sched.h */
+#include "fluid_sched.h"
+
 /* ---- EGL constants (Khronos registry values) ---------------------------- */
 #define EGL_SUCCESS 0x3000
 #define EGL_BAD_NATIVE_WINDOW 0x300B
@@ -849,6 +853,7 @@ typedef struct {
         u32 gw, gh, dw, dh;      /* velocity / dye grid                  */
         int vc, dc, pc;          /* ping-pong current index              */
         f64 amb_t, wisp_acc;     /* CPU-side clocks (match fluid.c)      */
+        u64 wisp_fires;           /* organic cadence index (fluid_sched.h) */
         u64 last_seen;           /* GC stamp (frame counter)             */
         bool ok;                 /* resources valid                      */
 } GLFluid;
@@ -1243,6 +1248,7 @@ static GLFluid *fluid_slot(RenderGL *r, int win, const RSimFluid *sd)
         best->vc = best->dc = best->pc = 0;
         best->amb_t = 0;
         best->wisp_acc = 0;
+        best->wisp_fires = 0;
         best->ok = false;
         best->key = sd;
         best->last_seen = r->frame_no;
@@ -1309,8 +1315,12 @@ static GLuint_ gl_fluid_step(RenderGL *r, GLFluid *f, const RSimFluid *sd)
         const double rad_g = radius * f->gw * 0.5 + 1.5;   /* grid texels */
         const double rad_d = rad_g * 2.0;                  /* dye texels  */
 
-        /* ---- C-side event bookkeeping (mirrors fluid.c exactly) ---- */
+        /* ---- C-side event bookkeeping (mirrors fluid.c exactly:
+         * fluid_sched.h is the single shared scheduler — cadence,
+         * trajectory and ambient breathing are the same math on every
+         * tier, scheduled CPU-side) ---- */
         f64 amb_t = f->amb_t;
+        const f64 ambient_gain = ambient > 0 ? fluid_ambient_gain(f->amb_t + dt) : 1.0;
         if (ambient > 0)
             amb_t += dt;
 
@@ -1319,14 +1329,14 @@ static GLuint_ gl_fluid_step(RenderGL *r, GLFluid *f, const RSimFluid *sd)
         RColor wisp_c = sd->dye_a;
         if (ambient > 0) {
                 f->wisp_acc += dt;
-                if (f->wisp_acc > 0.9) {
+                if (f->wisp_acc > fluid_wisp_interval(f->wisp_fires)) {
                         f->wisp_acc = 0;
+                        f->wisp_fires++;
                         wisp_fire = true;
-                        wisp_x = 0.15 + 0.7 * fabs(sin(amb_t * 1.7));
-                        wisp_y = 0.15 + 0.7 * fabs(cos(amb_t * 1.1));
-                        wisp_vx = sin(amb_t * 2.0) * 0.6;
-                        wisp_vy = cos(amb_t * 1.6) * 0.6;
-                        wisp_c = (((int)(amb_t * 3) & 1) != 0) ? sd->dye_a : sd->dye_b;
+                        bool alt;
+                        fluid_wisp_at(amb_t, f->wisp_fires, &wisp_x, &wisp_y,
+                                      &wisp_vx, &wisp_vy, &alt);
+                        wisp_c = alt ? sd->dye_b : sd->dye_a;
                 }
         }
 
@@ -1365,7 +1375,7 @@ static GLuint_ gl_fluid_step(RenderGL *r, GLFluid *f, const RSimFluid *sd)
                 g->glUniform2f(r->fu[pi].impB, (float)(wisp_fire ? wisp_vx : 0.0),
                                (float)(wisp_fire ? wisp_vy : 0.0));
                 g->glUniform1f(r->fu[pi].radB, (float)(wisp_fire ? rad_g : 1.0));
-                g->glUniform1f(r->fu[pi].ambient, (float)ambient);
+                g->glUniform1f(r->fu[pi].ambient, (float)(ambient * ambient_gain));
                 g->glUniform1f(r->fu[pi].dt, (float)dt);
                 g->glUniform1f(r->fu[pi].t, (float)amb_t);
                 g->glActiveTexture(GL_TEXTURE0);

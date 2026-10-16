@@ -53,6 +53,10 @@
 #include "util.h"
 #include "vk_spv.h"
 
+/* CPU-side fluid scheduling (cadence/trajectory/ambient breathing) shared
+ * with fluid.c and render_gl.c — see fluid_sched.h */
+#include "fluid_sched.h"
+
 /* ---- minimal hand-vendored Vulkan declarations --------------------------
  * Values cross-checked against the official headers. */
 typedef void *VkInstance_;       /* dispatchable */
@@ -725,6 +729,7 @@ typedef struct {
         u32 gw, gh, dw, dh;
         int vc, dc, pc;
         f64 amb_t, wisp_acc;
+        u64 wisp_fires;   /* organic cadence index (fluid_sched.h) */
         /* ripple field (RGBA16F) */
         VImg field[2];
         u32 rgw, rgh;
@@ -1937,6 +1942,7 @@ static VKSim *vk_sim_slot(RenderVK *v, int win, const void *key, bool is_ripple,
                 best->vc = best->dc = best->pc = 0;
                 best->amb_t = 0;
                 best->wisp_acc = 0;
+                best->wisp_fires = 0;
                 if (gw < 8 || gh < 8)
                         return NULL;
                 if (!vkimg_new(v, win, &best->vel[0], gw, gh,
@@ -2018,8 +2024,11 @@ static const VImg *vk_fluid_step(RenderVK *v, int win, VKSim *f, const RSimFluid
         const double rad_g = radius * f->gw * 0.5 + 1.5;   /* grid texels */
         const double rad_d = rad_g * 2.0;                  /* dye texels  */
 
-        /* C-side event bookkeeping (mirrors fluid.c / gl_fluid_step) */
+        /* C-side event bookkeeping — the SAME fluid_sched.h math as
+         * fluid.c and gl_fluid_step: cadence, trajectory and ambient
+         * breathing are identical across tiers by construction */
         f64 amb_t = f->amb_t;
+        const f64 ambient_gain = ambient > 0 ? fluid_ambient_gain(f->amb_t + dt) : 1.0;
         if (ambient > 0)
                 amb_t += dt;
 
@@ -2028,14 +2037,14 @@ static const VImg *vk_fluid_step(RenderVK *v, int win, VKSim *f, const RSimFluid
         RColor wisp_c = sd->dye_a;
         if (ambient > 0) {
                 f->wisp_acc += dt;
-                if (f->wisp_acc > 0.9) {
+                if (f->wisp_acc > fluid_wisp_interval(f->wisp_fires)) {
                         f->wisp_acc = 0;
+                        f->wisp_fires++;
                         wisp_fire = true;
-                        wisp_x = 0.15 + 0.7 * fabs(sin(amb_t * 1.7));
-                        wisp_y = 0.15 + 0.7 * fabs(cos(amb_t * 1.1));
-                        wisp_vx = sin(amb_t * 2.0) * 0.6;
-                        wisp_vy = cos(amb_t * 1.6) * 0.6;
-                        wisp_c = (((int)(amb_t * 3) & 1) != 0) ? sd->dye_a : sd->dye_b;
+                        bool alt;
+                        fluid_wisp_at(amb_t, f->wisp_fires, &wisp_x, &wisp_y,
+                                      &wisp_vx, &wisp_vy, &alt);
+                        wisp_c = alt ? sd->dye_b : sd->dye_a;
                 }
         }
 
@@ -2068,7 +2077,7 @@ static const VImg *vk_fluid_step(RenderVK *v, int win, VKSim *f, const RSimFluid
                 par[7] = (f32)(ptr_fire ? rad_g : 1.0);
                 par[8] = (f32)(ptr_fire ? ptr_vx : 0.0);
                 par[9] = (f32)(ptr_fire ? ptr_vy : 0.0);
-                par[11] = (f32)ambient;
+                par[11] = (f32)(ambient * ambient_gain);
                 par[12] = (f32)wisp_x;
                 par[13] = (f32)wisp_y;
                 par[15] = (f32)(wisp_fire ? rad_g : 1.0);

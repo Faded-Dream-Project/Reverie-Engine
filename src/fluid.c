@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fluid_sched.h"
 #include "log.h"
 
 #define NITER  16        /* pressure Gauss-Seidel iterations */
@@ -39,6 +40,7 @@ struct RevFluid {
         f64 force, radius, dissip, ambient;
         /* ambient drift clock + wisp accumulator (per-instance) */
         f64 amb_t, wisp_acc;
+        u64 wisp_fires;         /* organic cadence: hash index of the NEXT firing */
         /* pointer splats queued between steps */
         struct {
                 f64 x, y, dx, dy;
@@ -392,27 +394,34 @@ void fluid_step(RevFluid *f, f64 dt)
         f->ptr.dx = 0;
         f->ptr.dy = 0;
 
-        /* ambient drift: slowly rotating force field */
+        /* ambient drift: slowly rotating force field, strength breathing
+         * through fluid_ambient_gain() so the motion never settles into a
+         * steady state (the pre-scheduler constant amplitude read as a
+         * mechanical loop after a few minutes) */
         if (f->ambient > 0) {
                 f->amb_t += dt;
                 f64 t = f->amb_t;
+                f64 amb = f->ambient * fluid_ambient_gain(t);
                 for (int y = 1; y < gh - 1; y += 3) {
                         for (int x = 1; x < gw - 1; x += 3) {
                                 f64 nx = (f64)x / gw, ny = (f64)y / gh;
                                 f64 fx = sin(ny * 6.0 + t * 0.35) * cos(nx * 4.0 - t * 0.22);
                                 f64 fy = cos(nx * 5.0 + t * 0.3) * sin(ny * 5.0 + t * 0.18);
-                                f->u[(size_t)y * gw + x] += (f32)(fx * f->ambient * dt * 8.0);
-                                f->v[(size_t)y * gw + x] += (f32)(fy * f->ambient * dt * 8.0);
+                                f->u[(size_t)y * gw + x] += (f32)(fx * amb * dt * 8.0);
+                                f->v[(size_t)y * gw + x] += (f32)(fy * amb * dt * 8.0);
                         }
                 }
-                /* occasional dye wisps */
+                /* occasional dye wisps — irregular cadence, open trajectory
+                 * (see fluid_sched.h: what the fixed 0.9 s comb used to be) */
                 f->wisp_acc += dt;
-                if (f->wisp_acc > 0.9) {
+                if (f->wisp_acc > fluid_wisp_interval(f->wisp_fires)) {
                         f->wisp_acc = 0;
-                        f64 px = 0.15 + 0.7 * fabs(sin(t * 1.7));
-                        f64 py = 0.15 + 0.7 * fabs(cos(t * 1.1));
-                        splat(f, px, py, sin(t * 2.0) * 0.6, cos(t * 1.6) * 0.6,
-                              ((int)(t * 3) & 1) ? f->dye_a : f->dye_b);
+                        f->wisp_fires++;
+                        f64 wx, wy, wvx, wvy;
+                        bool alt;
+                        fluid_wisp_at(t, f->wisp_fires, &wx, &wy, &wvx, &wvy, &alt);
+                        splat(f, wx, wy, wvx, wvy,
+                              alt ? f->dye_b : f->dye_a);
                 }
         }
 
