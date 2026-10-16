@@ -153,10 +153,83 @@ re-arms the hot-reload watcher on the new theme (its snapshot is taken at
 load time), so file edits on the active theme keep hot-reloading across
 switches. See docs/IPC.md for the full control protocol.
 
+## The bundled collection
+
+Nine themes ship in `themes/`, each an independent unit:
+
+| Theme | Style | Sims |
+|---|---|---|
+| `ripple-lake` | photographic lake, interactive water refraction | ripple |
+| `mountain-dusk` | SVG ridgeline sunset, parallax, valley mist | fluid (soft) |
+| `fluid-aurora` | bright teal/violet fluid ribbons over a deep sky | fluid (bright) |
+| `ember-drift` | dark warm hearth, rising embers | particles |
+| `snowfall` | soft-focus winter evening, drifting snow | particles |
+| `animated-gradients` | pure animated-gradient showcase | none |
+| `nebula-drift` | deep space: starfield + one vast slow nebula billow | fluid (dim, vast) |
+| `aurora-veil` | atmospheric polar curtains, incommensurate sway | none |
+| `light-lattice` | geometric arcs/spokes with a flowing light sweep | none |
+
+No theme depends on another; removing, adding, or updating any subset
+leaves the engine and the remaining themes fully functional (a directory
+holding any subset lists exactly that subset). The near-static themes
+(`aurora-veil`, `light-lattice`, `animated-gradients`) run no solvers at
+all — their cost is gradient rasterization, and static layers are cached.
+
+## Installing individual themes
+
+A theme is a directory (or one `.revpack` file) — there is no bundle, no
+registry, and no install step beyond putting it somewhere:
+
+```sh
+# from a checkout / release tarball:
+cp -r themes/nebula-drift ~/.local/share/reverie-themes/
+./build/reverie ~/.local/share/reverie-themes/nebula-drift
+
+# or ship/receive the single-file form:
+./build/revtool theme pack themes/aurora-veil -o aurora-veil.revpack
+./build/reverie aurora-veil.revpack          # no extraction, ever
+```
+
+To remove a theme, delete its folder or `.revpack`. To verify what a
+directory holds: `revtool theme list <dir>`; to check integrity before
+installing: `revtool theme validate <theme>` (metadata, scene compile,
+asset resolution, engine version gate).
+
+## Creating your own theme
+
+The smallest working theme is two files:
+
+```
+my-theme/
+  theme.json     {"id": "my-theme", "name": "My Theme"}
+  scene.rev      scene "My Theme" { layer bg { type = solid  color = #102030 } }
+```
+
+Build up from there: `stops` gradients, `image` layers (PNG/SVG under
+`assets/`), `fluid`/`ripple`/`particles` sims, `anim` blocks for motion —
+the full vocabulary is documented in `docs/SCENE-FORMAT.md`. Keep the
+per-theme rules in mind: all paths theme-relative, assets under the
+theme directory, no executable files. Validate while iterating:
+
+```sh
+./build/revtool theme validate my-theme
+./build/reverie my-theme -o -s 960x540 -O preview.png   # offline look
+./build/revtool theme pack my-theme -o my-theme.revpack # when done
+```
+
+The engine never requires any particular theme to exist; the built-in
+default behavior (plain `scenes/*.rev`, `--video`, solid fills) works
+with an empty theme collection.
+
 ## Compatibility
 
 * v1 `.revpack` scene packs load exactly as before.
 * Plain `.rev` scenes are unaffected.
-* The bundled themes in `themes/` are the same five wallpapers as
-  `scenes/`, reorganized — identical renders, verified byte-for-byte
-  in the e2e suite.
+* Six of the bundled themes (`ripple-lake`, `mountain-dusk`,
+  `fluid-aurora`, `ember-drift`, `snowfall`, `animated-gradients`) exist
+  twice by convention: as `themes/<id>/` folders and as twin
+  `scenes/<id>.rev` scene files with identical renders (the e2e suite
+  verifies the theme forms byte-for-byte). The three newer themes
+  (`nebula-drift`, `aurora-veil`, `light-lattice`) are theme-only —
+  their asset layout (full-size stars, SVG lattice) lives in their own
+  directories.
