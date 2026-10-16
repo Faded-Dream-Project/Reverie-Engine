@@ -119,8 +119,14 @@ static void lex_token(Lex *lx)
                 return;
         }
 
-        if (isdigit((unsigned char)c) || (c == '.' && lx->p + 1 < lx->end && isdigit((unsigned char)lx->p[1]))) {
+        /* A number may carry a leading '-' (docs promise `-3`); the sign is
+         * scanned into the same token span so rev_parse_f64 sees it. */
+        if (isdigit((unsigned char)c)
+            || (c == '-' && lx->p + 1 < lx->end && isdigit((unsigned char)lx->p[1]))
+            || (c == '.' && lx->p + 1 < lx->end && isdigit((unsigned char)lx->p[1]))) {
                 const char *st = lx->p;
+                if (c == '-')
+                        lex_next(lx);
                 while (lx->p < lx->end && isdigit((unsigned char)lex_peek(lx)))
                         lex_next(lx);
                 if (lex_peek(lx) == '.') {

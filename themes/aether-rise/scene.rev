@@ -1,0 +1,52 @@
+/* Reverie Engine — "Aether Rise"
+   Luminous motes rise from the floor and lean toward the cursor; clicking
+   releases a soft shower. This theme is pure data: it exercises the scene
+   language's full particle vocabulary (emit regions, velocity cones,
+   turbulence, sway, pointer attraction, envelopes, ramps, glow sprites,
+   burst knobs) without touching a line of engine code. */
+
+scene "Aether Rise" {
+    fps = 60
+
+    layer sky {
+        type = gradient
+        shape = linear
+        angle = 90
+        stops = [#05060f, (#0a0d24 0.4), (#010209 1.0)]
+    }
+
+    layer floor {
+        type = gradient
+        shape = radial
+        center = (0.5, 1.05)
+        radius = 0.9
+        stops = [#1b2b5e88, (#0e1636aa 0.4), #00000000]
+        blend = screen
+        anim opacity { from = 0.6; to = 1.0; dur = 9s; ease = sine; mode = pingpong }
+    }
+
+    layer motes {
+        type = particles
+        spawn = both
+        emit_from = bottom
+        direction = -78
+        spread = 22
+        speed = (55, 150)
+        lifetime = (6, 11)
+        rate = 70
+        size = (1.6, 4.4)
+        size_out = 0.22
+        fade_in = 1.2
+        fade_out = 1.8
+        flicker = 0.22
+        turbulence = 0.3
+        sway = 0.35
+        attract = 55
+        drag = 0.05
+        shape = glow
+        colors = [#35e0ff, (#8f6bff 0.45), (#ff6bd6 0.8), #ffd9a0]
+        burst = 42
+        burst_speed = (110, 420)
+        blend = screen
+    }
+}

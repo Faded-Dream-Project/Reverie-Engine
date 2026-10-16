@@ -697,6 +697,7 @@ static const char *VS_PARTICLES =
         "uniform int u_rows;\n"              /* band rows (slots/1024)       */
         "out vec3 v_col;\n"
         "out float v_alpha;\n"
+        "out float v_shape;\n"
         "void main() {\n"
         "    int id = gl_VertexID;\n"
         "    ivec2 pa = ivec2(id % 1024, id / 1024);\n"
@@ -716,21 +717,34 @@ static const char *VS_PARTICLES =
         "    gl_PointSize = min(2.0 * r + 1.0, 63.0);\n"
         "    v_col = col.rgb;\n"
         "    v_alpha = pos.w;\n"
+        "    v_shape = col.w;\n"              /* band1.w rides the shape id */
         "}\n";
 
 static const char *FS_PARTICLES =
         "#version 300 es\n"
-        "precision mediump float;\n"
+        "precision highp float;\n"           /* shapes use exp(); keep parity
+                                               * with the CPU's f64 math */
         "in vec3 v_col;\n"
         "in float v_alpha;\n"
+        "in float v_shape;\n"
         "out vec4 fragColor;\n"
         "void main() {\n"
         "    vec2 d = gl_PointCoord * 2.0 - 1.0;\n"
         "    float d2 = dot(d, d);\n"        /* |d|=1 at r+0.5 px — the CPU's
                                                   distance normalization     */
         "    if (d2 > 1.0) discard;\n"
-        "    float cov = 1.0 - d2;\n"
-        "    cov = cov * cov * v_alpha;\n"
+        "    float t = sqrt(d2);\n"
+        "    float cov;\n"
+        "    int sh = int(v_shape + 0.5);\n"
+        /* coverage mirrors particles.c:shape_cov() shape for shape — the
+         * e2e parity legs hold this to the CPU raster */
+        "    if (sh == 1) { cov = min(1.0, (1.0 - t) * 6.0); }\n"          /* disc  */
+        "    else if (sh == 2) { cov = max(0.0, (exp(-5.0 * d2) - 0.006737947) / 0.993262053); }\n" /* glow */
+        "    else if (sh == 3) { cov = min(1.0, max(0.0, 1.0 - 3.0 * abs(d.x)) + max(0.0, 1.0 - 3.0 * abs(d.y))); }\n" /* spark */
+        "    else if (sh == 4) { float c = max(0.0, 1.0 - abs(d.x) - abs(d.y)); cov = c * c * c; }\n" /* star */
+        "    else if (sh == 5) { cov = clamp(1.0 - abs(t - 0.75) * 5.0, 0.0, 1.0); }\n" /* ring */
+        "    else { cov = 1.0 - d2; cov = cov * cov; }\n"                 /* soft  */
+        "    cov *= v_alpha;\n"
         "    if (cov <= 0.02) discard;\n"     /* the CPU skips these pixels */
         "    fragColor = vec4(v_col, cov);\n"
         "}\n";

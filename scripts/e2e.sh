@@ -302,7 +302,7 @@ stop_xvfb
 # click burst itself. Asymmetric click (0.25,0.25): a mirror lands ~ (0.75,
 # 0.75), far outside the 6% centroid tolerance.
 start_xvfb
-for PROBE in snow embers; do
+for PROBE in snow embers aether; do
     FIX="tests/fixtures/click-probe-$PROBE.rev"
     for TIER in cpu opengl vulkan; do
         if [ "$TIER" = opengl ]; then
@@ -369,7 +369,7 @@ fi
 # the three new themes (nebula-drift / aurora-veil / light-lattice):
 # offline render with pixel sanity (real content, not a flat frame) AND
 # per-theme packed parity — each theme is an independent, distributable unit
-for NEWT in nebula-drift aurora-veil light-lattice; do
+for NEWT in nebula-drift aurora-veil light-lattice aether-rise; do
     ./build/reverie "themes/$NEWT" -o -s 480x270 -O "$OUT/nt_$NEWT.png" \
         > "$OUT/nt_$NEWT.log" 2>&1 || true
     ./build/revtool theme pack "themes/$NEWT" -o "$OUT/$NEWT.revpack" \

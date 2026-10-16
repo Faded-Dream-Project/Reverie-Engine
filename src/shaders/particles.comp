@@ -9,15 +9,19 @@
  * the exact per-pixel source-over sequence GL's fixed-function blend
  * performed, not an approximation.
  *
- * Coverage math is bit-identical to the GL sprites: r = max(1,
+ * Coverage is bit-identical to the GL sprites: r = max(1,
  * floor(size*2)), point size 2r+1 (capped at 63 -> radius 31.5 px),
- * d = (pixel - center) / (r + 0.5), cov = (1 - d^2)^2 * alpha with the
- * cov <= 0.02 skip. The shared list is capped at 256 particles per tile
- * (snowfall-class densities stay far below; overflow particles are
- * dropped for that tile, which is invisible in practice).
+ * d = (pixel - center) / (r + 0.5), cov = shape(d) * alpha with the
+ * cov <= 0.02 skip. The shape function mirrors particles.c:shape_cov()
+ * and FS_PARTICLES shape for shape (soft/disc/glow/spark/star/ring) —
+ * the e2e parity legs hold all three rasterizers to each other. The
+ * shared list is capped at 256 particles per tile (snowfall-class
+ * densities stay far below; overflow particles are dropped for that
+ * tile, which is invisible in practice).
  *
  * Band layout (RSimParticles): RGBA32F image, 1024 wide; band 0 at rows
- * 0..rows-1 = (x, y, size, alpha), band 1 at rows rows..2*rows-1 = rgb.
+ * 0..rows-1 = (x, y, size, alpha), band 1 at rows rows..2*rows-1 =
+ * (r, g, b, SHAPE).
  *
  * UBO:
  *   [0] frame dims (w,h), n, rows
@@ -37,7 +41,7 @@ layout(rgba8, set = 0, binding = 7) uniform image2D dst_img;
 
 shared int s_count;
 shared vec4 s_pos[LIST_CAP];    /* x, y, R, alpha */
-shared vec4 s_col[LIST_CAP];    /* r, g, b, - */
+shared vec4 s_col[LIST_CAP];    /* r, g, b, shape */
 
 vec4 part_at(int i, int rows)
 {
@@ -95,8 +99,26 @@ void main()
                 float d2 = dot(d, d);
                 if (d2 > 1.0)
                     continue;
-                float cov = 1.0 - d2;
-                cov = cov * cov * s_pos[j].w;
+                float t = sqrt(d2);
+                float cov;
+                int sh = int(s_col[j].w + 0.5);
+                if (sh == 1) {
+                    cov = min(1.0, (1.0 - t) * 6.0);                      /* disc  */
+                } else if (sh == 2) {
+                    cov = max(0.0, (exp(-5.0 * d2) - 0.006737947) / 0.993262053); /* glow */
+                } else if (sh == 3) {
+                    cov = min(1.0, max(0.0, 1.0 - 3.0 * abs(d.x))
+                                 + max(0.0, 1.0 - 3.0 * abs(d.y)));       /* spark */
+                } else if (sh == 4) {
+                    float c = max(0.0, 1.0 - abs(d.x) - abs(d.y));
+                    cov = c * c * c;                                       /* star */
+                } else if (sh == 5) {
+                    cov = clamp(1.0 - abs(t - 0.75) * 5.0, 0.0, 1.0);     /* ring  */
+                } else {
+                    cov = 1.0 - d2;
+                    cov = cov * cov;                                       /* soft  */
+                }
+                cov *= s_pos[j].w;
                 if (cov <= 0.02)
                     continue;    /* the CPU/GL paths skip these pixels */
                 vec3 rgb = s_col[j].rgb;

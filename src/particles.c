@@ -20,27 +20,164 @@ static f64 rnd(void)
 }
 
 typedef struct Part_ {
-        f64 x, y;        /* device px            */
-        f64 vx, vy;      /* px/s                 */
+        f64 x, y;        /* device px                          */
+        f64 vx, vy;      /* px/s                               */
         f64 life, maxlife;
-        f64 size;
+        f64 size0;       /* sprite radius at birth, px         */
+        f64 size1;       /* radius at end of life (size_out)   */
         RColor c;
-        bool spark;      /* pointer-spawned burst particle */
+        bool spark;      /* pointer-spawned burst particle    */
 } Part;
 
 struct RevParticles {
         u32 w, h;
         Part *parts;
         int cap, n;
-        int preset, spawn;
-        f64 rate, size, gravity, drift;
-        RColor c0, c1;
+        PartCfg cfg;
         f64 emit_acc;
-        f64 px, py;
+        f64 px, py;      /* pointer, [0..1]                   */
         bool pressed;
 };
 
 #define PS RevParticles
+
+/* ---------------------------------------------------------------- presets */
+
+static void ramp2(PartCfg *c, RColor a, RColor b)
+{
+        c->ramp[0] = a;
+        c->ramp[1] = b;
+        c->ramp_t[0] = 0;
+        c->ramp_t[1] = 1;
+        c->nramp = 2;
+}
+
+void particles_preset(int preset, PartCfg *c)
+{
+        memset(c, 0, sizeof *c);
+        c->spawn = RPSPAWN_AMBIENT;
+        c->emit_from = RPEMIT_EVERYWHERE;
+        c->area[0] = 0; c->area[1] = 0; c->area[2] = 1; c->area[3] = 1;
+        c->rate = 60;
+        c->dir_deg = 90;
+        c->spread_deg = 180;
+        c->speed0 = 0;
+        c->speed1 = 30;
+        c->gravity = 0;
+        c->life0 = 3;
+        c->life1 = 7;
+        c->size0 = 1.8;
+        c->size1 = 4.2;
+        c->size_out = 1.0;
+        c->fade_in = 0;
+        c->fade_out = -1;          /* the classic last-20% tail */
+        c->flicker = 0;
+        c->shape = RSHAPE_SOFT;
+        ramp2(c, rev_rgb(255, 200, 120), rev_rgb(255, 90, 60));
+        c->burst = 24;
+        c->burst_speed0 = 90;
+        c->burst_speed1 = 350;
+        c->burst_size = 3;
+        c->streaks = false;
+
+        switch (preset) {
+        case RPPRESET_RAIN:
+                /* baked-in fall speed, constant (no per-frame gravity —
+                 * that is what the original emitter did) */
+                c->rate = 340;
+                c->emit_from = RPEMIT_TOP;
+                c->dir_deg = 90;
+                c->spread_deg = 2;
+                c->speed0 = 1105;
+                c->speed1 = 1495;
+                c->life0 = c->life1 = 4;
+                c->size0 = c->size1 = 1.6;
+                c->burst_size = 1.6;
+                ramp2(c, rev_rgba(170, 200, 255, 190), rev_rgba(120, 160, 230, 150));
+                c->streaks = true;
+                break;
+        case RPPRESET_SNOW:
+                c->rate = 90;
+                c->emit_from = RPEMIT_TOP;
+                c->dir_deg = 90;
+                c->spread_deg = 40;
+                c->speed0 = 33;
+                c->speed1 = 77;
+                c->life0 = c->life1 = 20;
+                c->size0 = 1.56;
+                c->size1 = 3.9;
+                c->burst_size = 2.6;
+                c->sway = 1.0;
+                ramp2(c, rev_rgba(255, 255, 255, 230), rev_rgba(220, 235, 255, 180));
+                break;
+        case RPPRESET_EMBERS:
+                c->rate = 55;
+                c->emit_from = RPEMIT_BOTTOM;
+                c->dir_deg = -90;
+                c->spread_deg = 20;
+                c->speed0 = 35;
+                c->speed1 = 105;
+                c->life0 = c->life1 = 6;
+                c->size0 = 1.1;
+                c->size1 = 2.2;
+                c->burst_size = 2.2;
+                c->flicker = 0.9;
+                ramp2(c, rev_rgba(255, 170, 60, 230), rev_rgba(255, 60, 30, 200));
+                break;
+        case RPPRESET_PETALS:
+                c->rate = 24;
+                c->emit_from = RPEMIT_TOP;
+                c->dir_deg = 90;
+                c->spread_deg = 50;
+                c->speed0 = 25;
+                c->speed1 = 66;
+                c->life0 = c->life1 = 20;
+                c->size0 = 2.7;
+                c->size1 = 6.75;
+                c->burst_size = 4.5;
+                c->sway = 1.0;
+                ramp2(c, rev_rgba(255, 170, 200, 220), rev_rgba(255, 120, 170, 200));
+                break;
+        case RPPRESET_FIREflies:
+                c->rate = 14;
+                c->emit_from = RPEMIT_EVERYWHERE;
+                c->spread_deg = 180;
+                c->speed0 = 0;
+                c->speed1 = 25;
+                c->life0 = 3;
+                c->life1 = 8;
+                c->size0 = c->size1 = 2.4;
+                c->burst_size = 2.4;
+                c->flicker = 0.9;
+                ramp2(c, rev_rgba(220, 255, 140, 210), rev_rgba(160, 255, 120, 160));
+                break;
+        default:
+                break;      /* CUSTOM keeps the plain defaults above */
+        }
+}
+
+/* ------------------------------------------------------------ color ramp */
+
+static RColor ramp_sample(const PartCfg *c, f64 t)
+{
+        if (c->nramp <= 0)
+                return rev_rgb(255, 255, 255);
+        if (c->nramp == 1 || t <= c->ramp_t[0])
+                return c->ramp[0];
+        if (t >= c->ramp_t[c->nramp - 1])
+                return c->ramp[c->nramp - 1];
+        for (int i = 0; i < c->nramp - 1; i++) {
+                f64 a = c->ramp_t[i], b = c->ramp_t[i + 1];
+                if (t >= a && t <= b) {
+                        f64 span = b - a;
+                        f64 k = span > 1e-9 ? (t - a) / span : 0;
+                        return rev_lerp_color(c->ramp[i], c->ramp[i + 1], k);
+                }
+        }
+        return c->ramp[c->nramp - 1];
+}
+
+/* ------------------------------------------------------------- lifecycle */
 
 RevParticles *particles_new(u32 w, u32 h)
 {
@@ -51,14 +188,7 @@ RevParticles *particles_new(u32 w, u32 h)
         p->h = h;
         p->cap = 4096;
         p->parts = (Part *)calloc((size_t)p->cap, sizeof(Part));
-        p->spawn = RPSPAWN_AMBIENT;
-        p->preset = RPPRESET_CUSTOM;
-        p->rate = 60;
-        p->size = 3;
-        p->gravity = 60;
-        p->drift = 20;
-        p->c0 = rev_rgb(255, 200, 120);
-        p->c1 = rev_rgb(255, 90, 60);
+        particles_preset(RPPRESET_CUSTOM, &p->cfg);
         return p;
 }
 
@@ -70,61 +200,17 @@ void particles_free(RevParticles *p)
         free(p);
 }
 
-void particles_configure(RevParticles *pp, int preset,
-                         int count, f64 rate, f64 size, f64 gravity, f64 drift,
-                         int spawn, RColor c0, RColor c1)
+void particles_setup(RevParticles *pp, const PartCfg *cfg)
 {
         struct RevParticles *p = pp;
-        if (!p)
+        if (!p || !cfg)
                 return;
-        p->preset = preset;
-        p->spawn = spawn;
-        p->c0 = c0;
-        p->c1 = c1;
-
-        switch (preset) {
-        case RPPRESET_RAIN:
-                p->rate = 340; p->size = 1.6; p->gravity = 1300; p->drift = 30;
-                p->c0 = rev_rgba(170, 200, 255, 190);
-                p->c1 = rev_rgba(120, 160, 230, 150);
-                break;
-        case RPPRESET_SNOW:
-                p->rate = 90; p->size = 2.6; p->gravity = 55; p->drift = 45;
-                p->c0 = rev_rgba(255, 255, 255, 230);
-                p->c1 = rev_rgba(220, 235, 255, 180);
-                break;
-        case RPPRESET_EMBERS:
-                p->rate = 55; p->size = 2.2; p->gravity = -70; p->drift = 26;
-                p->c0 = rev_rgba(255, 170, 60, 230);
-                p->c1 = rev_rgba(255, 60, 30, 200);
-                break;
-        case RPPRESET_PETALS:
-                p->rate = 24; p->size = 4.5; p->gravity = 42; p->drift = 60;
-                p->c0 = rev_rgba(255, 170, 200, 220);
-                p->c1 = rev_rgba(255, 120, 170, 200);
-                break;
-        case RPPRESET_FIREflies:
-                p->rate = 14; p->size = 2.4; p->gravity = 0; p->drift = 18;
-                p->c0 = rev_rgba(220, 255, 140, 210);
-                p->c1 = rev_rgba(160, 255, 120, 160);
-                break;
-        default:
-                p->rate = rate;
-                p->size = size;
-                p->gravity = gravity;
-                p->drift = drift;
-                break;
-        }
-        if (preset == RPPRESET_CUSTOM) {
-                p->rate = rate;
-                p->size = size;
-                p->gravity = gravity;
-                p->drift = drift;
-        }
-        (void)count;
+        p->cfg = *cfg;
+        p->n = 0;
+        p->emit_acc = 0;
 }
 
-static void emit(struct RevParticles *p, bool spark);
+static void emit(PS *p, bool spark);
 
 void particles_pointer(RevParticles *pp, f64 x, f64 y, bool pressed)
 {
@@ -156,67 +242,75 @@ static void emit(PS *p, bool spark)
 {
         if (p->n >= p->cap)
                 return;
+        const PartCfg *c = &p->cfg;
         Part *t = &p->parts[p->n++];
         memset(t, 0, sizeof *t);
-        f64 mixc = rnd();
-        t->c = rev_lerp_color(p->c0, p->c1, mixc);
+
+        t->c = ramp_sample(c, rnd());
 
         if (spark) {
                 t->x = p->px * p->w;
                 t->y = p->py * p->h;
                 f64 ang = rnd() * 2.0 * M_PI;
-                f64 spd = 90 + rnd() * 260;
+                f64 spd = c->burst_speed0 + rnd() * (c->burst_speed1 - c->burst_speed0);
                 t->vx = cos(ang) * spd;
                 t->vy = sin(ang) * spd - 60;
                 t->maxlife = 0.7 + rnd() * 0.8;
-                t->size = p->size * (0.7 + rnd() * 0.8);
+                t->size0 = c->burst_size * (0.7 + rnd() * 0.8);
+                t->size1 = t->size0 * c->size_out;
                 t->spark = true;
                 return;
         }
 
-        switch (p->preset) {
-        case RPPRESET_RAIN:
-                t->x = rnd() * p->w * 1.2 - p->w * 0.1;
-                t->y = -8;
-                t->vx = (rnd() - 0.5) * p->drift;
-                t->vy = p->gravity * (0.85 + rnd() * 0.3);
-                t->maxlife = 4.0;
-                t->size = p->size;
-                break;
-        case RPPRESET_SNOW:
-        case RPPRESET_PETALS:
+        /* spawn position by region */
+        switch (c->emit_from) {
+        case RPEMIT_TOP:
                 t->x = rnd() * p->w * 1.1 - p->w * 0.05;
                 t->y = -8;
-                t->vx = (rnd() - 0.5) * p->drift;
-                t->vy = p->gravity * (0.6 + rnd() * 0.8);
-                t->maxlife = 20.0;
-                t->size = p->size * (0.6 + rnd() * 0.9);
                 break;
-        case RPPRESET_EMBERS:
+        case RPEMIT_BOTTOM:
                 t->x = rnd() * p->w;
                 t->y = p->h + 6;
-                t->vx = (rnd() - 0.5) * p->drift;
-                t->vy = p->gravity * (0.5 + rnd()) ;
-                t->maxlife = 6.0;
-                t->size = p->size * (0.5 + rnd());
                 break;
-        case RPPRESET_FIREflies:
-                t->x = rnd() * p->w;
+        case RPEMIT_LEFT:
+                t->x = -8;
                 t->y = rnd() * p->h;
-                t->vx = (rnd() - 0.5) * p->drift * 2;
-                t->vy = (rnd() - 0.5) * p->drift * 2;
-                t->maxlife = 3 + rnd() * 5;
-                t->size = p->size;
                 break;
+        case RPEMIT_RIGHT:
+                t->x = p->w + 8;
+                t->y = rnd() * p->h;
+                break;
+        case RPEMIT_EDGES:
+                switch ((int)(rnd() * 4)) {
+                case 0:  t->x = rnd() * p->w * 1.1 - p->w * 0.05; t->y = -8;     break;
+                case 1:  t->x = rnd() * p->w;                      t->y = p->h + 6; break;
+                case 2:  t->x = -8;                                t->y = rnd() * p->h; break;
+                default: t->x = p->w + 8;                          t->y = rnd() * p->h; break;
+                }
+                break;
+        case RPEMIT_AREA: {
+                f64 ax = c->area[0] + rnd() * c->area[2];
+                f64 ay = c->area[1] + rnd() * c->area[3];
+                t->x = ax * p->w;
+                t->y = ay * p->h;
+                break;
+        }
         default:
                 t->x = rnd() * p->w;
                 t->y = rnd() * p->h;
-                t->vx = (rnd() - 0.5) * p->drift * 2;
-                t->vy = (rnd() - 0.5) * p->drift * 2;
-                t->maxlife = 3 + rnd() * 4;
-                t->size = p->size * (0.6 + rnd() * 0.8);
                 break;
         }
+
+        /* initial velocity: the direction cone */
+        f64 deg = c->dir_deg + (rnd() - 0.5) * c->spread_deg;
+        f64 rad = deg * (M_PI / 180.0);
+        f64 spd = c->speed0 + rnd() * (c->speed1 - c->speed0);
+        t->vx = cos(rad) * spd;
+        t->vy = sin(rad) * spd;
+
+        t->maxlife = c->life0 + rnd() * (c->life1 - c->life0);
+        t->size0 = c->size0 + rnd() * (c->size1 - c->size0);
+        t->size1 = t->size0 * c->size_out;
 }
 
 void particles_step(RevParticles *pp, f64 dt)
@@ -226,17 +320,18 @@ void particles_step(RevParticles *pp, f64 dt)
                 return;
         if (dt <= 0) dt = 1.0 / 60.0;
         if (dt > 0.1) dt = 0.1;
+        const PartCfg *c = &p->cfg;
 
         /* ambient emission */
-        if (p->spawn == RPSPAWN_AMBIENT || p->spawn == RPSPAWN_BOTH) {
-                p->emit_acc += p->rate * dt;
+        if (c->spawn == RPSPAWN_AMBIENT || c->spawn == RPSPAWN_BOTH) {
+                p->emit_acc += c->rate * dt;
                 while (p->emit_acc >= 1.0) {
                         emit(p, false);
                         p->emit_acc -= 1.0;
                 }
         }
-        /* pointer sparks */
-        if (p->pressed && (p->spawn == RPSPAWN_POINTER || p->spawn == RPSPAWN_BOTH)) {
+        /* pointer sparks while the button is held */
+        if (p->pressed && (c->spawn == RPSPAWN_POINTER || c->spawn == RPSPAWN_BOTH)) {
                 p->emit_acc += 160 * dt;
                 while (p->emit_acc >= 1.0) {
                         emit(p, true);
@@ -244,17 +339,45 @@ void particles_step(RevParticles *pp, f64 dt)
                 }
         }
 
+        f64 drag_k = c->drag > 0 ? c->drag * dt : 0;
+        if (drag_k > 1) drag_k = 1;
+        f64 tx = p->px * p->w, ty = p->py * p->h;
+
         int n = 0;
         for (int i = 0; i < p->n; i++) {
                 Part *t = &p->parts[i];
                 t->life += dt;
                 if (t->life >= t->maxlife)
                         continue;
-                t->vy += (t->spark ? -220.0 : 0.0) * dt;   /* sparks arc upward */
-                if (p->preset == RPPRESET_SNOW || p->preset == RPPRESET_PETALS) {
-                        /* gentle sway */
-                        t->vx += sin(t->life * 2.2 + t->x * 0.02) * 26.0 * dt;
+
+                /* continuous fields */
+                if (c->gravity != 0)
+                        t->vy += c->gravity * dt;
+                if (c->wind[0] != 0 || c->wind[1] != 0) {
+                        t->vx += c->wind[0] * dt;
+                        t->vy += c->wind[1] * dt;
                 }
+                if (c->turbulence > 0) {
+                        t->vx += (rnd() - 0.5) * c->turbulence * 400.0 * dt;
+                        t->vy += (rnd() - 0.5) * c->turbulence * 400.0 * dt;
+                }
+                if (c->sway > 0)
+                        t->vx += sin(t->life * 2.2 + t->x * 0.02) * 26.0 * c->sway * dt;
+                if (drag_k > 0) {
+                        t->vx *= 1.0 - drag_k;
+                        t->vy *= 1.0 - drag_k;
+                }
+                if (c->attract != 0) {
+                        f64 dx = tx - t->x, dy = ty - t->y;
+                        f64 len = sqrt(dx * dx + dy * dy);
+                        if (len > 1.0) {
+                                t->vx += dx / len * c->attract * dt;
+                                t->vy += dy / len * c->attract * dt;
+                        }
+                }
+                if (t->spark)
+                        t->vy += -220.0 * dt;    /* bursts arc upward (legacy) */
+
                 t->x += t->vx * dt;
                 t->y += t->vy * dt;
                 if (t->x < -40 || t->x > p->w + 40 || t->y > p->h + 60 || t->y < -60)
@@ -266,47 +389,98 @@ void particles_step(RevParticles *pp, f64 dt)
         p->n = n;
 }
 
-/* soft radial sprite (16x16 coverage LUT, scaled) */
-static const u8 SPRITE[16][16] = {
-        {0,0,0,0,0,0,1,2,2,1,0,0,0,0,0,0},
-        {0,0,0,1,2,4,6,8,8,6,4,2,1,0,0,0},
-        {0,0,2,4,7,10,13,15,15,13,10,7,4,2,0,0},
-        {0,1,4,8,12,16,20,23,23,20,16,12,8,4,1,0},
-        {0,2,7,12,17,22,26,29,29,26,22,17,12,7,2,0},
-        {0,4,10,16,22,28,33,36,36,33,28,22,16,10,4,0},
-        {1,6,13,20,26,33,39,42,42,39,33,26,20,13,6,1},
-        {2,8,15,23,29,36,42,46,46,42,36,29,23,15,8,2},
-        {2,8,15,23,29,36,42,46,46,42,36,29,23,15,8,2},
-        {1,6,13,20,26,33,39,42,42,39,33,26,20,13,6,1},
-        {0,4,10,16,22,28,33,36,36,33,28,22,16,10,4,0},
-        {0,2,7,12,17,22,26,29,29,26,22,17,12,7,2,0},
-        {0,1,4,8,12,16,20,23,23,20,16,12,8,4,1,0},
-        {0,0,2,4,7,10,13,15,15,13,10,7,4,2,0,0},
-        {0,0,0,1,2,4,6,8,8,6,4,2,1,0,0,0},
-        {0,0,0,0,0,0,1,2,2,1,0,0,0,0,0,0},
-};
+/* ------------------------------------------------------ shared appearance */
+
+/* The per-particle alpha envelope — one formula, used by BOTH the CPU
+ * raster and particles_pack (the GPU tiers read the packed value, so the
+ * three renderers agree by construction). */
+static f64 part_alpha(const PS *p, const Part *t, int i)
+{
+        const PartCfg *c = &p->cfg;
+        f64 a = 1.0;
+        if (c->fade_in > 0) {
+                f64 f = t->life / c->fade_in;
+                a *= f < 1.0 ? f : 1.0;
+        }
+        if (c->fade_out >= 0) {
+                f64 f = (t->maxlife - t->life) / c->fade_out;
+                a *= f < 0 ? 0 : (f < 1 ? f : 1);
+        } else {
+                f64 fade = t->life / t->maxlife;    /* the classic tail */
+                a *= fade < 0.8 ? 1.0 : 1.0 - (fade - 0.8) / 0.2;
+        }
+        if (c->flicker > 0)
+                a *= (1.0 - c->flicker) + c->flicker * (0.5 + 0.5 * sin(t->life * 6.0 + i));
+        return a;
+}
+
+/* Radius at the current point of life (size_out interpolation). */
+static f64 part_size(const Part *t)
+{
+        f64 k = t->life / t->maxlife;
+        return t->size0 + (t->size1 - t->size0) * (k < 0 ? 0 : (k > 1 ? 1 : k));
+}
+
+/* Shape coverage at unit-space coordinates (u, v) in [-1,1] — mirrored in
+ * FS_PARTICLES (render_gl.c) and particles.comp; the parity legs hold the
+ * three to each other. */
+static f64 shape_cov(int shape, f64 u, f64 v)
+{
+        f64 d2 = u * u + v * v;
+        if (d2 > 1.0)
+                return 0.0;
+        f64 t = sqrt(d2);
+        f64 c;
+        switch (shape) {
+        case RSHAPE_DISC:
+                c = (1.0 - t) * 6.0;
+                return c > 1 ? 1 : c;
+        case RSHAPE_GLOW:
+                c = (exp(-5.0 * d2) - 0.006737946999) / 0.993262053;
+                return c < 0 ? 0 : c;
+        case RSHAPE_SPARK: {
+                f64 a1 = 1.0 - 3.0 * fabs(u);
+                f64 a2 = 1.0 - 3.0 * fabs(v);
+                if (a1 < 0) a1 = 0;
+                if (a2 < 0) a2 = 0;
+                c = a1 + a2;
+                return c > 1 ? 1 : c;
+        }
+        case RSHAPE_STAR:
+                c = 1.0 - fabs(u) - fabs(v);
+                if (c < 0)
+                        return 0;
+                return c * c * c;
+        case RSHAPE_RING:
+                c = 1.0 - fabs(t - 0.75) * 5.0;
+                return c < 0 ? 0 : (c > 1 ? 1 : c);
+        default:                    /* RSHAPE_SOFT */
+                c = 1.0 - d2;
+                return c * c;
+        }
+}
+
+/* ------------------------------------------------------------- rendering */
 
 void particles_render(const RevParticles *pp, u32 *px, u32 w, u32 h)
 {
         const struct RevParticles *p = pp;
         if (!p || !px)
                 return;
+        const PartCfg *cfg = &p->cfg;
 
         for (int i = 0; i < p->n; i++) {
                 const Part *t = &p->parts[i];
-                f64 fade = t->life / t->maxlife;
-                f64 alpha = fade < 0.8 ? 1.0 : (1.0 - (fade - 0.8) / 0.2);
-                if (p->preset == RPPRESET_FIREflies || p->preset == RPPRESET_EMBERS)
-                        alpha *= 0.55 + 0.45 * sin(t->life * 6.0 + i);
+                f64 alpha = part_alpha(p, t, i);
                 if (alpha <= 0.02)
                         continue;
 
-                f64 sz = t->size;
+                f64 sz = part_size(t);
                 if (sz < 0.5) sz = 0.5;
                 f64 cx = t->x, cy = t->y;
 
-                /* streaks for rain */
-                if (p->preset == RPPRESET_RAIN) {
+                /* rain's velocity streaks — the CPU-only sprite */
+                if (cfg->streaks) {
                         f64 len = sz * 9.0;
                         i32 x0 = (i32)(cx - sz), x1 = (i32)(cx + sz + 1);
                         i32 y0 = (i32)(cy - len), y1 = (i32)(cy + len * 0.25);
@@ -336,8 +510,7 @@ void particles_render(const RevParticles *pp, u32 *px, u32 w, u32 h)
                         continue;
                 }
 
-                /* round soft sprite */
-                i32 r = (i32)(sz * 2.0);
+                f64 r = sz * 2.0;
                 if (r < 1) r = 1;
                 i32 x0 = (i32)(cx - r), x1 = (i32)(cx + r);
                 i32 y0 = (i32)(cy - r), y1 = (i32)(cy + r);
@@ -345,12 +518,9 @@ void particles_render(const RevParticles *pp, u32 *px, u32 w, u32 h)
                         if (y < 0 || y >= (i32)h) continue;
                         for (i32 x = x0; x <= x1; x++) {
                                 if (x < 0 || x >= (i32)w) continue;
-                                f64 ddx = (f64)x - cx, ddy = (f64)y - cy;
-                                f64 dist = sqrt(ddx * ddx + ddy * ddy) / (r + 0.5);
-                                if (dist > 1.0) continue;
-                                f64 cov = (1.0 - dist * dist);
-                                cov *= cov;
-                                cov *= alpha;
+                                f64 u = ((f64)x - cx) / (r + 0.5);
+                                f64 v = ((f64)y - cy) / (r + 0.5);
+                                f64 cov = shape_cov(cfg->shape, u, v) * alpha;
                                 if (cov <= 0.02) continue;
                                 u32 dst = px[(size_t)y * w + x];
                                 u32 sa = (u32)(t->c.a * cov);
@@ -369,37 +539,32 @@ void particles_render(const RevParticles *pp, u32 *px, u32 w, u32 h)
                         }
                 }
         }
-        (void)SPRITE;
 }
 
 u32 particles_pack(const RevParticles *pp, f32 *band0, f32 *band1, u32 slots)
 {
-	const struct RevParticles *p = pp;
-	if (!p || !band0 || !band1 || slots == 0)
-		return 0;
-	u32 n = 0;
-	for (int i = 0; i < p->n && n < slots; i++) {
-		const Part *t = &p->parts[i];
-		/* alpha exactly as particles_render computes it */
-		f64 fade = t->life / t->maxlife;
-		f64 alpha = fade < 0.8 ? 1.0 : (1.0 - (fade - 0.8) / 0.2);
-		if (p->preset == RPPRESET_FIREflies || p->preset == RPPRESET_EMBERS)
-			alpha *= 0.55 + 0.45 * sin(t->life * 6.0 + i);
-		if (alpha <= 0.02)
-			continue;
-		f64 sz = t->size;
-		if (sz < 0.5) sz = 0.5;
-		f32 *a = band0 + (size_t)n * 4;
-		a[0] = (f32)t->x;
-		a[1] = (f32)t->y;
-		a[2] = (f32)sz;
-		a[3] = (f32)alpha;
-		f32 *b = band1 + (size_t)n * 4;
-		b[0] = (f32)t->c.r / 255.0f;
-		b[1] = (f32)t->c.g / 255.0f;
-		b[2] = (f32)t->c.b / 255.0f;
-		b[3] = 0.0f;
-		n++;
-	}
-	return n;
+        const struct RevParticles *p = pp;
+        if (!p || !band0 || !band1 || slots == 0)
+                return 0;
+        u32 n = 0;
+        for (int i = 0; i < p->n && n < slots; i++) {
+                const Part *t = &p->parts[i];
+                f64 alpha = part_alpha(p, t, i);   /* exactly what render uses */
+                if (alpha <= 0.02)
+                        continue;
+                f64 sz = part_size(t);
+                if (sz < 0.5) sz = 0.5;
+                f32 *a = band0 + (size_t)n * 4;
+                a[0] = (f32)t->x;
+                a[1] = (f32)t->y;
+                a[2] = (f32)sz;
+                a[3] = (f32)alpha;
+                f32 *b = band1 + (size_t)n * 4;
+                b[0] = (f32)t->c.r / 255.0f;
+                b[1] = (f32)t->c.g / 255.0f;
+                b[2] = (f32)t->c.b / 255.0f;
+                b[3] = (f32)p->cfg.shape;      /* band1.w rides the shape id */
+                n++;
+        }
+        return n;
 }

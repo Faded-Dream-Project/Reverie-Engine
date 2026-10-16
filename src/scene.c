@@ -71,9 +71,8 @@ typedef struct RTLayer {
 
         f64 r_strength, r_damping, r_radius;
 
-        int p_preset, p_spawn;
-        f64 p_rate, p_size, p_grav, p_drift;
-        RColor p_c0, p_c1;
+        int p_preset;          /* preset id (diagnostics only — values live in pcfg) */
+        PartCfg pcfg;          /* the full particle layer configuration      */
 
         bool v_loop, v_paused; /* video layer                              */
         RevVideo *vid;         /* layer-level decoder (shared by monitors) */
@@ -263,6 +262,8 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
         static const char *shape_names[] = { "linear", "radial" };
         static const char *spawn_names[] = { "ambient", "pointer", "both" };
         static const char *preset_names[] = { "custom", "rain", "snow", "embers", "petals", "fireflies" };
+        static const char *emit_names[] = { "top", "bottom", "left", "right", "edges", "area", "everywhere" };
+        static const char *pshape_names[] = { "soft", "disc", "glow", "spark", "star", "ring" };
         static const char *ease_names[] = { "linear", "sine", "quad", "cubic", "quart", "expo", "back", "elastic", "bounce" };
         static const char *mode_names[] = { "once", "loop", "pingpong" };
         static const char *anim_targets[] = { "opacity", "blur", "parallax", "force", "angle", "strength", "radius" };
@@ -292,13 +293,7 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                 rt->r_damping = 0.12;
                 rt->r_radius = 0.01;
                 rt->p_preset = RPPRESET_CUSTOM;
-                rt->p_spawn = RPSPAWN_AMBIENT;
-                rt->p_rate = 60;
-                rt->p_size = 3;
-                rt->p_grav = 60;
-                rt->p_drift = 20;
-                rt->p_c0 = rev_rgb(255, 200, 120);
-                rt->p_c1 = rev_rgb(255, 90, 60);
+                particles_preset(RPPRESET_CUSTOM, &rt->pcfg);
 
                 /* type (required) */
                 const RVal *tv = getp(L->props, L->nprops, "type");
@@ -434,24 +429,172 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                         if ((v = getp(L->props, L->nprops, "radius")))   val_num(v, &rt->r_radius);
                         sc->animated = true;
                 } else if (rt->type == LT_PARTICLES) {
+                        /* The preset fills the whole config FIRST; every
+                         * explicit property below overrides it — a preset
+                         * is a starting point, not a cage. */
                         if ((v = getp(L->props, L->nprops, "preset"))) {
                                 int p = map_ident(v, preset_names, 6);
                                 if (p < 0)
-                                        { fail(err, errcap, "layer '%s': unknown preset '%s'", rt->name, v->str); goto bad; }
+                                        { fail(err, errcap, "layer '%s': unknown preset '%s' (rain|snow|embers|petals|fireflies)",
+                                                    rt->name, v->str); goto bad; }
                                 rt->p_preset = p;
                         }
-                        if ((v = getp(L->props, L->nprops, "rate")))   val_num(v, &rt->p_rate);
-                        if ((v = getp(L->props, L->nprops, "size")))   val_num(v, &rt->p_size);
-                        if ((v = getp(L->props, L->nprops, "gravity"))) val_num(v, &rt->p_grav);
-                        if ((v = getp(L->props, L->nprops, "drift")))  val_num(v, &rt->p_drift);
+                        particles_preset(rt->p_preset, &rt->pcfg);
+                        PartCfg *pc = &rt->pcfg;
                         if ((v = getp(L->props, L->nprops, "spawn"))) {
                                 int s = map_ident(v, spawn_names, 3);
                                 if (s < 0)
                                         { fail(err, errcap, "layer '%s': spawn must be ambient|pointer|both", rt->name); goto bad; }
-                                rt->p_spawn = s;
+                                pc->spawn = s;
                         }
-                        val_color(getp(L->props, L->nprops, "color"), &rt->p_c0);
-                        val_color(getp(L->props, L->nprops, "color2"), &rt->p_c1);
+                        if ((v = getp(L->props, L->nprops, "rate")))        val_num(v, &pc->rate);
+                        if ((v = getp(L->props, L->nprops, "gravity")))     val_num(v, &pc->gravity);
+                        if ((v = getp(L->props, L->nprops, "drift"))) {
+                                f64 d = 0;   /* legacy: the custom speed range */
+                                if (!val_num(v, &d))
+                                        { fail(err, errcap, "layer '%s': drift must be a number", rt->name); goto bad; }
+                                pc->speed0 = d * 0.5;
+                                pc->speed1 = d * 1.5;
+                        }
+                        if ((v = getp(L->props, L->nprops, "size"))) {
+                                if (v->kind == RV_TUPLE && v->n == 2) {
+                                        if (!val_num(v->items[0], &pc->size0) || !val_num(v->items[1], &pc->size1))
+                                                { fail(err, errcap, "layer '%s': size = N or (min, max) px", rt->name); goto bad; }
+                                } else if (!val_num(v, &pc->size0)) {
+                                        { fail(err, errcap, "layer '%s': size = N or (min, max) px", rt->name); goto bad; }
+                                } else {
+                                        pc->size1 = pc->size0;
+                                }
+                        }
+                        if ((v = getp(L->props, L->nprops, "size_out")))    val_num(v, &pc->size_out);
+                        if ((v = getp(L->props, L->nprops, "lifetime"))) {
+                                if (v->kind == RV_TUPLE && v->n == 2) {
+                                        if (!val_num(v->items[0], &pc->life0) || !val_num(v->items[1], &pc->life1))
+                                                { fail(err, errcap, "layer '%s': lifetime = (min, max) seconds", rt->name); goto bad; }
+                                } else if (!val_num(v, &pc->life0)) {
+                                        { fail(err, errcap, "layer '%s': lifetime = (min, max) seconds", rt->name); goto bad; }
+                                } else {
+                                        pc->life1 = pc->life0;
+                                }
+                        }
+                        if ((v = getp(L->props, L->nprops, "emit_from"))) {
+                                int e = map_ident(v, emit_names, 7);
+                                if (e < 0)
+                                        { fail(err, errcap, "layer '%s': emit_from must be top|bottom|left|right|edges|area|everywhere",
+                                                    rt->name); goto bad; }
+                                pc->emit_from = e;
+                        }
+                        if ((v = getp(L->props, L->nprops, "emit_area"))) {
+                                if (v->kind != RV_TUPLE || v->n != 4 ||
+                                    !val_num(v->items[0], &pc->area[0]) || !val_num(v->items[1], &pc->area[1]) ||
+                                    !val_num(v->items[2], &pc->area[2]) || !val_num(v->items[3], &pc->area[3]))
+                                        { fail(err, errcap, "layer '%s': emit_area = (x, y, w, h) relative", rt->name); goto bad; }
+                        }
+                        if ((v = getp(L->props, L->nprops, "direction")))   val_num(v, &pc->dir_deg);
+                        if ((v = getp(L->props, L->nprops, "spread")))      val_num(v, &pc->spread_deg);
+                        if ((v = getp(L->props, L->nprops, "speed"))) {
+                                if (v->kind == RV_TUPLE && v->n == 2) {
+                                        if (!val_num(v->items[0], &pc->speed0) || !val_num(v->items[1], &pc->speed1))
+                                                { fail(err, errcap, "layer '%s': speed = N or (min, max) px/s", rt->name); goto bad; }
+                                } else if (!val_num(v, &pc->speed0)) {
+                                        { fail(err, errcap, "layer '%s': speed = N or (min, max) px/s", rt->name); goto bad; }
+                                } else {
+                                        pc->speed1 = pc->speed0;
+                                }
+                        }
+                        if ((v = getp(L->props, L->nprops, "wind"))) {
+                                if (v->kind != RV_TUPLE || v->n != 2 ||
+                                    !val_num(v->items[0], &pc->wind[0]) || !val_num(v->items[1], &pc->wind[1]))
+                                        { fail(err, errcap, "layer '%s': wind = (x, y) px/s^2", rt->name); goto bad; }
+                        }
+                        if ((v = getp(L->props, L->nprops, "turbulence")))  val_num(v, &pc->turbulence);
+                        if ((v = getp(L->props, L->nprops, "sway")))        val_num(v, &pc->sway);
+                        if ((v = getp(L->props, L->nprops, "drag")))         val_num(v, &pc->drag);
+                        if ((v = getp(L->props, L->nprops, "attract")))     val_num(v, &pc->attract);
+                        if ((v = getp(L->props, L->nprops, "fade_in")))     val_num(v, &pc->fade_in);
+                        if ((v = getp(L->props, L->nprops, "fade_out")))    val_num(v, &pc->fade_out);
+                        if ((v = getp(L->props, L->nprops, "flicker")))     val_num(v, &pc->flicker);
+                        if ((v = getp(L->props, L->nprops, "shape"))) {
+                                int s = map_ident(v, pshape_names, 6);
+                                if (s < 0)
+                                        { fail(err, errcap, "layer '%s': shape must be soft|disc|glow|spark|star|ring",
+                                                    rt->name, v->str); goto bad; }
+                                pc->shape = s;
+                        }
+                        if ((v = getp(L->props, L->nprops, "burst"))) {
+                                f64 bn = 0;
+                                if (!val_num(v, &bn))
+                                        { fail(err, errcap, "layer '%s': burst must be a number", rt->name); goto bad; }
+                                pc->burst = (int)bn;
+                        }
+                        if ((v = getp(L->props, L->nprops, "burst_size")))  val_num(v, &pc->burst_size);
+                        if ((v = getp(L->props, L->nprops, "burst_speed"))) {
+                                if (v->kind == RV_TUPLE && v->n == 2) {
+                                        if (!val_num(v->items[0], &pc->burst_speed0) || !val_num(v->items[1], &pc->burst_speed1))
+                                                { fail(err, errcap, "layer '%s': burst_speed = N or (min, max)", rt->name); goto bad; }
+                                } else if (!val_num(v, &pc->burst_speed0)) {
+                                        { fail(err, errcap, "layer '%s': burst_speed = N or (min, max)", rt->name); goto bad; }
+                                } else {
+                                        pc->burst_speed1 = pc->burst_speed0;
+                                }
+                        }
+                        /* colors: an N-stop ramp (offsets weight the pick),
+                         * or the legacy color/color2 pair */
+                        const RVal *cols = getp(L->props, L->nprops, "colors");
+                        if (cols) {
+                                if (cols->kind != RV_LIST || cols->n < 2 || cols->n > RP_MAX_RAMP)
+                                        { fail(err, errcap, "layer '%s': colors = [#.., ..] (2..%d stops)",
+                                                    rt->name, RP_MAX_RAMP); goto bad; }
+                                pc->nramp = 0;
+                                for (int i = 0; i < cols->n; i++) {
+                                        const RVal *it = cols->items[i];
+                                        RColor col;
+                                        f64 off = -1;
+                                        if (val_color(it, &col)) {
+                                                off = (f64)i / (cols->n - 1);   /* evenly weighted */
+                                        } else if (it->kind == RV_TUPLE && it->n == 2 &&
+                                                   val_color(it->items[0], &col) && val_num(it->items[1], &off)) {
+                                                /* (color, offset) */
+                                        } else {
+                                                { fail(err, errcap, "layer '%s': colors stop %d must be a color or (color, offset)",
+                                                            rt->name, i); goto bad; }
+                                        }
+                                        pc->ramp[pc->nramp] = col;
+                                        pc->ramp_t[pc->nramp] = rev_clampf(off, 0, 1);
+                                        pc->nramp++;
+                                }
+                        } else {
+                                RColor col;
+                                if (val_color(getp(L->props, L->nprops, "color"), &col))
+                                        pc->ramp[0] = col;
+                                if (val_color(getp(L->props, L->nprops, "color2"), &col))
+                                        pc->ramp[1] = col;
+                                pc->ramp_t[0] = 0;
+                                pc->ramp_t[1] = 1;
+                                pc->nramp = 2;
+                        }
+                        /* clamp the authoring surface to sane ranges */
+                        pc->rate     = rev_clampf(pc->rate, 0, 4000);
+                        pc->speed0   = rev_clampf(pc->speed0, -20000, 20000);
+                        pc->speed1   = rev_clampf(pc->speed1, -20000, 20000);
+                        pc->burst_speed0 = rev_clampf(pc->burst_speed0, 0, 20000);
+                        pc->burst_speed1 = rev_clampf(pc->burst_speed1, 0, 20000);
+                        pc->burst_size = rev_clampf(pc->burst_size, 0.05, 64);
+                        pc->life0    = rev_clampf(pc->life0, 0.05, 600);
+                        pc->life1    = rev_clampf(pc->life1, 0.05, 600);
+                        pc->size0    = rev_clampf(pc->size0, 0.05, 64);
+                        pc->size1    = rev_clampf(pc->size1, 0.05, 64);
+                        pc->size_out = rev_clampf(pc->size_out, 0, 8);
+                        pc->turbulence = rev_clampf(pc->turbulence, 0, 1);
+                        pc->sway     = rev_clampf(pc->sway, 0, 1);
+                        pc->flicker  = rev_clampf(pc->flicker, 0, 1);
+                        pc->drag     = rev_clampf(pc->drag, 0, 8);
+                        pc->attract  = rev_clampf(pc->attract, -4000, 4000);
+                        pc->fade_in  = rev_clampf(pc->fade_in, 0, 60);
+                        if (pc->fade_out >= 0)
+                                pc->fade_out = rev_clampf(pc->fade_out, 0.01, 600);
+                        if (pc->burst < 0)   pc->burst = 0;
+                        if (pc->burst > 512) pc->burst = 512;
                         sc->animated = true;
                 } else if (rt->type == LT_VIDEO) {
                         const char *s;
@@ -1185,16 +1328,15 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                         if (!in->parts) {
                                 in->parts = particles_new((u32)W, (u32)H);
                                 if (in->parts)
-                                        particles_configure(in->parts, L->p_preset, 0, L->p_rate, L->p_size,
-                                                            L->p_grav, L->p_drift, L->p_spawn, L->p_c0, L->p_c1);
+                                        particles_setup(in->parts, &L->pcfg);
                         }
                         if (in->parts) {
                                 particles_pointer(in->parts, px, py, pressed);
                                 if (clicks) {
                                         /* bursts fire at each queued click
-                                         * position (24 sparks per click) */
+                                         * position (cfg.burst sparks per click) */
                                         for (u32 c = 0; c < clicks; c++)
-                                                particles_burst(in->parts, click_x[c], click_y[c], 24);
+                                                particles_burst(in->parts, click_x[c], click_y[c], L->pcfg.burst);
                                 }
                                 f64 ms = rev_monotonic();
                                 particles_step(in->parts, dt);
@@ -1205,10 +1347,10 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                  * renderer draws them as point sprites (the
                                  * old path rasterized a full-frame sprite layer
                                  * on the CPU and uploaded 8MB RGBA every
-                                 * frame). Rain's vertical streaks are not
-                                 * point-sprite-shaped — that preset keeps the
+                                 * frame). Streaked layers (rain) are not
+                                 * point-sprite-shaped — those keep the
                                  * CPU raster. */
-                                if (fl && fl->point_offload && L->p_preset != RPPRESET_RAIN) {
+                                if (fl && fl->point_offload && !L->pcfg.streaks) {
                                         u32 live = 0;
                                         /* one-time band buffer sized to the
                                          * particle capacity (4096 slots) */

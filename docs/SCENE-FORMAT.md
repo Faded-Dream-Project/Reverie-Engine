@@ -144,15 +144,86 @@ video directly out of the container.
 
 ## `type = particles`
 
-| Property  | Type   | Default  | Meaning                              |
-|-----------|--------|----------|--------------------------------------|
-| `preset`  | ident  | custom   | `rain snow embers petals fireflies`  |
-| `spawn`   | ident  | ambient  | `ambient pointer both` (pointer = click bursts) |
-| `rate`    | number | 60       | particles per second                  |
-| `size`    | number | 3        | px                                    |
-| `gravity` | number | 60       | px/s² (negative rises)                |
-| `drift`   | number | 20       | horizontal wander                     |
-| `color`, `color2` | color | warm | color range lerped per particle |
+A full particle vocabulary. The named presets are nothing more than
+known-good bundles — **every property below overrides whichever preset
+you started from** (or stands alone with `preset = custom`), so new
+looks are authored as data, not engine code.
+
+**Emission**
+
+| Property    | Type     | Default     | Meaning                                        |
+|-------------|----------|-------------|------------------------------------------------|
+| `preset`    | ident    | custom      | `rain snow embers petals fireflies` (a starting point, not a cage) |
+| `spawn`     | ident    | ambient     | `ambient pointer both` (pointer = click bursts) |
+| `rate`      | number   | 60          | particles per second                           |
+| `emit_from` | ident    | everywhere  | `top bottom left right edges area everywhere` |
+| `emit_area` | tuple    | (0, 0, 1, 1)| x, y, w, h relative — with `emit_from = area`  |
+
+**Motion**
+
+| Property     | Type      | Default   | Meaning                                     |
+|--------------|-----------|-----------|---------------------------------------------|
+| `direction`  | number    | 90        | degrees: 0 = right, 90 = down, -90 = up    |
+| `spread`     | number    | 180       | random cone width around direction         |
+| `speed`      | N or (a, b) | preset  | initial speed, px/s                        |
+| `gravity`    | number    | 0         | continuous pull, px/s² (+ is down)         |
+| `wind`       | tuple     | (0, 0)    | constant acceleration, px/s²               |
+| `turbulence` | number    | 0         | 0..1 random wander                         |
+| `sway`       | number    | 0         | 0..1 sinusoidal sway (snow, leaves)        |
+| `drag`       | number    | 0         | velocity damping, per second               |
+| `attract`    | number    | 0         | px/s² toward the cursor; negative repels   |
+
+**Lifetime & appearance**
+
+| Property    | Type      | Default  | Meaning                                    |
+|-------------|-----------|----------|--------------------------------------------|
+| `lifetime`  | (a, b)    | (3, 7)   | seconds, random in range                   |
+| `size`      | N or (a, b) | preset | sprite radius at birth, px                |
+| `size_out`  | number    | 1        | radius scale at end of life (<1 shrinks)  |
+| `fade_in`   | number    | 0        | seconds ramping opacity in                |
+| `fade_out`  | number    | classic  | seconds ramping out; the default keeps the classic last-20% tail |
+| `flicker`   | number    | 0        | 0..1 sinusoidal brightness wobble         |
+| `shape`     | ident     | soft     | `soft disc glow spark star ring`           |
+| `colors`    | list      | preset   | up to 8 stops; `(color, offset)` pairs weight the pick. `color`/`color2` are the 2-stop shorthand |
+
+**Clicks**
+
+| Property      | Type        | Default    | Meaning                          |
+|---------------|-------------|------------|----------------------------------|
+| `burst`       | number      | 24         | sparks per click                 |
+| `burst_speed` | N or (a, b) | (90, 350)  | spark launch speed, px/s         |
+| `burst_size`  | number      | preset     | nominal spark radius, px         |
+
+Shapes render with identical math on every tier (CPU raster, GL point
+sprites, Vulkan compute). Rain's vertical streaks are CPU-rasterized (a
+streak is not a point sprite) — GPU tiers fall back for streaked layers.
+
+```
+layer motes {
+    type = particles
+    spawn = both
+    emit_from = bottom
+    direction = -78
+    spread = 22
+    speed = (55, 150)
+    lifetime = (6, 11)
+    rate = 70
+    size = (1.6, 4.4)
+    size_out = 0.22
+    fade_in = 1.2
+    fade_out = 1.8
+    flicker = 0.22
+    turbulence = 0.3
+    sway = 0.35
+    attract = 55
+    drag = 0.05
+    shape = glow
+    colors = [#35e0ff, (#8f6bff 0.45), (#ff6bd6 0.8), #ffd9a0]
+    burst = 42
+    burst_speed = (110, 420)
+    blend = screen
+}
+```
 
 ## Animations
 

@@ -1,0 +1,25 @@
+/* New-vocabulary click probe: a fully custom emitter (no preset) exercising
+   emit_from / direction / spread / speed / shape / colors / fade envelope /
+   burst knobs. spawn=pointer means no ambient emission — the only visible
+   change is the click burst, exactly like the preset probes. */
+scene "Aether Click Probe" {
+    fps = 60
+
+    layer sparks {
+        type = particles
+        spawn = pointer
+        emit_from = bottom
+        direction = -90
+        spread = 20
+        speed = (60, 120)
+        lifetime = (2, 3)
+        size = (1.5, 3)
+        size_out = 0.3
+        fade_in = 0.1
+        fade_out = 0.8
+        shape = glow
+        colors = [#35e0ff, (#8f6bff 0.5), #ff6bd6]
+        burst = 30
+        burst_speed = (100, 380)
+    }
+}

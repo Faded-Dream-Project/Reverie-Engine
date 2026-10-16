@@ -155,7 +155,7 @@ switches. See docs/IPC.md for the full control protocol.
 
 ## The bundled collection
 
-Nine themes ship in `themes/`, each an independent unit:
+Ten themes ship in `themes/`, each an independent unit:
 
 | Theme | Style | Sims |
 |---|---|---|
@@ -168,6 +168,7 @@ Nine themes ship in `themes/`, each an independent unit:
 | `nebula-drift` | deep space: starfield + one vast slow nebula billow | fluid (dim, vast) |
 | `aurora-veil` | atmospheric polar curtains, incommensurate sway | none |
 | `light-lattice` | geometric arcs/spokes with a flowing light sweep | none |
+| `aether-rise` | luminous motes rise from the floor, lean toward the cursor | particles |
 
 No theme depends on another; removing, adding, or updating any subset
 leaves the engine and the remaining themes fully functional (a directory

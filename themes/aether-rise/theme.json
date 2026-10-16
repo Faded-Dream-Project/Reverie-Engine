@@ -1,0 +1,8 @@
+{
+  "id": "aether-rise",
+  "name": "Aether Rise",
+  "description": "Luminous motes rise from the floor and lean toward the cursor; a click releases a soft shower. Authored entirely in the scene language's particle vocabulary — no engine code was written for this theme.",
+  "author": "FemBoyGamerTechGuy",
+  "version": "1.0.0",
+  "scene": "scene.rev"
+}

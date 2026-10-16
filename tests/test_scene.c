@@ -507,6 +507,107 @@ int main(void)
                 }
         }
 
+        /* 5b. the particle authoring vocabulary: a fully custom emitter
+         *     compiles, renders, and packs (the shape id rides band1.w);
+         *     fade_in gates visibility; the validation surface rejects
+         *     garbage with the right words. */
+        {
+                const char *txt =
+                        "scene {"
+                        "  layer p {"
+                        "    type = particles"
+                        "    emit_from = bottom"
+                        "    direction = -90"
+                        "    spread = 25"
+                        "    speed = (40, 120)"
+                        "    lifetime = (2, 4)"
+                        "    rate = 300"
+                        "    size = (1.5, 3.5)"
+                        "    size_out = 0.25"
+                        "    fade_in = 0.4"
+                        "    fade_out = 0.9"
+                        "    shape = glow"
+                        "    colors = [#35e0ff, (#8f6bff 0.5), #ff6bd6]"
+                        "    attract = 40"
+                        "  }"
+                        "}";
+                RTScene *sc = compile(txt, err, sizeof err);
+                CHECK(sc != NULL, "compile: %s", err);
+                if (sc) {
+                        RTFrameList fl;
+                        memset(&fl, 0, sizeof fl);
+                        fl.w = W;
+                        fl.h = H;
+                        fl.sim_offload = true;
+                        fl.point_offload = true;
+                        rtscene_render_layers(sc, &fl, 0, 0.5, 0.5);
+                        CHECK(fl.n == 1, "one layer emitted (n=%d)", fl.n);
+                        if (fl.n == 1) {
+                                CHECK(fl.cmds[0].psim != NULL, "particle descriptor present");
+                                if (fl.cmds[0].psim && fl.cmds[0].psim->n > 0) {
+                                        /* shape id 2 (glow) rides band1.w on
+                                         * every packed particle */
+                                        u32 shaped = 0;
+                                        const RSimParticles *pd = fl.cmds[0].psim;
+                                        for (u32 i = 0; i < pd->n; i++)
+                                                if (pd->band1[i * 4 + 3] == 2.0f)
+                                                        shaped++;
+                                        CHECK(shaped == pd->n,
+                                              "shape rides band1.w (n=%u shaped=%u)",
+                                              pd->n, shaped);
+                                }
+                        }
+                        rtscene_free(sc);
+                }
+
+                /* fade_in gate: a 60s ramp keeps everything under the
+                 * cov <= 0.02 visibility floor for the first second */
+                {
+                        const char *t2 =
+                                "scene {"
+                                "  layer p {"
+                                "    type = particles"
+                                "    rate = 400"
+                                "    emit_from = everywhere"
+                                "    fade_in = 60"
+                                "    lifetime = (10, 10)"
+                                "  }"
+                                "}";
+                        RTScene *sc2 = compile(t2, err, sizeof err);
+                        CHECK(sc2 != NULL, "compile fade gate: %s", err);
+                        if (sc2) {
+                                RFb fb = { calloc((size_t)W * H, 4), W, H };
+                                for (int i = 0; i < 30; i++)
+                                        rtscene_render(sc2, &fb, 0, i / 30.0, 1.0 / 30.0);
+                                u64 lit = 0;
+                                for (size_t i = 0; i < (size_t)W * H; i++)
+                                        if ((fb.px[i] >> 24) > 0)
+                                                lit++;
+                                CHECK(lit == 0, "fade_in gates visibility (%llu px)",
+                                      (unsigned long long)lit);
+                                free(fb.px);
+                                rtscene_free(sc2);
+                        }
+                }
+
+                /* validation surface */
+                CHECK(compile("scene { layer p { type = particles  shape = blob } }",
+                              err, sizeof err) == NULL && strstr(err, "shape must be"),
+                      "bad shape rejected: %s", err);
+                CHECK(compile("scene { layer p { type = particles  emit_from = middle } }",
+                              err, sizeof err) == NULL && strstr(err, "emit_from must be"),
+                      "bad emit_from rejected: %s", err);
+                CHECK(compile("scene { layer p { type = particles  lifetime = (1) } }",
+                              err, sizeof err) == NULL && strstr(err, "lifetime"),
+                      "bad lifetime rejected: %s", err);
+                CHECK(compile("scene { layer p { type = particles  emit_area = (0.1, 0.2) } }",
+                              err, sizeof err) == NULL && strstr(err, "emit_area"),
+                      "bad emit_area rejected: %s", err);
+                CHECK(compile("scene { layer p { type = particles  colors = [#fff] } }",
+                              err, sizeof err) == NULL && strstr(err, "colors"),
+                      "short ramp rejected: %s", err);
+        }
+
         /* 6. ripple refracts the content below */
         {
                 const char *txt =
