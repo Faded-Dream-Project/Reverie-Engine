@@ -133,7 +133,7 @@ gate passes.
 ```
 reverie themes/ripple-lake          # folder theme
 reverie ripple-lake.revpack         # packed theme
-reverie scenes/ripple-lake.rev      # plain scene (unchanged)
+reverie my-scene.rev                # any plain .rev scene (unchanged)
 reverie old-scene.revpack           # v1 scene pack (unchanged)
 ```
 
@@ -218,18 +218,14 @@ theme directory, no executable files. Validate while iterating:
 ```
 
 The engine never requires any particular theme to exist; the built-in
-default behavior (plain `scenes/*.rev`, `--video`, solid fills) works
+default behavior (any plain `.rev` scene, `--video`, solid fills) works
 with an empty theme collection.
 
 ## Compatibility
 
 * v1 `.revpack` scene packs load exactly as before.
 * Plain `.rev` scenes are unaffected.
-* Six of the bundled themes (`ripple-lake`, `mountain-dusk`,
-  `fluid-aurora`, `ember-drift`, `snowfall`, `animated-gradients`) exist
-  twice by convention: as `themes/<id>/` folders and as twin
-  `scenes/<id>.rev` scene files with identical renders (the e2e suite
-  verifies the theme forms byte-for-byte). The three newer themes
-  (`nebula-drift`, `aurora-veil`, `light-lattice`) are theme-only —
-  their asset layout (full-size stars, SVG lattice) lives in their own
-  directories.
+* The legacy `scenes/*.rev` twin files are gone — `themes/` is the
+  single home of the bundled collection (every theme an independent,
+  removable unit). Plain standalone `.rev` scenes keep working
+  everywhere, exactly as before.

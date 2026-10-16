@@ -55,8 +55,8 @@ int main(void)
 
         /* ---- the historical contract ---------------------------------- */
 
-        CHECK(parse("scenes/fluid-aurora.rev", &a, err, sizeof err, &usage_hint) &&
-              !strcmp(a.scene_path, "scenes/fluid-aurora.rev") && !usage_hint,
+        CHECK(parse("themes/fluid-aurora/scene.rev", &a, err, sizeof err, &usage_hint) &&
+              !strcmp(a.scene_path, "themes/fluid-aurora/scene.rev") && !usage_hint,
               "positional scene is accepted (compat)");
 
         CHECK(parse("-R vulkan --renderer cpu", &a, err, sizeof err, &usage_hint) &&
@@ -132,8 +132,8 @@ int main(void)
 
         /* ---- new: --exit-if-running ------------------------------------- */
 
-        CHECK(parse("--exit-if-running scenes/snowfall.rev", &a, err, sizeof err, &usage_hint) &&
-              a.exit_if_running && !strcmp(a.scene_path, "scenes/snowfall.rev"),
+        CHECK(parse("--exit-if-running themes/snowfall/scene.rev", &a, err, sizeof err, &usage_hint) &&
+              a.exit_if_running && !strcmp(a.scene_path, "themes/snowfall/scene.rev"),
               "--exit-if-running parses alongside a scene");
         CHECK(parse("--exit-if-running", &a, err, sizeof err, &usage_hint) &&
               a.exit_if_running, "--exit-if-running alone parses (caller demands content)");

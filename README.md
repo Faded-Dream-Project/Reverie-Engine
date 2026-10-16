@@ -21,7 +21,7 @@ hand-editable text file. Scenes ship as **themes**: self-contained folders
 loaded without extraction — byte-identical renders either way.
 
 ```
- ~ $ reverie scenes/mountain-dusk.rev
+ ~ $ reverie themes/mountain-dusk
  [info] reverie 0.2.0-dev — backend=auto renderer=auto
  [info] backend: x11
  [info] opengl: hardware renderer NVIDIA GeForce GTX 1050 Ti/PCIe/SSE2 (vendor: NVIDIA)
@@ -625,7 +625,7 @@ graduating from experimental, more SVG filters.
 
 ```
 src/          engine sources (see docs/ARCHITECTURE.md)
-scenes/       example .rev scenes + hand-drawn assets
+themes/       the bundled theme collection (scene + assets per theme)
 tests/        unit + integration suites (incl. the Wayland fake compositor)
 scripts/e2e.sh         Xvfb end-to-end, all renderer tiers present on the machine
 scripts/e2e-wayland.sh real-weston Wayland wire-protocol E2E (needs the test stack)

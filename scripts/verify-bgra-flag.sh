@@ -12,7 +12,7 @@
 # ============================================================================
 cd "$(dirname "$0")/.." || exit 1
 GPU_ROOT="${REV_GPU_ROOT:-$(cd .. && pwd)/gpulibs/root}"
-SCENE="${1:-scenes/mountain-dusk.rev}"
+SCENE="${1:-themes/mountain-dusk/scene.rev}"
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"; kill $XVFB_PID 2>/dev/null' EXIT INT TERM
 

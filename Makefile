@@ -165,8 +165,8 @@ test: $(TEST_BIN)
 
 # Scene assets are produced by Reverie's own PNG encoder (dogfooding).
 assets: $(BUILD)/revtool
-	$(BUILD)/revtool mkpng scenes/assets/lake.png 512 512 soft-bands
-	$(BUILD)/revtool mkpng scenes/assets/stars.png 512 512 stars
+	$(BUILD)/revtool mkpng themes/ripple-lake/assets/lake.png 512 512 soft-bands
+	$(BUILD)/revtool mkpng themes/mountain-dusk/assets/stars.png 512 512 stars
 	$(BUILD)/revtool mkpng themes/nebula-drift/assets/stars.png 1920 1080 stars
 
 install: $(BINS)

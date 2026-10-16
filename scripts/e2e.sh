@@ -18,11 +18,11 @@
 # When the local test stack exists at ../gpulibs/root (llvmpipe + lavapipe,
 # no root needed), its env is exported automatically.
 #
-# Usage: scripts/e2e.sh [scene.rev]     (default: scenes/mountain-dusk.rev)
+# Usage: scripts/e2e.sh [scene.rev]     (default: themes/mountain-dusk/scene.rev)
 # ============================================================================
 cd "$(dirname "$0")/.." || exit 1
 
-SCENE="${1:-scenes/mountain-dusk.rev}"
+SCENE="${1:-themes/mountain-dusk/scene.rev}"
 OUT=$(mktemp -d)
 XDISPLAY=":97"
 XVFB_PID=""
@@ -161,7 +161,7 @@ stop_xvfb
 # equation/refraction composite) stays regression-tested without hardware.
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 timeout 10 \
-    ./build/reverie -R opengl --shot 5 "$OUT/glf" scenes/fluid-aurora.rev \
+    ./build/reverie -R opengl --shot 5 "$OUT/glf" themes/fluid-aurora/scene.rev \
     > "$OUT/glf.log" 2>&1 || true
 if grep -q "fluid + ripple solvers on GPU" "$OUT/glf.log" 2>/dev/null \
    && grep -q "simulations: GPU" "$OUT/glf.log" 2>/dev/null; then
@@ -181,7 +181,7 @@ stop_xvfb
 # GPU compositing entirely — refraction composites against the accum FBO)
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 REV_FAKE_POINTER=0.1 timeout 10 \
-    ./build/reverie -R opengl --shot 6 "$OUT/rip" scenes/ripple-lake.rev \
+    ./build/reverie -R opengl --shot 6 "$OUT/rip" themes/ripple-lake/scene.rev \
     > "$OUT/rip.log" 2>&1 || true
 if grep -q "simulations: GPU" "$OUT/rip.log" 2>/dev/null \
    && ! grep -q "scene needs CPU compositing" "$OUT/rip.log" 2>/dev/null; then
@@ -812,7 +812,7 @@ fi
 # equation/refraction composite) stays regression-tested on lavapipe.
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_SIMS_SW=1 timeout 12 \
-    ./build/reverie -R vulkan --shot 5 "$OUT/vkf" scenes/fluid-aurora.rev \
+    ./build/reverie -R vulkan --shot 5 "$OUT/vkf" themes/fluid-aurora/scene.rev \
     > "$OUT/vkf.log" 2>&1 || true
 if grep -q "fluid + ripple solvers on GPU" "$OUT/vkf.log" 2>/dev/null \
    && grep -q "simulations: GPU" "$OUT/vkf.log" 2>/dev/null; then
@@ -831,7 +831,7 @@ stop_xvfb
 # ---- Vulkan tier: GPU ripple + click parity (the field-reported scene) -------
 start_xvfb
 DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_SIMS_SW=1 REV_FAKE_POINTER=0.1 REV_FAKE_CLICK="0.5,0.5@2" \
-    timeout 12 ./build/reverie -R vulkan --shot 2.6 "$OUT/ripv" scenes/ripple-lake.rev \
+    timeout 12 ./build/reverie -R vulkan --shot 2.6 "$OUT/ripv" themes/ripple-lake/scene.rev \
     > "$OUT/ripv.log" 2>&1 || true
 if grep -q "fluid + ripple solvers on GPU" "$OUT/ripv.log" 2>/dev/null \
    && [ -f "$OUT/ripv.png" ]; then

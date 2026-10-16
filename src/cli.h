@@ -5,7 +5,7 @@
  * and returns; main() owns usage(), exit codes, and env-var fallbacks.
  *
  * Content modes (mutually exclusive):
- *   - a positional path (compat: scenes/fluid-aurora.rev, theme dirs, packs)
+ *   - a positional path (compat: themes/<id>, any .rev scene, packs)
  *   - --scene PATH (the same slot, explicit)
  *   - --video PATH (media mode; wired in the media-mode commit)
  *

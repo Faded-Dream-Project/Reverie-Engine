@@ -28,11 +28,11 @@
 # ../gpulibs relative to the repo — weston, libwayland, desktop-shell).
 # Skips gracefully when the stack is absent.
 #
-# Usage: scripts/e2e-wayland.sh [scene.rev]   (default: scenes/mountain-dusk.rev)
+# Usage: scripts/e2e-wayland.sh [scene.rev]   (default: themes/mountain-dusk/scene.rev)
 # ============================================================================
 cd "$(dirname "$0")/.." || exit 1
 
-SCENE="${1:-scenes/mountain-dusk.rev}"
+SCENE="${1:-themes/mountain-dusk/scene.rev}"
 GPU_ROOT="${REV_GPU_ROOT:-$(cd .. && pwd)/gpulibs/root}"
 WESTON="$GPU_ROOT/usr/bin/weston"
 if [ ! -x "$WESTON" ]; then

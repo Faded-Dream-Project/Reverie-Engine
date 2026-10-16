@@ -217,7 +217,7 @@ scene "Mountain Dusk" {
 Errors carry line numbers and say what they expected:
 
 ```
-$ revtool validate scenes/myscene.rev
+$ revtool validate my-scene.rev
 FAIL: layer 'sky' (line 14): gradient needs stops = [color, ...] (min 2)
 ```
 
@@ -263,7 +263,7 @@ warning (packs are built best-effort).
 Tooling:
 
 ```
-revtool pack   scenes/mountain-dusk.rev -o dusk.revpack
+revtool pack   my-scene.rev -o my-scene.revpack
 revtool unpack dusk.revpack -d dusk_dir/     # scene.rev + flat assets
 reverie dusk.revpack                          # runs directly from the pack
 ```

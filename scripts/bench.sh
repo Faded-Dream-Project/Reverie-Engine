@@ -45,7 +45,7 @@ for R in cpu opengl; do
         # an idle cursor measures an idle scene.
         DISPLAY="$XDISPLAY" env $GPU_ENV REV_PROFILE=1 REV_FAKE_POINTER=0.15 \
             timeout "$SECS" \
-            ./build/reverie -R "$R" "scenes/${S}.rev" > "$LOG" 2>&1 || true
+            ./build/reverie -R "$R" "themes/${S}" > "$LOG" 2>&1 || true
         FPS=$(grep 'perf: .* fps' "$LOG" | tail -1)
         STAGES=$(grep 'perf: sim=' "$LOG" | tail -1)
         DIST=$(grep 'perf: frame' "$LOG" | tail -1)
