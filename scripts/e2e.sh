@@ -395,6 +395,10 @@ MCOK=1
 ./build/reverie --scale fill >/dev/null 2>&1 && MCOK=0
 ./build/reverie --no-loop >/dev/null 2>&1 && MCOK=0
 ./build/reverie --video x.mp4 --scale bogus >/dev/null 2>&1 && MCOK=0
+# a forgotten path (--video --scale stretch) must name the real problem —
+# a missing value — not mis-report a content-mode conflict
+./build/reverie --video --scale stretch >/dev/null 2>&1 && MCOK=0
+./build/reverie --video --scale stretch 2>&1 | grep -q "needs a value" || MCOK=0
 if [ "$MCOK" = 1 ]; then
     echo "    media(cli):   PASS (content-mode conflicts rejected)"
     PASS=$((PASS+1))

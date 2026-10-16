@@ -82,6 +82,18 @@ const char *rev_cli_canon_backend(const char *name)
         return NULL;
 }
 
+/* A token that is itself a long option never starts a value: in
+ * `--video --scale stretch` the path was simply forgotten, and eating
+ * `--scale` as the path made the parser mis-report a content-mode
+ * conflict instead of the real problem. Values may still open with a
+ * single '-' (negative numbers — the legacy `--shot -3 out.png` form —
+ * or files like "-frame.png"); a file really named `--...` can be
+ * passed with an explicit ./ or path prefix. */
+static bool option_like(const char *s)
+{
+        return s[0] == '-' && s[1] == '-';
+}
+
 bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
 {
         memset(a, 0, sizeof *a);
@@ -94,7 +106,7 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
         err[0] = 0;
 
         #define NEED_VALUE(opt) do { \
-                if (i + 1 >= argc) { \
+                if (i + 1 >= argc || option_like(argv[i + 1])) { \
                         snprintf(err, errcap, "option '%s' needs a value", (opt)); \
                         a->show_usage = true; \
                         return false; \

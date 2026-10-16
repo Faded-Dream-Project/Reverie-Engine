@@ -170,6 +170,28 @@ int main(void)
         CHECK(!parse("b.rev --video a.mp4", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "conflicting content modes"),
               "positional before --video rejected");
+
+        /* ---- option-like tokens are never values ------------------------- */
+        /* `--video --scale stretch` used to eat `--scale` as the path and
+         * mis-report a content-mode conflict (the scene was "stretch") */
+        CHECK(!parse("--video --scale stretch", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "option '--video' needs a value") && usage_hint,
+              "the forgotten-path command names its real problem");
+        CHECK(!parse("--scene --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "option '--scene' needs a value") && usage_hint,
+              "option-like token is not a --scene value");
+        CHECK(!parse("--video a.mp4 --scale", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "needs a value"),
+              "trailing --scale still needs a value");
+        CHECK(!parse("-R --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "option '-R' needs a value") && usage_hint,
+              "short option forms are protected too");
+        CHECK(parse("--scene -frame.rev", &a, err, sizeof err, &usage_hint) &&
+              !strcmp(a.scene_path, "-frame.rev"),
+              "single-dash value stays a legal scene path");
+        CHECK(parse("--shot -3 out.png", &a, err, sizeof err, &usage_hint) &&
+              a.shot_after == -3.0 && !strcmp(a.shot_file, "out.png"),
+              "legacy --shot with negative seconds still parses");
         CHECK(!parse("--scale fill", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "--scale applies to --video media mode"),
               "--scale without --video rejected");
