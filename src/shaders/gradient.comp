@@ -56,5 +56,16 @@ void main()
         }
         c = u.p[4 + k];
     }
+    /* ordered dither — the same 4x4 Bayer offset the CPU raster applies to
+     * its UNQUANTIZED LUT color (see BAYER4 in raster.c): B(x,y) =
+     * ((x0^y0)<<3)|(y0<<2)|((x1^y1)<<1)|y1, offset (B-7.5)/16 in 8-bit CODE
+     * units on RGB (alpha exact, flat colors stay flat: |D| < 0.5). Keeps
+     * tier parity and kills staircase banding on dark gradients. */
+    {
+        int dx = pc.x & 3, dy = pc.y & 3;
+        int b = (((dx & 1) ^ (dy & 1)) << 3) | ((dy & 1) << 2)
+              | ((((dx >> 1) & 1) ^ ((dy >> 1) & 1)) << 1) | ((dy >> 1) & 1);
+        c.rgb += vec3((float(b) - 7.5) / 16.0);
+    }
     imageStore(dst_img, pc, c);
 }
