@@ -840,6 +840,162 @@ static void render_media_frame(RRenderer *rend, const RVideoFrame *vf,
         rend->end(rend, NULL);
 }
 
+/* ---- output hotplug reconcile -----------------------------------------------
+ * Re-enumerates the platform's monitor list and reconciles the daemon's
+ * windows with it: new monitors get a window + framebuffer + renderer
+ * surface, gone monitors lose theirs, changed geometry feeds the same
+ * resize dance the per-tick poll uses. SLOTS ARE NEVER COMPACTED — the
+ * scene's per-monitor instances and the renderers' per-window state are
+ * indexed by slot, so a gone monitor tombstones (winidx[i] = -1) and a new
+ * one reuses the first free slot. Identity comes from monitor_id (Wayland:
+ * wl_output global name; X11: Xinerama-origin key). Caller gates the
+ * cadence (REV_HOTPLUG_S, default 2 s; 0 = off) and skips when -m pinned a
+ * monitor or the platform lacks the identity/removal primitives.
+ * Returns the (possibly grown) high-water slot count. */
+static int hotplug_reconcile(RPlatform *plat, RRenderer *rend,
+                              RRect *mons, RFb *fbs, u32 *fb_scale, int *mon_hz,
+                              u64 *mon_id, int *winidx, int nmon,
+                              bool media, RTScene *sc, bool *zero_logged)
+{
+        RRect fresh[REV_PLATFORM_MAX_OUTPUTS];
+        int nfresh = plat->monitors(plat, fresh, REV_PLATFORM_MAX_OUTPUTS);
+        if (nfresh < 0)
+                return nmon;
+        u64 fid[REV_PLATFORM_MAX_OUTPUTS];
+        for (int j = 0; j < nfresh; j++)
+                fid[j] = plat->monitor_id(plat, j);
+        /* claimed[j]: the fresh entry was consumed by an active slot. Slots
+         * claim DISTINCT entries even when identities collide (mirrored
+         * Xinerama screens share an origin key) — otherwise every reconcile
+         * pass would re-add a duplicate and grow forever. */
+        bool claimed[REV_PLATFORM_MAX_OUTPUTS];
+        memset(claimed, 0, sizeof claimed);
+
+        /* ---- removals + geometry updates ---------------------------------- */
+        for (int i = 0; i < nmon; i++) {
+                if (winidx[i] < 0)
+                        continue;    /* already tombstoned */
+                int j = -1;
+                for (int k = 0; k < nfresh; k++) {
+                        if (!claimed[k] && fid[k] == mon_id[i]) {
+                                j = k;
+                                break;
+                        }
+                }
+                if (j < 0) {
+                        /* output gone: release the renderer's surface FIRST
+                         * (its native handle dies with the platform window),
+                         * then the window, then the framebuffer */
+                        LOGI("hotplug: monitor gone (%ux%u at %d,%d) — releasing window %d",
+                             mons[i].w, mons[i].h, mons[i].x, mons[i].y, winidx[i]);
+                        if (rend->remove_window)
+                                rend->remove_window(rend, winidx[i]);
+                        if (plat->remove_window && !plat->remove_window(plat, winidx[i]))
+                                LOGW("hotplug: window %d removal refused — "
+                                     "leaking the slot", winidx[i]);
+                        free(fbs[i].px);
+                        fbs[i].px = NULL;
+                        winidx[i] = -1;
+                        continue;
+                }
+                claimed[j] = true;
+
+                /* survived: pull the fresh geometry/scale/refresh into the
+                 * slot (the per-tick poll only sees the WINDOW's geometry,
+                 * which never changes on its own for monitor-driven changes) */
+                f64 mscale = plat->monitor_scale(plat, j);
+                u32 nscale = mscale > 1.0 ? (u32)(mscale + 0.5) : 1;
+                int nhz = plat->monitor_refresh ? plat->monitor_refresh(plat, j) : 0;
+                u32 nw = (u32)(fresh[j].w * nscale);
+                u32 nh = (u32)(fresh[j].h * nscale);
+                bool size_changed = nw != fbs[i].w || nh != fbs[i].h;
+                bool moved = fresh[j].x != mons[i].x || fresh[j].y != mons[i].y;
+                if (size_changed || moved) {
+                        LOGI("monitor %d: geometry now %ux%u at %d,%d%s",
+                             i, fresh[j].w, fresh[j].h, fresh[j].x, fresh[j].y,
+                             size_changed ? ", re-creating" : "");
+                        free(fbs[i].px);
+                        fbs[i].w = nw;
+                        fbs[i].h = nh;
+                        fbs[i].px = (u32 *)calloc((size_t)nw * nh, 4);
+                        plat->resize_window(plat, winidx[i], fresh[j]);
+                        rend->resize(rend, winidx[i], nw, nh);
+                        if (!media && sc)
+                                rtscene_flush_caches(sc);
+                }
+                mons[i] = fresh[j];
+                fb_scale[i] = nscale;
+                mon_hz[i] = nhz;
+        }
+
+        /* ---- additions ------------------------------------------------------ */
+        for (int j = 0; j < nfresh; j++) {
+                if (claimed[j])
+                        continue;
+                int slot = -1;
+                for (int i = 0; i < nmon; i++) {
+                        if (winidx[i] < 0) {
+                                slot = i;
+                                break;
+                        }
+                }
+                if (slot < 0 && nmon < REV_PLATFORM_MAX_OUTPUTS)
+                        slot = nmon++;
+                if (slot < 0) {
+                        static bool warned;
+                        if (!warned) {
+                                warned = true;
+                                LOGW("hotplug: output beyond the %d-slot cap ignored",
+                                     REV_PLATFORM_MAX_OUTPUTS);
+                        }
+                        continue;
+                }
+
+                f64 mscale = plat->monitor_scale(plat, j);
+                fb_scale[slot] = mscale > 1.0 ? (u32)(mscale + 0.5) : 1;
+                mon_hz[slot] = plat->monitor_refresh ? plat->monitor_refresh(plat, j) : 0;
+                mon_id[slot] = fid[j];
+                mons[slot] = fresh[j];
+                fbs[slot].w = (u32)(fresh[j].w * fb_scale[slot]);
+                fbs[slot].h = (u32)(fresh[j].h * fb_scale[slot]);
+                fbs[slot].px = (u32 *)calloc((size_t)fbs[slot].w * fbs[slot].h, 4);
+                winidx[slot] = plat->add_window(plat, fresh[j]);
+                if (winidx[slot] < 0) {
+                        LOGW("hotplug: monitor %dx%d at %d,%d — window creation failed",
+                             fresh[j].w, fresh[j].h, fresh[j].x, fresh[j].y);
+                        free(fbs[slot].px);
+                        fbs[slot].px = NULL;
+                        continue;
+                }
+                if (rend->add_window && !rend->add_window(rend, plat, winidx[slot])) {
+                        /* GPU surface failed (logged by the renderer): a
+                         * renderer-owned present path cannot use the window,
+                         * so release it again instead of presenting black */
+                        if (rend->remove_window)
+                                rend->remove_window(rend, winidx[slot]);
+                        if (plat->remove_window)
+                                plat->remove_window(plat, winidx[slot]);
+                        free(fbs[slot].px);
+                        fbs[slot].px = NULL;
+                        winidx[slot] = -1;
+                        continue;
+                }
+                *zero_logged = false;
+                LOGI("hotplug: monitor added (%ux%u at %d,%d) — window %d",
+                     fresh[j].w, fresh[j].h, fresh[j].x, fresh[j].y, winidx[slot]);
+        }
+
+        /* ---- zero-window transition (keep idling until an output returns) -- */
+        bool any = false;
+        for (int i = 0; i < nmon && !any; i++)
+                any = winidx[i] >= 0;
+        if (!any && !*zero_logged) {
+                LOGI("hotplug: no outputs left — idling until one returns");
+                *zero_logged = true;
+        }
+        return nmon;
+}
+
 int main(int argc, char **argv)
 {
         char err[512] = { 0 };
@@ -1024,10 +1180,14 @@ int main(int argc, char **argv)
         RFb fbs[REV_PLATFORM_MAX_OUTPUTS];
         u32 fb_scale[REV_PLATFORM_MAX_OUTPUTS];
         int winidx[REV_PLATFORM_MAX_OUTPUTS];
+        int mon_hz[REV_PLATFORM_MAX_OUTPUTS];     /* cached output refresh  */
+        u64 mon_id[REV_PLATFORM_MAX_OUTPUTS];      /* stable hotplug identity */
         int any_window = 0;
         for (int i = 0; i < nmon; i++) {
                 f64 scale = plat->monitor_scale(plat, i);
                 fb_scale[i] = scale > 1.0 ? (u32)(scale + 0.5) : 1;
+                mon_hz[i] = plat->monitor_refresh ? plat->monitor_refresh(plat, i) : 0;
+                mon_id[i] = plat->monitor_id ? plat->monitor_id(plat, i) : (u64)(i + 1);
                 fbs[i].w = (u32)(mons[i].w * fb_scale[i]);
                 fbs[i].h = (u32)(mons[i].h * fb_scale[i]);
                 fbs[i].px = (u32 *)calloc((size_t)fbs[i].w * fbs[i].h, 4);
@@ -1270,6 +1430,30 @@ int main(int argc, char **argv)
                 }
         }
 
+        /* ---- output hotplug reconcile cadence --------------------------------
+         * REV_HOTPLUG_S (default 2 s, 0 = off): how often the monitor list is
+         * re-enumerated and windows reconciled. Disabled when a monitor was
+         * pinned with -m (the user asked for exactly that output) or when the
+         * platform lacks the primitives (no monitor_id / no remove_window).
+         * The per-tick window-geometry poll below still handles plain resizes
+         * between reconcile passes. */
+        f64 hotplug_s = 2.0;
+        {
+                const char *hs = getenv("REV_HOTPLUG_S");
+                if (hs && *hs) {
+                        char *end = NULL;
+                        f64 v = strtod(hs, &end);
+                        if (end != hs && v >= 0.0 && v < 3600.0)
+                                hotplug_s = v;
+                }
+        }
+        const bool hotplug_on = hotplug_s > 0.0 && only_monitor < 0 &&
+                                plat->monitor_id && plat->remove_window;
+        if (hotplug_on)
+                LOGD("hotplug: reconcile every %.0fs", hotplug_s);
+        f64 hotplug_next = 0.0;
+        bool zero_logged = false;
+
         while (g_run) {
                 f64 now = rev_monotonic();
                 f64 dt = now - last_frame;
@@ -1354,6 +1538,17 @@ int main(int argc, char **argv)
                 if (plat->should_close(plat))
                         break;
 
+                /* output hotplug reconcile (gated cadence): runs even while
+                 * hidden — idling with zero outputs must notice a replug.
+                 * pump() above dispatched the platform's hotplug events
+                 * (Wayland late-bound outputs / global_removes) first. */
+                if (hotplug_on && now >= hotplug_next) {
+                        hotplug_next = now + hotplug_s;
+                        nmon = hotplug_reconcile(plat, rend, mons, fbs, fb_scale,
+                                                  mon_hz, mon_id, winidx, nmon,
+                                                  media, sf.sc, &zero_logged);
+                }
+
                 /* runtime IPC: bounded non-blocking pump — theme switches,
                  * playlist commands and QUIT arrive here (works while hidden
                  * too: the loop still ticks at the idle pace). Media mode
@@ -1394,7 +1589,11 @@ int main(int argc, char **argv)
                                         fbs[i].h = nh;
                                         fbs[i].px = (u32 *)calloc((size_t)nw * nh, 4);
                                         plat->resize_window(plat, winidx[i], g);
-                                        rend->resize(rend, i, nw, nh);
+                                        /* renderer windows are indexed by the
+                                         * PLATFORM window number (see begin()
+                                         * below) — under hotplug that is not
+                                         * always the slot number */
+                                        rend->resize(rend, winidx[i], nw, nh);
                                         if (!media)
                                                 rtscene_flush_caches(sf.sc);
                                 }
@@ -1572,6 +1771,15 @@ int main(int argc, char **argv)
                 /* test hook: screenshot */
                 if (shot_after >= 0 && t >= shot_after && !shot_done) {
                         shot_done = true;
+                        /* naming follows the ACTIVE window count, not the
+                         * high-water slot count: after a hotplug removal the
+                         * surviving single window must get the plain FILE.png
+                         * name (indexed names appear only when two or more
+                         * windows are actually captured) */
+                        int nwin = 0;
+                        for (int i = 0; i < nmon; i++)
+                                if (winidx[i] >= 0)
+                                        nwin++;
                         for (int i = 0; i < nmon; i++) {
                                 if (winidx[i] < 0)
                                         continue;
@@ -1579,7 +1787,7 @@ int main(int argc, char **argv)
                                 u32 *shot = plat->screenshot(plat, winidx[i], &sw, &sh);
                                 if (shot) {
                                         char path[600];
-                                        if (nmon > 1)
+                                        if (nwin > 1)
                                                 snprintf(path, sizeof path, "%s.%d.png", shot_file, i);
                                         else
                                                 snprintf(path, sizeof path, "%s.png", shot_file);
@@ -1702,12 +1910,17 @@ int main(int argc, char **argv)
                         /* cap scene fps to the fastest connected display — the
                          * extra frames could never be shown (they would just
                          * pile up as compositor drops). An explicit --fps
-                         * override is always honored as-is. */
+                         * override is always honored as-is. Uses the
+                         * per-SLOT refresh cache: after a hotplug the packed
+                         * platform indices no longer align with slot numbers,
+                         * so re-querying by slot index would read the wrong
+                         * output (or none). */
                         int hz = 0;
                         for (int i = 0; i < nmon; i++) {
-                                int r = plat->monitor_refresh(plat, i);
-                                if (r > hz)
-                                        hz = r;
+                                if (winidx[i] < 0)
+                                        continue;
+                                if (mon_hz[i] > hz)
+                                        hz = mon_hz[i];
                         }
                         if (hz > 0 && fps > hz) {
                                 LOGD("pacing: scene %d fps capped to display %d Hz", fps, hz);

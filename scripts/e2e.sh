@@ -48,7 +48,18 @@ cleanup() {
         wait "$XVFB_PID" 2>/dev/null
     fi
 }
-trap cleanup EXIT INT TERM
+# A trapped INT/TERM must TERMINATE the script: dash resumes execution after
+# a signal trap whose handler does not exit — an external signal mid-leg
+# would otherwise leave the leg running against a killed Xvfb (observed: a
+# sandbox supervisor TERMs long commands; the resumed leg then fails on a
+# dead display instead of the script exiting cleanly). The plain EXIT trap
+# keeps the script's own exit status.
+on_signal() {
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 echo "reverie e2e — scene: $SCENE  out: $OUT"
 
@@ -733,6 +744,101 @@ else
     echo "    x11(idle):    FAIL (idle cycle incomplete)"
     cat "$OUT/dpmsf.log"
     FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
+# ---- Output hotplug: add + resize + remove (deterministic mon-file hook) ---
+# REV_X11_MON_FILE drives the same re-enumeration path a real RandR screen
+# change takes (x11_monitors is re-queried by the reconciler). One monitor
+# becomes two at t=1.5s — AND the survivor changes size in the same rewrite
+# (add + in-place resize in one pass). The --shot at t=4s must capture BOTH
+# windows (FILE.i.png per active window when two or more are captured).
+start_xvfb
+MONF="$OUT/mon.list"
+printf '0 0 1280 800\n' > "$MONF"
+DISPLAY="$XDISPLAY" REV_X11_MON_FILE="$MONF" REV_HOTPLUG_S=1 \
+    timeout 7 ./build/reverie -R cpu --shot 4 "$OUT/hp" "$SCENE" \
+    > "$OUT/hp-add.log" 2>&1 &
+DPID=$!
+sleep 1.5
+printf '0 0 1000 700\n1000 0 280 700\n' > "$MONF"
+sleep 4                       # reconcile (1s cadence) + render + shot at t=4
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+ok=1
+grep -q "hotplug: monitor added" "$OUT/hp-add.log" 2>/dev/null || ok=0
+grep -q "geometry now 1000x700" "$OUT/hp-add.log" 2>/dev/null || ok=0
+[ -f "$OUT/hp.0.png" ] || ok=0
+[ -f "$OUT/hp.1.png" ] || ok=0
+if [ "$ok" = 1 ]; then
+    echo "    x11(hp-add):  PASS (second output gained a window + survivor resized)"
+    PASS=$((PASS+1))
+else
+    echo "    x11(hp-add):  FAIL (added monitor did not gain a rendering window)"
+    cat "$OUT/hp-add.log"
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
+# ---- Output hotplug: monitor removed mid-run ----------------------------------
+# Two outputs become one at t=1.5s. The window is released, the slot
+# tombstoned, and the shot at t=4s must be the SINGLE-window form (plain
+# FILE.png — indexed names appear only while 2+ windows are captured).
+start_xvfb
+MONF="$OUT/mon.list"
+printf '0 0 640 800\n640 0 640 800\n' > "$MONF"
+DISPLAY="$XDISPLAY" REV_X11_MON_FILE="$MONF" REV_HOTPLUG_S=1 \
+    timeout 7 ./build/reverie -R cpu --shot 4 "$OUT/hr" "$SCENE" \
+    > "$OUT/hp-rem.log" 2>&1 &
+DPID=$!
+sleep 1.5
+printf '0 0 640 800\n' > "$MONF"
+sleep 4
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+ok=1
+grep -q "hotplug: monitor gone" "$OUT/hp-rem.log" 2>/dev/null || ok=0
+[ -f "$OUT/hr.png" ] || ok=0
+[ -f "$OUT/hr.0.png" ] && ok=0
+[ -f "$OUT/hr.1.png" ] && ok=0
+if [ "$ok" = 1 ]; then
+    echo "    x11(hp-rem):  PASS (removed output's window released cleanly)"
+    PASS=$((PASS+1))
+else
+    echo "    x11(hp-rem):  FAIL (removal did not reconcile the window set)"
+    cat "$OUT/hp-rem.log"
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
+# ---- Output hotplug on the OpenGL tier (EGL surface created mid-run) ----------
+# Same add scenario on the GL renderer: the reconciler must build the new
+# window's EGL surface at runtime (gl_add_window). Skipped like the other
+# GL legs when no EGL stack is present.
+start_xvfb
+MONF="$OUT/mon.list"
+printf '0 0 1280 800\n' > "$MONF"
+DISPLAY="$XDISPLAY" env $GPU_ENV REV_X11_MON_FILE="$MONF" REV_HOTPLUG_S=1 \
+    timeout 7 ./build/reverie -R opengl --shot 4 "$OUT/hpg" "$SCENE" \
+    > "$OUT/hp-gl.log" 2>&1 &
+DPID=$!
+sleep 1.5
+printf '0 0 640 800\n640 0 640 800\n' > "$MONF"
+sleep 4
+kill $DPID 2>/dev/null; wait $DPID 2>/dev/null
+if grep -q "renderer: opengl" "$OUT/hp-gl.log" 2>/dev/null; then
+    ok=1
+    grep -q "hotplug: monitor added" "$OUT/hp-gl.log" 2>/dev/null || ok=0
+    [ -f "$OUT/hpg.1.png" ] || ok=0
+    if [ "$ok" = 1 ]; then
+        echo "    gl(hp-add):   PASS (runtime EGL surface on the new window)"
+        PASS=$((PASS+1))
+    else
+        echo "    gl(hp-add):   FAIL (GL renderer missed the added monitor)"
+        cat "$OUT/hp-gl.log"
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    gl(hp-add):   SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
 fi
 stop_xvfb
 

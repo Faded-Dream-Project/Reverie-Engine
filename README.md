@@ -246,6 +246,20 @@ No release yet: active development, everything unstable, not ready for
 public use — the tree stays a -dev version until it earns a number.
 Still no tags and no GitHub releases. This dev cycle:
 
+* **Output hotplug: monitors can come and go while the daemon runs
+  (2026-10).** The monitor list is re-enumerated every `REV_HOTPLUG_S`
+  seconds (default 2, 0 off; `-m` disables it) and the window set is
+  reconciled with it — a plugged monitor gets a window + renderer
+  surface at runtime (EGL surface / Vulkan swapchain built mid-run), an
+  unplugged one releases its surface first, then its window; a resized
+  or moved monitor goes through the same in-place recreation a window
+  resize takes. Outputs are matched by stable identity (the `wl_output`
+  global name on Wayland, the Xinerama origin on X11), window slots are
+  never renumbered, and the reconcile runs even while idle-hidden so a
+  replug during display sleep is noticed on wake. Verified by e2e legs
+  driving X11 through the deterministic `REV_X11_MON_FILE` hook plus the
+  strict fake-compositor unit test; real RandR/compositor hotplug in the
+  field is a documented untested limit. See docs/BACKENDS.md.
 * **Runtime control + idle power-save everywhere (2026-10, three-feature
   pass).** (1) The WSI swapchain path — the fast present path — now idles:
   every `vkQueuePresentKHR` arms a `wl_surface.frame` request on the very
@@ -426,18 +440,25 @@ Still no tags and no GitHub releases. This dev cycle:
   GPU color conversion. docs/VIDEO.md records the full decoder
   architecture assessment (why a from-scratch H.264 decoder is the
   wrong project, licensing notes, and the phase-2 hardware-decode plan).
-* **Verification.** 12 unit suites (new this cycle: the IPC protocol —
-  handshake versioning, framing limits, garbage/oversize/partial-line
-  handling, stale-socket reclaim, in-use refusal, per-user permissions;
-  the fade math — SSE2 lanes vs the scalar path, exact rounding; the
-  X11 display-power parser), e2e 22/23 legs under Xvfb (new this cycle:
-  X11 DPMS idle cycle + idle-watchdog audit burst via the deterministic
-  hook; a full runtime-IPC session — ping, status, faded theme switch,
-  playlist + next, bad-theme ERR, clean QUIT before timeout; earlier
-  legs: Vulkan pixel parity on both present paths, GPU sims on lavapipe,
-  GPU ripple click parity, folder/packed theme parity, corrupt-pack
-  rejection, video on CPU and GL tiers, click-after-calm on CPU and GL
-  tiers; one leg skips on Xvfb builds without the DPMS extension), e2e-
+* **Verification.** 15 unit suites (newest: the output-hotplug contract —
+  the deterministic X11 monitor-file parser; the Wayland fake-compositor
+  hotplug leg — late wl_output bind, packed monitor list, window teardown
+  wire-exact with real opcodes, slot reuse; earlier this cycle: the IPC
+  protocol — handshake versioning, framing limits, garbage/oversize/
+  partial-line handling, stale-socket reclaim, in-use refusal, per-user
+  permissions; the fade math — SSE2 lanes vs the scalar path, exact
+  rounding; the X11 display-power parser), e2e 35/36 legs under Xvfb
+  (newest: output-hotplug add + survivor-resize, hotplug removal with
+  window release, and a runtime EGL surface built for a hotplug-added
+  monitor on the GL tier, all through the deterministic
+  `REV_X11_MON_FILE` hook; earlier: X11 DPMS idle cycle + idle-watchdog
+  audit burst via the deterministic hook; a full runtime-IPC session —
+  ping, status, faded theme switch, playlist + next, bad-theme ERR,
+  clean QUIT before timeout; Vulkan pixel parity on both present paths,
+  GPU sims on lavapipe, GPU ripple click parity, folder/packed theme
+  parity, corrupt-pack rejection, video on CPU and GL tiers,
+  click-after-calm on CPU and GL tiers; one leg skips on Xvfb builds
+  without the DPMS extension), e2e-
   wayland 4/4 against real headless weston, a clean ASan+UBSan+LSan pass
   over the unit suite AND a five-switch IPC daemon session including
   mid-fade redirects, plus GitHub Actions CI running build + unit + e2e

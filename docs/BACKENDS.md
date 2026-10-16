@@ -105,6 +105,56 @@ Note on XWayland: an X11-backend session inside Wayland reports DPMS
 from the X server, which may not track the Wayland display's actual
 power state — run the native Wayland backend there for accurate idling.
 
+### Output hotplug (monitors added / removed / resized at runtime)
+
+The daemon re-enumerates the monitor list every `REV_HOTPLUG_S` seconds
+(default 2, `0` disables) and reconciles its window set with it — the
+cadence runs even while idle-hidden, so a replug during sleep is noticed
+on wake. New outputs get a window + framebuffer + renderer surface
+(`add_window` hooks: EGL surface on GL, `VkSurfaceKHR` + swapchain on the
+vulkan WSI path; nothing on the CPU tier); removed outputs release the
+renderer surface FIRST (its native handle dies with the platform
+window), then the window, then the framebuffer. Surviving outputs whose
+geometry changed go through the same resize dance the per-tick window
+poll uses. Window SLOTS are never renumbered — the scene's per-monitor
+instances and the renderers' per-window state are indexed by slot, so a
+gone output tombstones its slot and a new output reuses the first free
+one. `-m N` disables the reconciler entirely (the user pinned exactly
+that output); so does a platform without the identity/removal
+primitives (all current backends have both).
+
+Identity per backend:
+
+* **Wayland** (both the raw client and the WSI shim): the `wl_output`
+  registry global name — compositor-assigned, unique for the output's
+  lifetime, never reused for a different output. Outputs appearing
+  mid-session are bound inside `pump()` (never inside the event parser)
+  with a bounded roundtrip for their geometry; `global_remove`
+  tombstones the gone one. `wl_monitors()` packs the surviving outputs,
+  so monitor N means "the (N+1)-th output still present".
+* **X11**: Xinerama exposes no stable output ids — the screen ORIGIN is
+  the only persistent key core X11 offers. A monitor MOVED therefore
+  matches as remove+add (window recreation at the new position —
+  correct, if chatty); a monitor REPLACED at the same origin is an
+  in-place geometry update. Mirrored screens (same origin) share the
+  identity key; the reconciler claims distinct entries so duplicates
+  still get distinct windows.
+
+`REV_X11_MON_FILE=<path>` is a TEST hook that overrides the Xinerama
+query with a text file ("x y w h" per line, `#` comments) — the e2e
+hotplug legs drive monitor add/remove/resize through the same code path
+a real RandR screen change takes, deterministically, on any server.
+Malformed files fall back to the server query with a warning.
+
+Honest limits: hotplug e2e coverage is X11-through-the-mon-file-hook
+and the Wayland fake-compositor unit test; real RandR screen changes,
+real DPMS-resume replug races, and real compositor output hotplug
+(KWin/wlroots adding an output mid-session) are documented as untested
+in the field. The zero-outputs transition (all monitors unplugged) is
+handled by design — the daemon logs it and idles until an output
+returns — but is not e2e-verifiable on X11, where the server always
+reports at least the root screen.
+
 ## The renderer policy (2026-10 redesign)
 
 `--renderer` / `REV_RENDERER` accept `auto | vulkan | opengl | cpu`.
@@ -355,6 +405,8 @@ selects.
 | `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long flips the daemon to paused — see "Idle power-save") |
 | `REV_IDLE_AUDIT_S`  | idle watchdog interval in seconds (default 30, 0 = off): after this long continuously hidden, a 1 s full-rate audit burst guards against a wedged idle detector |
 | `REV_X11_DPMS_FILE` | TEST hook: a file naming the display level (`on`/`standby`/`suspend`/`off`) that overrides the X11 DPMS wire query — drives the idle machinery deterministically on any server |
+| `REV_HOTPLUG_S`     | monitor re-enumeration / window reconcile interval in seconds (default 2, `0` = off; disabled automatically when `-m` pinned a monitor). See "Output hotplug" |
+| `REV_X11_MON_FILE`  | TEST hook: a file with one `x y w h` monitor per line (`#` comments) that overrides the Xinerama query — drives deterministic output-hotplug e2e under Xvfb |
 | `REV_PROFILE`       | `1` = append the stage breakdown to the periodic `perf:` line: `sim / raster / render (incl upload) / gpu` ms + frame-time p50/p95/max. `gpu` comes from async driver timer queries on hardware GL and is labeled unavailable when the driver has none |
 | `REV_AUTO_VK`       | `1` = let auto keep SOFTWARE Vulkan (lavapipe) — hardware Vulkan already leads auto; the override only admits the software device |
 | `REV_AUTO_GL_SW`    | `1` = let auto keep software GL (llvmpipe) instead of the native CPU renderer |
