@@ -399,6 +399,11 @@ MCOK=1
 # a missing value — not mis-report a content-mode conflict
 ./build/reverie --video --scale stretch >/dev/null 2>&1 && MCOK=0
 ./build/reverie --video --scale stretch 2>&1 | grep -q "needs a value" || MCOK=0
+# media flags are position independent: --scale before --video must
+# parse — the failure below is the missing file (or the stub refusal),
+# never the 'applies to' parse error
+./build/reverie --scale fit --video nosuchmedia.mp4 -o > "$OUT/mord.log" 2>&1 || true
+grep -q "applies to" "$OUT/mord.log" && MCOK=0
 if [ "$MCOK" = 1 ]; then
     echo "    media(cli):   PASS (content-mode conflicts rejected)"
     PASS=$((PASS+1))

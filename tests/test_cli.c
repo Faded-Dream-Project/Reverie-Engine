@@ -207,6 +207,16 @@ int main(void)
         CHECK(parse("--video a.mp4 --scale center --no-loop", &a, err, sizeof err, &usage_hint) &&
               a.scale == REV_SCALE_CENTER && a.no_loop,
               "--scale center + --no-loop parse");
+        CHECK(parse("--scale stretch --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_STRETCH && !strcmp(a.video_path, "a.mp4") &&
+              !a.scene_path,
+              "--scale before --video parses (position independent)");
+        CHECK(parse("--no-loop --scale fit --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.no_loop && a.scale == REV_SCALE_FIT,
+              "--no-loop + --scale both before --video parse");
+        CHECK(!parse("--scale fill --scene a.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--scale applies to --video media mode"),
+              "--scale still rejected in scene mode (post-parse check)");
         CHECK(parse("--video a.mp4 --exit-if-running -R cpu", &a, err, sizeof err, &usage_hint) &&
               a.exit_if_running && !strcmp(a.renderer_pref, "cpu"),
               "--video composes with the daemon flags");

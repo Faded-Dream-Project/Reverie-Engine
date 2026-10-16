@@ -104,6 +104,9 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
         a->scale = REV_SCALE_FILL;
         a->shot_after = -1;
         err[0] = 0;
+        /* Media-mode flags are recorded during the scan but validated once,
+         * after the whole line is parsed — see the post-loop checks. */
+        bool scale_seen = false, no_loop_seen = false;
 
         #define NEED_VALUE(opt) do { \
                 if (i + 1 >= argc || option_like(argv[i + 1])) { \
@@ -170,19 +173,11 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                                          "bad --scale (want fill|fit|stretch|center)");
                                 return false;
                         }
-                        if (!a->video_path) {
-                                snprintf(err, errcap,
-                                         "--scale applies to --video media mode");
-                                return false;
-                        }
                         a->scale = m;
+                        scale_seen = true;
                 } else if (!strcmp(argv[i], "--no-loop")) {
-                        if (!a->video_path) {
-                                snprintf(err, errcap,
-                                         "--no-loop applies to --video media mode");
-                                return false;
-                        }
                         a->no_loop = true;
+                        no_loop_seen = true;
                 } else if (!strcmp(argv[i], "--exit-if-running")) {
                         a->exit_if_running = true;
                 } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) {
@@ -259,6 +254,19 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                         if (err[0])
                                 return false;
                 }
+        }
+        /* Media-only flags are rejected here, once the whole line is known:
+         * `--scale stretch --video f.mp4` is the same command as
+         * `--video f.mp4 --scale stretch`, and the old inline check made
+         * the order significant for no reason. Orphaned flags (no --video
+         * anywhere) keep the historical error messages. */
+        if (scale_seen && !a->video_path) {
+                snprintf(err, errcap, "--scale applies to --video media mode");
+                return false;
+        }
+        if (no_loop_seen && !a->video_path) {
+                snprintf(err, errcap, "--no-loop applies to --video media mode");
+                return false;
         }
         return true;
 }
