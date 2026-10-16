@@ -1,0 +1,11 @@
+/* Ember-preset click probe: spawn=pointer means no ambient emission —
+   the only visible change is the click burst, preset mechanics intact. */
+scene "Ember Click Probe" {
+    fps = 60
+
+    layer sparks {
+        type = particles
+        preset = embers
+        spawn = pointer
+    }
+}

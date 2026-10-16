@@ -703,7 +703,15 @@ static const char *VS_PARTICLES =
         "    vec4 pos = texelFetch(u_parts, pa, 0);\n"
         "    vec4 col = texelFetch(u_parts, pa + ivec2(0, u_rows), 0);\n"
         "    vec2 n = pos.xy / u_frame;\n"   /* [0..1], y from the TOP     */
-        "    gl_Position = vec4(n.x * 2.0 - 1.0, 1.0 - 2.0 * n.y, 0.0, 1.0);\n"
+        /* clip.y maps top-down rows DIRECTLY (y=0 -> -1): this renderer's
+         * layer targets are top-down (uploads store row 0 = image top,
+         * FS_GRADIENT evaluates v_screen as top-down pixel rows, the
+         * present pass flips v once for the whole frame). The usual GL
+         * 1-2y flip stored the sprite layer bottom-up, and the composite
+         * mirrored every particle layer vertically — only visible on
+         * localized bursts (ambient particles are uniform, so the parity
+         * legs could not see it). */
+        "    gl_Position = vec4(n.x * 2.0 - 1.0, 2.0 * n.y - 1.0, 0.0, 1.0);\n"
         "    float r = max(1.0, floor(pos.z * 2.0));\n"
         "    gl_PointSize = min(2.0 * r + 1.0, 63.0);\n"
         "    v_col = col.rgb;\n"

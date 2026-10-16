@@ -288,6 +288,59 @@ for TIER in cpu opengl; do
 done
 stop_xvfb
 
+# ---- Particles CLICK placement regression (2026-10) ---------------------------
+# Field report: snowfall / ember-drift bursts appeared MIRRORED — "move the
+# mouse up and click, the effect appears down." Root cause: VS_PARTICLES
+# mapped device-y into GL's y-up clip space, but this renderer's layer-target
+# convention is TOP-DOWN (uploads store row 0 = image top, FS_GRADIENT
+# evaluates v_screen as top-down pixel rows, the present pass flips v once
+# for the whole frame) — so the composite mirrored every GPU point-sprite
+# layer vertically. The ripple click legs never caught it: uniform ambient
+# particles make a flip invisible; only the localized burst reveals it.
+# The fixtures (tests/fixtures/click-probe-*.rev) run the real presets with
+# spawn=pointer — zero ambient emission, so the ONLY inter-run diff is the
+# click burst itself. Asymmetric click (0.25,0.25): a mirror lands ~ (0.75,
+# 0.75), far outside the 6% centroid tolerance.
+start_xvfb
+for PROBE in snow embers; do
+    FIX="tests/fixtures/click-probe-$PROBE.rev"
+    for TIER in cpu opengl vulkan; do
+        if [ "$TIER" = opengl ]; then
+            TIENV="$GPU_ENV REV_GL_FLUID_SW=1"
+            NEED="particles: GPU point sprites"
+        elif [ "$TIER" = vulkan ]; then
+            TIENV="$GPU_ENV REV_VK_SIMS_SW=1"
+            NEED="particles: GPU point sprites"
+        else
+            TIENV="$GPU_ENV"
+            NEED="renderer: cpu"
+        fi
+        DISPLAY="$XDISPLAY" env $TIENV timeout 8 ./build/reverie -R $TIER \
+            --shot 0.5 "$OUT/pcp-$PROBE-$TIER-base" "$FIX" \
+            > "$OUT/pcp-$PROBE-$TIER-base.log" 2>&1 || true
+        DISPLAY="$XDISPLAY" env $TIENV REV_FAKE_CLICK=0.25,0.25 timeout 8 \
+            ./build/reverie -R $TIER --shot 0.5 "$OUT/pcp-$PROBE-$TIER" "$FIX" \
+            > "$OUT/pcp-$PROBE-$TIER.log" 2>&1 || true
+        OK=1
+        [ -f "$OUT/pcp-$PROBE-$TIER-base.png" ] && [ -f "$OUT/pcp-$PROBE-$TIER.png" ] || OK=0
+        grep -q "$NEED" "$OUT/pcp-$PROBE-$TIER.log" 2>/dev/null || OK=0
+        if [ $OK -eq 1 ]; then
+            if python3 scripts/click_cmp.py "$OUT/pcp-$PROBE-$TIER-base.png" \
+                    "$OUT/pcp-$PROBE-$TIER.png" 0.25 0.25 0.05 2>/dev/null; then
+                echo "    particles(click,$TIER/$PROBE): PASS (burst lands on the click)"
+                PASS=$((PASS+1))
+            else
+                echo "    particles(click,$TIER/$PROBE): FAIL (burst misplaced — mirrored layer)"
+                FAIL=$((FAIL+1))
+            fi
+        else
+            echo "    particles(click,$TIER/$PROBE): SKIP (tier unavailable / no shots)"
+            SKIP=$((SKIP+1))
+        fi
+    done
+done
+stop_xvfb
+
 # ---- Themes: folder + packed + hostile rejection -----------------------------
 start_xvfb
 DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 3 "$OUT/theme" themes/ripple-lake \
