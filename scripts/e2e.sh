@@ -680,6 +680,80 @@ if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null; then
     stop_xvfb
 fi
 
+# ---- GPU gradient evaluation parity (static scene, GPU paths forced on) -----
+# wants_grads is false on software devices, so every parity comparison above
+# rasterizes gradients with the CPU LUT — the shader-evaluated gradient
+# arithmetic (FS_GRADIENT / gradient.comp, incl. the ordered dither offset)
+# is never pixel-compared there. This leg forces it on (REV_VK_SIMS_SW /
+# REV_GL_FLUID_SW both flip wants_grads on software devices) and compares
+# against the CPU raster on a dark multi-stop linear+radial scene — the
+# configuration where the dither units bug (a 255x over-amplified Bayer
+# offset: dots instead of smooth ramps on every hardware tier) slipped
+# through all other comparisons.
+if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null \
+   || grep -q "renderer: opengl" "$OUT/gl.log" 2>/dev/null; then
+    start_xvfb
+    GRAD=$(mktemp -d)
+    cat > "$GRAD/grad.rev" <<'EOF'
+/* static gradient parity fixture — dark ramps + alpha, no anims */
+scene "gpu-grad parity" {
+    fps = 5
+    layer lin {
+        type = gradient
+        shape = linear
+        angle = 37
+        stops = [#04060f, (#1a2c4a 0.5), (#2c4f6e 1.0)]
+    }
+    layer rad {
+        type = gradient
+        shape = radial
+        stops = [(#00000000 0.0), (#5a3d6e66 0.55), (#0a0a2a 1.0)]
+        blend = screen
+    }
+}
+EOF
+    DISPLAY="$XDISPLAY" timeout 8 ./build/reverie -R cpu --shot 2 "$OUT/ggcpu" "$GRAD/grad.rev" \
+        > "$OUT/ggcpu.log" 2>&1 || true
+    if grep -q "renderer: vulkan" "$OUT/vk.log" 2>/dev/null; then
+        DISPLAY="$XDISPLAY" env $GPU_ENV REV_VK_SIMS_SW=1 timeout 10 \
+            ./build/reverie -R vulkan --shot 2 "$OUT/ggvk" "$GRAD/grad.rev" \
+            > "$OUT/ggvk.log" 2>&1 || true
+        if [ -f "$OUT/ggvk.png" ] && [ -f "$OUT/ggcpu.png" ]; then
+            if python3 scripts/rev_shot_cmp.py "$OUT/ggvk.png" "$OUT/ggcpu.png" 2 8 >/dev/null 2>&1; then
+                echo "    vulkan(ggrad): PASS (shader-evaluated gradient matches CPU raster)"
+                PASS=$((PASS+1))
+            else
+                echo "    vulkan(ggrad): FAIL (GPU gradient evaluation diverged from CPU raster)"
+                python3 scripts/rev_shot_cmp.py "$OUT/ggvk.png" "$OUT/ggcpu.png" 2 8 || true
+                FAIL=$((FAIL+1))
+            fi
+        else
+            echo "    vulkan(ggrad): SKIP (screenshot missing)"
+            SKIP=$((SKIP+1))
+        fi
+    fi
+    if grep -q "renderer: opengl" "$OUT/gl.log" 2>/dev/null; then
+        DISPLAY="$XDISPLAY" env $GPU_ENV REV_GL_FLUID_SW=1 timeout 10 \
+            ./build/reverie -R opengl --shot 2 "$OUT/gggl" "$GRAD/grad.rev" \
+            > "$OUT/gggl.log" 2>&1 || true
+        if [ -f "$OUT/gggl.png" ] && [ -f "$OUT/ggcpu.png" ]; then
+            if python3 scripts/rev_shot_cmp.py "$OUT/gggl.png" "$OUT/ggcpu.png" 2 8 >/dev/null 2>&1; then
+                echo "    opengl(ggrad): PASS (shader-evaluated gradient matches CPU raster)"
+                PASS=$((PASS+1))
+            else
+                echo "    opengl(ggrad): FAIL (GPU gradient evaluation diverged from CPU raster)"
+                python3 scripts/rev_shot_cmp.py "$OUT/gggl.png" "$OUT/ggcpu.png" 2 8 || true
+                FAIL=$((FAIL+1))
+            fi
+        else
+            echo "    opengl(ggrad): SKIP (screenshot missing)"
+            SKIP=$((SKIP+1))
+        fi
+    fi
+    rm -rf "$GRAD"
+    stop_xvfb
+fi
+
 # ---- Vulkan tier: GPU sims (forced on software devices via REV_VK_SIMS_SW) --
 # The whole GPU sim path (fluid splats/Jacobi/advection/tonemap + ripple wave
 # equation/refraction composite) stays regression-tested on lavapipe.

@@ -731,8 +731,9 @@ static const char *FS_PARTICLES =
  * Mirrors build_lut()/paint_t(): linear t = projection onto the axis,
  * radial t = |P - C| / r (scene radials are concentric), PAD spread, stops
  * sorted with implicit end caps, straight-RGBA channel lerp, AND the same
- * 4x4 ordered dither as the CPU raster (sub-LSB Bayer offset on t —
- * see BAYER4 in raster.c; differences stay under one LUT step). */
+ * 4x4 ordered dither as the CPU raster (sub-LSB Bayer offset on RGB in
+ * 8-bit CODE units — /255 into c's NORMALIZED units; raw code units were
+ * a 255x over-amplification. See BAYER4 in raster.c). */
 static const char *FS_GRADIENT =
         "#version 300 es\n"
         "precision highp float;\n"
@@ -775,7 +776,7 @@ static const char *FS_GRADIENT =
         "    int dx = dpix.x & 3, dy = dpix.y & 3;\n"
         "    int db = (((dx & 1) ^ (dy & 1)) << 3) | ((dy & 1) << 2)\n"
         "          | ((((dx >> 1) & 1) ^ ((dy >> 1) & 1)) << 1) | ((dy >> 1) & 1);\n"
-        "    c.rgb += vec3((float(db) - 7.5) / 16.0);\n"
+        "    c.rgb += vec3((float(db) - 7.5) / (16.0 * 255.0));\n"
         "    fragColor = c;\n"
         "}\n";
 
