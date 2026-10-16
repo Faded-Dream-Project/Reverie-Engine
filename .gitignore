@@ -16,3 +16,14 @@ build/
 *.log
 core
 docs/img/
+
+# Credentials — never commit tokens or key material. If one ever lands
+# here by accident, treat it as compromised and rotate it immediately.
+*.token
+*.pat
+*.pem
+*.key
+.secrets*
+.env
+.env.*
+credentials*.txt
