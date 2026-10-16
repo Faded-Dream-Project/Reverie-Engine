@@ -36,10 +36,10 @@ scene "Mountain Dusk" {
         force = 10
         radius = 0.022
         dissipation = 0.28
-        ambient = 0.4
+        ambient = 0.45
         blend = screen
         opacity = 0.45
         blur = 5
-        anim opacity { from = 0.3; to = 0.6; dur = 14s; ease = sine; mode = pingpong }
+        anim opacity { from = 0.28; to = 0.58; dur = 19s; ease = sine; mode = pingpong }
     }
 }

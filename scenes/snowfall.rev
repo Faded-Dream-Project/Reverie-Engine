@@ -11,6 +11,15 @@ scene "Snowfall" {
         blur = 4
     }
 
+    layer skylight {
+        type = gradient
+        shape = linear
+        angle = 180
+        stops = [#0e2038, (#0a1428aa 0.5), #00000000]
+        blend = screen
+        opacity = 0.5
+    }
+
     layer frost {
         type = gradient
         shape = radial

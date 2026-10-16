@@ -22,6 +22,15 @@ scene "Aurora Fluid" {
         anim angle { from = 160; to = 300; dur = 44s; ease = sine; mode = pingpong }
     }
 
+    layer band2 {
+        type = gradient
+        shape = linear
+        angle = 140
+        stops = [#00000000, (#1d3a6e4d 0.45), (#2a4f8e5e 0.6), #00000000]
+        blend = screen
+        anim angle { from = 118; to = 156; dur = 67s; ease = sine; mode = pingpong }
+    }
+
     layer aurora {
         type = fluid
         res = 0.5
@@ -29,7 +38,7 @@ scene "Aurora Fluid" {
         dye2 = #b46bff
         force = 12
         radius = 0.012
-        dissipation = 0.05
+        dissipation = 0.045
         ambient = 0.4
         blend = screen
         opacity = 0.9

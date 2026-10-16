@@ -12,13 +12,22 @@ scene "Ember Drift" {
         stops = [#1d0b07, (#38100a 0.5), (#0a0505 1.0)]
     }
 
+    layer deep {
+        type = gradient
+        shape = radial
+        center = (0.5, 1.0)
+        radius = 0.9
+        stops = [#4d130a66, (#2a0c0833 0.55), #00000000]
+        blend = screen
+    }
+
     layer glow {
         type = gradient
         shape = linear
         angle = 90
         stops = [#00000000, (#ff6a0033 0.82), (#ffb30040 1.0)]
         blend = screen
-        anim opacity { from = 0.7; to = 1.0; dur = 6s; ease = sine; mode = pingpong }
+        anim opacity { from = 0.7; to = 1.0; dur = 11s; ease = sine; mode = pingpong }
     }
 
     layer embers {
