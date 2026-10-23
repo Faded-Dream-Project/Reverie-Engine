@@ -48,12 +48,16 @@ static void fresh_xdg(void)
 }
 
 /* The process's ORIGINAL cwd: relative-path recording resolves against
- * it everywhere except the chdir'd scene leg, which captures its own. */
+ * it everywhere except the chdir'd scene leg, which captures its own.
+ * Returns are checked, not discarded — Ubuntu's GCC 13 (fortify on)
+ * marks getcwd/chdir warn_unused_result and -Werror makes an ignored
+ * return a build break; GCC 14 relaxed the warning, which is how the
+ * statements compiled clean locally while failing on the runner. */
 static char cwd[512];
 
-static void record_cwd(void)
+static bool record_cwd(void)
 {
-        getcwd(cwd, sizeof cwd);
+        return getcwd(cwd, sizeof cwd) != NULL;
 }
 
 static char scwd[512];   /* the chdir'd sandbox leg's cwd */
@@ -100,7 +104,7 @@ static bool write_record(const char *json)
 int main(void)
 {
         setvbuf(stdout, NULL, _IOLBF, 0);
-        record_cwd();    /* the original cwd relative paths resolve against */
+        CHECK(record_cwd(), "original cwd captured for the relative legs");
         char err[512] = { 0 };
         RevArgs a;
         RevSession s;
@@ -125,7 +129,8 @@ int main(void)
                 if (d2) {
                         if (chdir(d2) != 0)
                                 CHECK(false, "chdir into cwd sandbox");
-                        getcwd(scwd, sizeof scwd);
+                        CHECK(getcwd(scwd, sizeof scwd) != NULL,
+                              "sandbox cwd captured");
                         CHECK(parse_spec("--scene|themes/my theme", &a,
                                          err, sizeof err) &&
                               rev_session_record(&a, err, sizeof err),
@@ -139,7 +144,8 @@ int main(void)
                         CHECK(tok_eq(&s, 1, want),
                               "relative path recorded ABSOLUTE (cwd-joined), "
                               "space intact");
-                        chdir(cwd);
+                        if (chdir(cwd) != 0)
+                                CHECK(false, "original cwd restored after leg");
                 }
         }
 
