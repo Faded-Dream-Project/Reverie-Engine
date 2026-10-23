@@ -9,6 +9,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -191,71 +194,215 @@ static u32 new_id(X11 *x)
 
 /* --------------------------------------------------------------------------
  * Xauthority
+ *
+ * The .Xauthority format (libXau): a sequence of records, each a chain of
+ * (u16 BIG-ENDIAN length, payload) pairs — family, address, display number
+ * (ASCII), authorization name, authorization data. Two independent defects
+ * made every real file unparseable until the 2026-10 field report
+ * ("server refused connection: Invalid ..." under Xorg/XLibre + Openbox):
+ * the parser assumed a flat little-endian 12-byte header with all lengths
+ * up front, and the family filter rejected FamilyWild — the record shape
+ * `xauth add :0 .` (startx, ssh, display managers) writes. No cookie was
+ * ever found, so any server requiring one refused us; CI never saw it
+ * because its Xvfb runs without -auth. The layout below is verified
+ * byte-for-byte against a live enforcing server (raw-socket probes, plus
+ * the e2e x11(auth) legs).
  * ------------------------------------------------------------------------ */
 
-static bool xauth_lookup(int display, u8 *out, u32 *outlen)
+enum {
+        XAUTH_FAMILY_INTERNET = 0,    /* IPv4 address bytes            */
+        XAUTH_FAMILY_INET6    = 6,   /* IPv6 address bytes            */
+        XAUTH_FAMILY_LOCAL    = 256, /* hostname string               */
+        XAUTH_FAMILY_WILD     = 65535 /* matches any connection        */
+};
+
+#define XAUTH_NAME_LEN 18        /* "MIT-MAGIC-COOKIE-1"            */
+#define XAUTH_DATA_CAP 64        /* cookies are 16 bytes; allow slack */
+
+typedef struct {
+        u16   family;
+        u8    addr[256];
+        u16   alen;
+        char  number[16];
+        u16   nlen;
+        char  name[256];
+        u16   nmlen;
+        u8    data[256];
+        u16   dtlen;
+} XauthRec;
+
+static bool xauth_rd16be(FILE *f, u16 *v)
 {
-        const char *path = getenv("XAUTHORITY");
-        char homepath[512];
-        if (!path || !*path) {
-                const char *home = getenv("HOME");
-                if (!home)
-                        return false;
-                snprintf(homepath, sizeof homepath, "%s/.Xauthority", home);
-                path = homepath;
+        u8 b[2];
+        if (fread(b, 1, 2, f) != 2)
+                return false;
+        *v = (u16)((b[0] << 8) | b[1]);
+        return true;
+}
+
+static bool xauth_rdbytes(FILE *f, void *dst, u16 n, size_t cap)
+{
+        if ((size_t)n > cap)
+                return false;
+        if (n && fread(dst, 1, n, f) != (size_t)n)
+                return false;
+        return true;
+}
+
+/* Reads one record. False at EOF (clean stop) or on a malformed/oversized
+ * field (parse stops — a wrong guess is worse than no cookie). */
+static bool xauth_read_rec(FILE *f, XauthRec *r)
+{
+        if (!xauth_rd16be(f, &r->family) ||
+            !xauth_rd16be(f, &r->alen) ||
+            !xauth_rdbytes(f, r->addr, r->alen, sizeof r->addr - 1))
+                return false;
+        r->addr[r->alen] = 0;
+        if (!xauth_rd16be(f, &r->nlen) ||
+            !xauth_rdbytes(f, r->number, r->nlen, sizeof r->number - 1))
+                return false;
+        r->number[r->nlen] = 0;
+        if (!xauth_rd16be(f, &r->nmlen) ||
+            !xauth_rdbytes(f, r->name, r->nmlen, sizeof r->name - 1))
+                return false;
+        r->name[r->nmlen] = 0;
+        if (!xauth_rd16be(f, &r->dtlen) ||
+            !xauth_rdbytes(f, r->data, r->dtlen, sizeof r->data))
+                return false;
+        return true;
+}
+
+/* Addresses our connection can legitimately claim — mirroring how the
+ * server sees the client. For local displays that is our hostname
+ * (FamilyLocal) plus every address the hostname resolves to (Xorg keeps
+ * exactly such a local-host list in os/access.c); for remote DISPLAYs the
+ * entry key is the DISPLAY host itself (libXau semantics: both the file
+ * entries and the lookup key derive from the DISPLAY string). Remote
+ * setups rely on FamilyWild records, which ssh forwarding and display
+ * managers write. */
+typedef struct {
+        char  hostname[256];
+        u8    v4[8][4];
+        int   nv4;
+        u8    v6[8][16];
+        int   nv6;
+} AddrSet;
+
+static void addrset_add_host(AddrSet *as, const char *host)
+{
+        struct addrinfo hints, *res = NULL, *ai;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0)
+                return;
+        for (ai = res; ai; ai = ai->ai_next) {
+                if (ai->ai_family == AF_INET && as->nv4 < 8) {
+                        memcpy(as->v4[as->nv4++],
+                               &((const struct sockaddr_in *)ai->ai_addr)->sin_addr, 4);
+                } else if (ai->ai_family == AF_INET6 && as->nv6 < 8) {
+                        memcpy(as->v6[as->nv6++],
+                               &((const struct sockaddr_in6 *)ai->ai_addr)->sin6_addr, 16);
+                }
         }
+        freeaddrinfo(res);
+}
+
+/* True when DISPLAY's host part names the local machine: "", "unix",
+ * "box/unix", "localhost", or a loopback literal. Xlib routes these to
+ * the unix socket (and so do we). */
+static bool x11_host_is_local(const char *host)
+{
+        if (!host || !*host || !strcmp(host, "unix") ||
+            !strcmp(host, "localhost") || !strcmp(host, "127.0.0.1") ||
+            !strcmp(host, "::1"))
+                return true;
+        size_t n = strlen(host);
+        return n >= 5 && strcmp(host + n - 5, "/unix") == 0;
+}
+
+static bool xauth_rec_matches(const AddrSet *as, const XauthRec *r,
+                              int display, bool host_local)
+{
+        /* the only scheme we speak */
+        if (r->nmlen != XAUTH_NAME_LEN ||
+            memcmp(r->name, "MIT-MAGIC-COOKIE-1", XAUTH_NAME_LEN) != 0)
+                return false;
+        if (r->dtlen == 0 || r->dtlen > XAUTH_DATA_CAP)
+                return false;
+        /* display number: an empty entry field means any display */
+        if (r->nlen > 0) {
+                char num[16];
+                int n = snprintf(num, sizeof num, "%d", display);
+                if (n < 0 || (u16)n != r->nlen ||
+                    memcmp(r->number, num, (size_t)n) != 0)
+                        return false;
+        }
+        switch (r->family) {
+        case XAUTH_FAMILY_WILD:
+                return true;
+        case XAUTH_FAMILY_LOCAL:
+                /* a Local entry is the server's view of a local connection —
+                 * useless (and rejected) when the DISPLAY is remote */
+                if (!host_local)
+                        return false;
+                return r->alen == 0 ||
+                       (r->alen == strlen(as->hostname) &&
+                        memcmp(r->addr, as->hostname, r->alen) == 0);
+        case XAUTH_FAMILY_INTERNET:
+                if (r->alen != 4)
+                        return false;
+                for (int i = 0; i < as->nv4; i++)
+                        if (memcmp(r->addr, as->v4[i], 4) == 0)
+                                return true;
+                return host_local && r->addr[0] == 127;  /* 127.0.0.0/8 */
+        case XAUTH_FAMILY_INET6: {
+                if (r->alen != 16)
+                        return false;
+                static const u8 v6_loop[16]  = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 };
+                static const u8 v6_v4map[16] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff,127,0,0,1 };
+                if (host_local &&
+                    (memcmp(r->addr, v6_loop, 16) == 0 ||
+                     memcmp(r->addr, v6_v4map, 16) == 0))
+                        return true;
+                for (int i = 0; i < as->nv6; i++)
+                        if (memcmp(r->addr, as->v6[i], 16) == 0)
+                                return true;
+                return false;
+        }
+        default:
+                return false;   /* DECnet/Chaos/ServerInterpreted: not ours */
+        }
+}
+
+bool x11_xauth_lookup(const char *path, const char *host, int display,
+                      u8 *out, u32 *outlen)
+{
+        if (!path || !*path || !out || !outlen || display < 0)
+                return false;
         FILE *f = fopen(path, "rb");
         if (!f)
                 return false;
 
-        char host[256] = { 0 };
-        gethostname(host, sizeof host - 1);
+        AddrSet as;
+        memset(&as, 0, sizeof as);
+        gethostname(as.hostname, sizeof as.hostname - 1);
+        bool host_local = x11_host_is_local(host);
+        addrset_add_host(&as, as.hostname);
+        if (host_local) {
+                addrset_add_host(&as, "localhost");
+        } else if (host && *host) {
+                addrset_add_host(&as, host);
+        }
 
         bool found = false;
-        for (;;) {
-                u16 family, alen, dlen, nlen, dtlen;
-                u8 hdr[12];
-                if (fread(hdr, 1, 12, f) != 12)
+        XauthRec r;
+        while (xauth_read_rec(f, &r)) {
+                if (xauth_rec_matches(&as, &r, display, host_local)) {
+                        memcpy(out, r.data, r.dtlen);
+                        *outlen = r.dtlen;
+                        found = true;
                         break;
-                family = (u16)(hdr[0] | (hdr[1] << 8));
-                alen = (u16)(hdr[2] | (hdr[3] << 8));
-                dlen = (u16)(hdr[4] | (hdr[5] << 8));
-                nlen = (u16)(hdr[6] | (hdr[7] << 8));
-                dtlen = (u16)(hdr[8] | (hdr[9] << 8));
-                (void)dlen;
-                if (alen > 4096 || nlen > 256 || dtlen > 256)
-                        break;
-                u8 addr[4096];
-                if (alen && fread(addr, 1, alen, f) != alen)
-                        break;
-                u8 disp[64] = { 0 };
-                if (dlen && fread(disp, 1, dlen, f) != (size_t)dlen)
-                        break;
-                u8 name[256];
-                if (nlen && fread(name, 1, nlen, f) != (size_t)nlen)
-                        break;
-                u8 data[256];
-                if (dtlen && fread(data, 1, dtlen, f) != (size_t)dtlen)
-                        break;
-
-                if (nlen == 18 && memcmp(name, "MIT-MAGIC-COOKIE-1", 18) == 0 &&
-                    dtlen > 0 && dtlen <= 64) {
-                        bool fam_ok = (family == 256) || (family == 1) || (family == 0);
-                        bool disp_ok = true;
-                        if (dlen > 0) {
-                                char d[32];
-                                snprintf(d, sizeof d, "%d", display);
-                                disp_ok = (dlen == strlen(d) && memcmp(disp, d, dlen) == 0);
-                        }
-                        bool addr_ok = true;
-                        if (family == 1 && alen > 0)
-                                addr_ok = (alen == strlen(host) && memcmp(addr, host, alen) == 0);
-                        if (fam_ok && disp_ok && addr_ok) {
-                                memcpy(out, data, (size_t)dtlen);
-                                *outlen = dtlen;
-                                found = true;
-                                break;
-                        }
                 }
         }
         fclose(f);
@@ -265,6 +412,65 @@ static bool xauth_lookup(int display, u8 *out, u32 *outlen)
 /* --------------------------------------------------------------------------
  * connection setup
  * ------------------------------------------------------------------------ */
+
+/* Unix-socket transports: the filesystem path first, then the abstract-
+ * namespace socket modern servers also bind (containers with odd /tmp
+ * mounts sometimes only have the abstract one). */
+static int x11_connect_unix(int dispnum)
+{
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/.X11-unix/X%d", dispnum);
+        size_t pl = strlen(path);
+        if (pl >= sizeof(((struct sockaddr_un *)0)->sun_path))
+                return -1;
+        for (int abstract = 0; abstract <= 1; abstract++) {
+                struct sockaddr_un sa;
+                memset(&sa, 0, sizeof sa);
+                sa.sun_family = AF_UNIX;
+                socklen_t salen;
+                if (!abstract) {
+                        memcpy(sa.sun_path, path, pl + 1);
+                        salen = (socklen_t)sizeof sa;
+                } else {
+                        sa.sun_path[0] = '\0';
+                        memcpy(sa.sun_path + 1, path, pl);
+                        salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + pl);
+                }
+                int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (fd < 0)
+                        return -1;
+                if (connect(fd, (struct sockaddr *)&sa, salen) == 0)
+                        return fd;
+                close(fd);
+        }
+        return -1;
+}
+
+/* TCP transport for remote DISPLAYs (ssh forwarding, remote hosts): the
+ * X convention is port 6000 + display number. */
+static int x11_connect_tcp(const char *host, int dispnum)
+{
+        char port[16];   /* fits any int 6000+dispnum incl. sign and NUL */
+        snprintf(port, sizeof port, "%d", 6000 + dispnum);
+        struct addrinfo hints, *res = NULL, *ai;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, port, &hints, &res) != 0)
+                return -1;
+        int fd = -1;
+        for (ai = res; ai && fd < 0; ai = ai->ai_next) {
+                fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+                if (fd < 0)
+                        continue;
+                if (connect(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+                        close(fd);
+                        fd = -1;
+                }
+        }
+        freeaddrinfo(res);
+        return fd;
+}
 
 X11 *x11_connect(char *err, size_t errcap)
 {
@@ -289,43 +495,88 @@ X11 *x11_connect(char *err, size_t errcap)
         if (dispnum < 0)
                 dispnum = 0;
 
+        /* transport — Xlib semantics: local DISPLAY hosts go to the unix
+         * socket (localhost additionally falls back to TCP); anything else
+         * is a remote display over TCP. */
+        bool unix_only = !host[0] || !strcmp(host, "unix") ||
+                         (strlen(host) >= 5 &&
+                          !strcmp(host + strlen(host) - 5, "/unix"));
+        bool local_host = x11_host_is_local(host);
         int fd = -1;
-        char sockpath[108];   /* sockaddr_un limit */
-        snprintf(sockpath, sizeof sockpath, "/tmp/.X11-unix/X%d", dispnum);
-        struct sockaddr_un sa;
-        memset(&sa, 0, sizeof sa);
-        sa.sun_family = AF_UNIX;
-        memcpy(sa.sun_path, sockpath, sizeof sa.sun_path);
-
-        fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (unix_only) {
+                fd = x11_connect_unix(dispnum);
+        } else if (local_host) {
+                fd = x11_connect_unix(dispnum);
+                if (fd < 0)
+                        fd = x11_connect_tcp(host, dispnum);
+        } else {
+                fd = x11_connect_tcp(host, dispnum);
+        }
         if (fd < 0) {
-                snprintf(err, errcap, "x11: socket(): %s", strerror(errno));
-                return NULL;
-        }
-        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
-                close(fd);
-                snprintf(err, errcap, "x11: cannot connect to %s (%s)", sockpath, strerror(errno));
+                char tried[192];
+                if (unix_only)
+                        snprintf(tried, sizeof tried,
+                                 "unix socket /tmp/.X11-unix/X%d", dispnum);
+                else if (local_host)
+                        snprintf(tried, sizeof tried,
+                                 "unix socket /tmp/.X11-unix/X%d and TCP %s:%d",
+                                 dispnum, host, 6000 + dispnum);
+                else
+                        snprintf(tried, sizeof tried, "TCP %s:%d",
+                                 host, 6000 + dispnum);
+                snprintf(err, errcap, "x11: cannot connect to display '%s' (%s)",
+                         display, tried);
                 return NULL;
         }
 
-        /* auth cookie */
+        /* auth cookie: $XAUTHORITY (or ~/.Xauthority) — real files are
+         * big-endian, interleaved (see x11_xauth_lookup). Only
+         * MIT-MAGIC-COOKIE-1 is spoken; servers demanding other schemes
+         * (XDM-AUTHORIZATION-1 etc.) fail below with the server's reason. */
         u8 cookie[64];
         u32 cookie_len = 0;
-        bool have_cookie = xauth_lookup(dispnum, cookie, &cookie_len);
+        {
+                const char *apath = getenv("XAUTHORITY");
+                char homepath[512];
+                if (!apath || !*apath) {
+                        const char *home = getenv("HOME");
+                        if (home)
+                                snprintf(homepath, sizeof homepath,
+                                         "%s/.Xauthority", home);
+                        else
+                                homepath[0] = 0;
+                        apath = homepath;
+                }
+                if (x11_xauth_lookup(apath, host, dispnum, cookie, &cookie_len)) {
+                        LOGI("x11: MIT-MAGIC-COOKIE-1 loaded (%u bytes)", cookie_len);
+                } else {
+                        cookie_len = 0;
+                        LOGI("x11: no MIT-MAGIC-COOKIE-1 in %s — connecting "
+                             "without credentials", apath);
+                }
+        }
 
-        /* setup request */
+        /* setup request: 12-byte header, then (padded) name + data. The
+         * authorization name is sent ONLY together with a cookie — a name
+         * with no data can never authenticate and only buys a vaguer
+         * refusal ("Invalid MIT-MAGIC-COOKIE-1 key" instead of "no
+         * authorization protocol specified"). */
         u8 req[128];
         memset(req, 0, sizeof req);
-        u16 namelen = 18, datalen = (u16)cookie_len;
+        u16 namelen = 0, datalen = (u16)cookie_len;
+        if (cookie_len > 0) {
+                namelen = XAUTH_NAME_LEN;
+                memcpy(req + 12, "MIT-MAGIC-COOKIE-1", XAUTH_NAME_LEN);
+                memcpy(req + 32, cookie, cookie_len);
+        }
         req[0] = 'l';                       /* little endian */
         put16(req + 2, 11);                 /* protocol major */
-        put16(req + 4, 0);
+        put16(req + 4, 0);                  /* protocol minor */
         put16(req + 6, namelen);
         put16(req + 8, datalen);
-        memcpy(req + 12, "MIT-MAGIC-COOKIE-1", 18);
-        if (have_cookie)
-                memcpy(req + 32, cookie, cookie_len);
-        size_t reqlen = 32 + ((datalen + 3) & ~3u);
+        size_t reqlen = namelen
+                ? 32 + ((size_t)(datalen + 3) & ~(size_t)3)
+                : 12;
         if (!write_all(fd, req, reqlen)) {
                 close(fd);
                 snprintf(err, errcap, "x11: setup write failed");
@@ -338,22 +589,56 @@ X11 *x11_connect(char *err, size_t errcap)
                 snprintf(err, errcap, "x11: connection closed during setup");
                 return NULL;
         }
-        if (hdr[0] == 0) {
-                /* failed: reason string follows */
-                u16 len = (u16)(hdr[6] | (hdr[7] << 8));
-                char reason[128] = { 0 };
-                if (len > 0) {
-                        size_t got = read(fd, reason, len < sizeof reason ? len : sizeof reason - 1);
-                        (void)got;
+        if (hdr[0] != 1) {
+                /* failure (0) or authenticate (2). The 8-byte prefix common
+                 * to all setup replies: [0]=status, [1]=reason length in
+                 * bytes (failures), [2..3]=major, [4..5]=minor, [6..7]=
+                 * additional-data length in 4-byte units; for FAILED the
+                 * additional data IS the reason string. Verified against a
+                 * live enforcing Xorg: "Invalid MIT-MAGIC-COOKIE-1 key",
+                 * "Authorization required, but no authorization protocol
+                 * specified" — the old parser read [6..7] as a byte count
+                 * and printed an 8-byte truncation, which is where the
+                 * field report's cryptic "Invalid )" came from. */
+                char reason[160] = { 0 };
+                u32 addl = (u32)get16(hdr + 6) * 4;
+                if (addl > 1024)
+                        addl = 1024;
+                u8 addbuf[1024];
+                size_t got = 0;
+                while (got < addl) {
+                        ssize_t k = read(fd, addbuf + got, addl - got);
+                        if (k < 0) {
+                                if (errno == EINTR)
+                                        continue;
+                                break;
+                        }
+                        if (k == 0)
+                                break;
+                        got += (size_t)k;
                 }
                 close(fd);
-                snprintf(err, errcap, "x11: server refused connection: %s", reason);
-                return NULL;
-        }
-        if (hdr[0] == 2) {
-                /* authenticate — not supported */
-                close(fd);
-                snprintf(err, errcap, "x11: server requires an unsupported auth mode");
+                size_t rlen = hdr[0] == 0 ? hdr[1] : got;
+                if (rlen > got)
+                        rlen = got;
+                if (rlen > sizeof reason - 1)
+                        rlen = sizeof reason - 1;
+                while (rlen > 0 &&
+                       (addbuf[rlen - 1] == '\n' || addbuf[rlen - 1] == '\r'))
+                        rlen--;
+                for (size_t i = 0; i < rlen; i++) {
+                        u8 c = addbuf[i];
+                        reason[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                }
+                if (hdr[0] == 0)
+                        snprintf(err, errcap,
+                                 "x11: server refused connection: %s",
+                                 rlen ? reason : "(no reason given)");
+                else
+                        snprintf(err, errcap,
+                                 "x11: server demands auth negotiation (%s) — "
+                                 "only MIT-MAGIC-COOKIE-1 is supported",
+                                 rlen ? reason : "no details");
                 return NULL;
         }
 

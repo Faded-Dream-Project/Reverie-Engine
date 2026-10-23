@@ -917,6 +917,52 @@ else
 fi
 stop_xvfb
 
+# ---- X11 auth: MIT-MAGIC-COOKIE-1 against an enforcing server ----------------
+# The 2026-10 field report ("server refused connection: Invalid" under
+# Xorg/XLibre + Openbox): real sessions — startx, display managers, XLibre —
+# require a cookie and the backend must find it in $XAUTHORITY. CI's plain
+# Xvfb never enforces auth, which is exactly how a broken parser shipped.
+# This leg runs a second server WITH -auth (authority fixture in the real
+# big-endian interleaved format — the same bytes a live Xorg accepts), and
+# its twin asserts the server's refusal reason surfaces verbatim when the
+# credentials are missing.
+AUTHDISPLAY=":98"
+AUTHF="$OUT/Xauthority"
+printf '\377\377\000\000\000\00298\000\022MIT-MAGIC-COOKIE-1\000\020\000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017' \
+    > "$AUTHF"
+Xvfb "$AUTHDISPLAY" -screen 0 1280x800x24 -nolisten tcp -auth "$AUTHF" \
+    >/dev/null 2>&1 &
+XVFB_PID=$!
+sleep 1.5
+DISPLAY="$AUTHDISPLAY" XAUTHORITY="$AUTHF" timeout 14 ./build/reverie -R cpu \
+    --shot 3 "$OUT/auth" "$SCENE" > "$OUT/auth.log" 2>&1 || true
+if [ -f "$OUT/auth.png" ]; then
+    echo "    x11(auth):    PASS (cookie honored by an enforcing server)"
+    PASS=$((PASS+1))
+else
+    echo "    x11(auth):    FAIL (refused by the auth server)"
+    cat "$OUT/auth.log"
+    FAIL=$((FAIL+1))
+fi
+
+# missing credentials: the refusal must carry the server's own reason —
+# "Authorization required, but no authorization protocol specified" — not a
+# truncated fragment (the field report's "Invalid )" was a misparsed reason)
+: > "$OUT/empty-auth"
+DISPLAY="$AUTHDISPLAY" XAUTHORITY="$OUT/empty-auth" timeout 10 \
+    ./build/reverie -R cpu "$SCENE" > "$OUT/noauth.log" 2>&1 || true
+if grep -q "no authorization protocol specified" "$OUT/noauth.log" 2>/dev/null; then
+    echo "    x11(authmsg): PASS (server refusal reason surfaced verbatim)"
+    PASS=$((PASS+1))
+else
+    echo "    x11(authmsg): FAIL (refusal reason wrong or missing)"
+    cat "$OUT/noauth.log"
+    FAIL=$((FAIL+1))
+fi
+kill "$XVFB_PID" 2>/dev/null
+wait "$XVFB_PID" 2>/dev/null
+XVFB_PID=""
+
 # ---- Output hotplug: add + resize + remove (deterministic mon-file hook) ---
 # REV_X11_MON_FILE drives the same re-enumeration path a real RandR screen
 # change takes (x11_monitors is re-queried by the reconciler). One monitor

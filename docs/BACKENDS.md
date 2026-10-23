@@ -9,6 +9,7 @@ only linked libraries are libc and libm.
 |                        | X11                          | Wayland                                  |
 |------------------------|------------------------------|------------------------------------------|
 | wire protocol          | hand-written, raw socket     | hand-written, raw socket                 |
+| connection auth       | MIT-MAGIC-COOKIE-1 from Xauthority | none (runtime-dir socket)         |
 | linked libraries       | none                         | none                                     |
 | wallpaper placement    | EWMH `_NET_WM_WINDOW_TYPE_DESKTOP` + `_NET_WM_STATE_BELOW/STICKY` | `zwlr_layer_shell_v1` background layer |
 | presentation (CPU tier)| MIT-SHM double buffer (core PutImage fallback) | wl_shm pools (memfd), 2 buffers, premultiplied ARGB8888 |
@@ -28,6 +29,32 @@ only linked libraries are libc and libm.
 4. else x11
 
 An explicit backend never silently falls back. Auto does.
+
+### X11 connection & authorization
+
+The raw-wire client connects exactly like Xlib would. Local DISPLAY hosts
+("", `unix`, `box/unix`, `localhost`, loopback literals) go to the unix
+socket at `/tmp/.X11-unix/X<n>` — filesystem path first, then the abstract
+namespace socket modern servers also bind — and `localhost` additionally
+falls back to TCP; any other host is a remote display over TCP port
+6000+n (ssh-forwarded displays included).
+
+Real sessions — startx, display managers, Xorg and XLibre alike — enforce
+cookie auth. Reverie speaks MIT-MAGIC-COOKIE-1: `x11_xauth_lookup` parses
+`$XAUTHORITY` (default `~/.Xauthority`) in the real libXau format — records
+of big-endian u16 length + payload pairs (family, address, display number,
+name, data) — and honors FamilyWild, FamilyLocal, FamilyInternet and
+FamilyInternet6 entries with libXau-style matching (the DISPLAY host is the
+lookup key; a local display additionally claims the hostname's addresses,
+mirroring Xorg's own local-host list). A missing cookie means exactly that:
+the daemon connects without credentials and, if the server refuses, dies
+with the server's own reason string, verified against a live enforcing
+Xorg ("Authorization required, but no authorization protocol specified",
+"Invalid MIT-MAGIC-COOKIE-1 key"). Servers demanding other schemes
+(XDM-AUTHORIZATION-1 and friends) are out of scope and fail with that
+reason surfaced. The e2e battery pins both halves against an `-auth` Xvfb
+(the plain CI server never enforces auth — that is precisely how a broken
+parser once shipped).
 
 ### The Wayland big caveat
 

@@ -1,8 +1,9 @@
 /* ============================================================================
  * Reverie Engine — x11.h
- * A raw X11 wire-protocol client speaking directly to the X server over a
- * unix socket. Replaces Xlib/XCB entirely. Implements: connection setup
- * with Xauthority MIT-MAGIC-COOKIE-1 auth, visual selection, window
+ * A raw X11 wire-protocol client speaking directly to the X server. No
+ * Xlib, no XCB. Implements: connection setup with Xauthority
+ * MIT-MAGIC-COOKIE-1 auth (real big-endian interleaved records; unix,
+ * abstract-socket and TCP transports), visual selection, window
  * creation with EWMH desktop hints, MIT-SHM double-buffered presentation
  * (with core PutImage fallback), Xinerama monitor enumeration, pointer
  * polling, and event reading.
@@ -18,9 +19,22 @@
 
 typedef struct X11 X11;
 
-/* Connects to the display in $DISPLAY (unix socket preferred). */
+/* Connects to the display in $DISPLAY. Local DISPLAY hosts ("", "unix",
+ * "box/unix", "localhost", loopback literals) use the unix socket
+ * (localhost also falls back to TCP); remote hosts use TCP 6000+display.
+ * Auth: MIT-MAGIC-COOKIE-1 from $XAUTHORITY (or ~/.Xauthority) when a
+ * matching entry exists — see x11_xauth_lookup. */
 X11 *x11_connect(char *err, size_t errcap);
 void x11_disconnect(X11 *x);
+
+/* Finds the MIT-MAGIC-COOKIE-1 for `display` (reached via DISPLAY-host
+ * `host`, "" = local) in the .Xauthority file `path`. True + the cookie
+ * copied to `out` (capacity 64) and its length to `outlen` on a match.
+ * Pure parser — unit-tested against files generated in the real
+ * big-endian interleaved wire format; the e2e x11(auth) legs prove the
+ * bytes a live enforcing Xorg accepts. */
+bool x11_xauth_lookup(const char *path, const char *host, int display,
+                       u8 *out, u32 *outlen);
 
 /* Monitor list via Xinerama (falls back to the full root window). The list
  * is re-queried on every call — runtime changes (hotplug) surface here.
