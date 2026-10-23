@@ -156,6 +156,24 @@ static void xnode_add(XNode *parent, XNode *kid, RArena *ar)
 static bool xml_skip_misc(Xml *x)
 {
 	for (;;) {
+		/* UTF-8 BOM: meaningful only at the document start, but a BOM
+		 * in misc position is 3 ignorable bytes wherever it appears —
+		 * tools write them, and mid-document ones would otherwise be
+		 * misread as text anyway. */
+		if (x->p + 3 <= x->end && (unsigned char)x->p[0] == 0xEF &&
+		    (unsigned char)x->p[1] == 0xBB &&
+		    (unsigned char)x->p[2] == 0xBF) {
+			x->p += 3;
+			continue;
+		}
+		/* XML's Misc is whitespace-interleaved: prolog = BOM? Misc*,
+		 * Misc ::= Comment | PI | S. Skipping whitespace here is what
+		 * makes the document prolog — the <?xml ...?> declaration
+		 * every real exporter writes, plus the newline after it, plus
+		 * any generator comments — reach the <svg> element instead of
+		 * dying as "not an <svg> document" on the whitespace between
+		 * the declaration and the root. */
+		xml_ws(x);
 		if (x->p + 4 <= x->end && strncmp(x->p, "<!--", 4) == 0) {
 			const char *e = x->p + 4;
 			while (e + 3 <= x->end && strncmp(e, "-->", 3) != 0)

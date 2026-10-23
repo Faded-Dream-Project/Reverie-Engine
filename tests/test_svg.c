@@ -238,6 +238,68 @@ int main(void)
                 }
         }
 
+        /* 11. document prolog: BOM / <?xml?> declaration / comments / PI
+         *     before the root — every real export (Inkscape, Illustrator,
+         *     Figma) carries these, and the whitespace between them and
+         *     <svg> used to kill the parse ("not an <svg> document").
+         *     Every variant must parse AND render byte-identical to the
+         *     bare document. */
+        {
+                const char *core =
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>"
+                        "<rect x='0' y='0' width='64' height='32' fill='#336699'/>"
+                        "</svg>";
+                u32 *ref = render(core);
+                CHECK(ref != NULL, "bare document parses (reference)");
+
+                char v_decl[512], v_bom[512], v_ws[512], v_adjacent[512];
+                char bad_pi[512], bad_cmt[512];
+                snprintf(v_decl, sizeof v_decl,
+                         "<?xml version='1.0' encoding='UTF-8'?>\n%s", core);
+                snprintf(v_bom, sizeof v_bom,
+                         "\xEF\xBB\xBF"
+                         "<?xml version='1.0' encoding='UTF-8' standalone='no'?>\r\n"
+                         "<!-- Generator: Reverie Test 11 -->\n%s", core);
+                snprintf(v_ws, sizeof v_ws, "  \n\t%s   \n", core);
+                snprintf(v_adjacent, sizeof v_adjacent,
+                         "<!--c--><?pi ?><!--x2-->\n%s", core);
+                const char *v_mid =
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>"
+                        "  <!-- mid-document comment -->"
+                        "  <?processing instruction?>"
+                        "  <rect x='0' y='0' width='64' height='32' fill='#336699'/>"
+                        "  </svg>";
+                const char *variants[] = { v_decl, v_bom, v_ws, v_adjacent, v_mid };
+                const char *names[] = {
+                        "xml declaration + newline",
+                        "BOM + declaration + generator comment",
+                        "leading/trailing whitespace",
+                        "adjacent comments/PIs, no whitespace",
+                        "misc between root children",
+                };
+                for (size_t i = 0; i < sizeof variants / sizeof *variants; i++) {
+                        u32 *px = render(variants[i]);
+                        if (px) {
+                                CHECK(memcmp(px, ref, (size_t)W * H * 4) == 0,
+                                      "prolog variant '%s' renders identical",
+                                      names[i]);
+                                free(px);
+                        } else {
+                                CHECK(false, "prolog variant '%s' failed to parse",
+                                      names[i]);
+                        }
+                }
+                free(ref);
+
+                /* unterminated prolog junk is still a clean parse error */
+                snprintf(bad_pi, sizeof bad_pi, "<?xml version='1.0'%s", core);
+                RevSvg *bad = rev_svg_parse(bad_pi, strlen(bad_pi), NULL, 0);
+                CHECK(bad == NULL, "unterminated PI refused");
+                snprintf(bad_cmt, sizeof bad_cmt, "<!-- never closed%s", core);
+                RevSvg *bad2 = rev_svg_parse(bad_cmt, strlen(bad_cmt), NULL, 0);
+                CHECK(bad2 == NULL, "unterminated comment refused");
+        }
+
         if (g_fails == 0)
                 printf("  svg: OK\n");
         return g_fails != 0;

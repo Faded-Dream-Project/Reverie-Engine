@@ -62,7 +62,9 @@ the chosen W3C-style blend function over the accumulated result.
 | `fit`    | ident  | `fill`  | `fill` (cover) `fit` (contain) `stretch` `tile` |
 
 SVGs re-render natively at the target resolution (viewBox-aware); PNGs are
-resampled bilinearly (or nearest with `smooth = false`).
+resampled bilinearly (or nearest with `smooth = false`). SVG files may carry
+the usual XML prolog — declaration, generator comments, BOM — exactly as
+Inkscape/Illustrator/Figma export them.
 
 ## `type = gradient`
 
