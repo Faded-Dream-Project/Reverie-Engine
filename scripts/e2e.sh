@@ -1242,6 +1242,44 @@ else
 fi
 stop_xvfb
 
+# ---- Hot reload: in-place scene edit while the daemon runs ------------------
+# The watcher must notice an edit that never moves the directory's own
+# mtime (snapshot walk over the theme files), reload without a restart,
+# and STATUS must keep naming the theme afterwards. That last clause is
+# the regression pin: the reload used to pass sf.path straight back into
+# scene_load, whose tail snprintf(sf->path, ..., "%s", path) overlapped —
+# glibc destroyed the string, and every STATUS after the first reload
+# printed an empty theme= (fixed with a path snapshot inside scene_load).
+start_xvfb
+HRSOCK="$OUT/hr.sock"
+DISPLAY="$XDISPLAY" REV_IPC_SOCK="$HRSOCK" \
+    timeout 18 ./build/reverie -R cpu themes/snowfall \
+    > "$OUT/hr.log" 2>&1 &
+HRPID=$!
+sleep 2
+./build/revtool ipc -s "$HRSOCK" STATUS > "$OUT/hr1.out" 2>&1
+touch themes/snowfall/scene.rev          # in-place edit: content intact, mtime moves
+sleep 2
+./build/revtool ipc -s "$HRSOCK" STATUS > "$OUT/hr2.out" 2>&1
+./build/revtool ipc -s "$HRSOCK" QUIT > "$OUT/hr3.out" 2>&1
+sleep 1
+HR_OK=1
+grep -q "theme=themes/snowfall" "$OUT/hr1.out" 2>/dev/null || HR_OK=0
+grep -q "reload ok" "$OUT/hr.log" 2>/dev/null || HR_OK=0
+grep -q "reload failed" "$OUT/hr.log" 2>/dev/null && HR_OK=0
+grep -q "theme=themes/snowfall" "$OUT/hr2.out" 2>/dev/null || HR_OK=0
+kill -0 $HRPID 2>/dev/null && HR_OK=0
+if [ "$HR_OK" = 1 ]; then
+    echo "    hotreload:    PASS (in-place edit reloads; STATUS theme= survives)"
+    PASS=$((PASS+1))
+else
+    echo "    hotreload:    FAIL (reload missed or STATUS theme= empty after reload)"
+    cat "$OUT/hr.log" "$OUT/hr1.out" "$OUT/hr2.out" 2>/dev/null
+    kill $HRPID 2>/dev/null; wait $HRPID 2>/dev/null
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
 # ---- Autostart: entry lifecycle + duplicate-instance guard -----------------
 # revtool autostart runs against a private XDG_CONFIG_HOME/XDG_STATE_HOME:
 # enable (NO arguments — the --restore contract) writes the single .desktop

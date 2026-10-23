@@ -191,6 +191,22 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
         RSceneIR *ir = NULL;
         RevPack pk;
 
+        /* path may alias sf->path — hot-reload passes sf.path straight
+         * back in — and this function overwrites sf->path at the end with
+         * snprintf(sf->path, ..., "%s", path). Overlapping snprintf is
+         * undefined behavior and glibc demonstrably destroys the string
+         * (field-observed: STATUS reported an empty theme= after the
+         * first disk reload). Snapshot the path into a stable local up
+         * front; everything below reads the copy, so any caller may
+         * pass sf->path itself. */
+        char pathbuf[sizeof sf->path];
+        if (snprintf(pathbuf, sizeof pathbuf, "%s", path) >= (int)sizeof pathbuf) {
+                snprintf(err && errcap ? err : NULL, err && errcap ? errcap : 0,
+                         "scene path too long");
+                return false;
+        }
+        path = pathbuf;
+
         /* theme? (folder with theme.json, or a packed theme .revpack) —
          * one resource interface serves both; the scene loader never
          * learns which it is reading from */
@@ -271,7 +287,7 @@ static bool scene_load(SceneFile *sf, const char *path, const char *base_dir,
         } else {
                 text = rev_read_file(path, &len);
                 if (!text) {
-                        snprintf(err, errcap, "cannot read '%s'", path);
+                        snprintf(err, errcap, "cannot read '%.200s'", path);
                         return false;
                 }
         }
