@@ -114,6 +114,38 @@ static bool read_all(int fd, void *buf, size_t n)
         return true;
 }
 
+/* Read up to n bytes and report how many actually arrived: partial
+ * delivery is kept, hard errors and EOF stop the drain (EINTR retries).
+ * For setup-failure detail, where whatever bytes made it through are
+ * still worth showing. Deliberately in read_all's cursor shape (pointer
+ * advances, count shrinks): the inline fixed-array-plus-running-offset
+ * accumulator this replaces — provably in-bounds, addl is clamped to the
+ * buffer and got only grows inside the loop — is mis-modelled by GCC
+ * 13's object-size pass at -O2 as a stringop-overflow (read can return
+ * up to SSIZE_MAX, so the accumulated offset looks unbounded to its
+ * range analysis; GCC 14 sees the loop invariant). The cursor idiom
+ * keeps pointer and count tied to the same k, which every GCC parses
+ * correctly — read_all is inlined into a dozen known-size stack buffers
+ * in this very file and has never tripped it. */
+static size_t read_partial(int fd, void *buf, size_t n)
+{
+        u8 *p = (u8 *)buf;
+        size_t total = n;
+        while (n > 0) {
+                ssize_t k = read(fd, p, n);
+                if (k < 0) {
+                        if (errno == EINTR)
+                                continue;
+                        break;
+                }
+                if (k == 0)
+                        break;
+                p += k;
+                n -= (size_t)k;
+        }
+        return total - n;
+}
+
 /* --------------------------------------------------------------------------
  * request/reply plumbing (strict lockstep)
  * ------------------------------------------------------------------------ */
@@ -605,18 +637,7 @@ X11 *x11_connect(char *err, size_t errcap)
                 if (addl > 1024)
                         addl = 1024;
                 u8 addbuf[1024];
-                size_t got = 0;
-                while (got < addl) {
-                        ssize_t k = read(fd, addbuf + got, addl - got);
-                        if (k < 0) {
-                                if (errno == EINTR)
-                                        continue;
-                                break;
-                        }
-                        if (k == 0)
-                                break;
-                        got += (size_t)k;
-                }
+                size_t got = read_partial(fd, addbuf, addl);
                 close(fd);
                 size_t rlen = hdr[0] == 0 ? hdr[1] : got;
                 if (rlen > got)
