@@ -18,6 +18,10 @@ bool  rev_write_file(const char *path, const void *data, size_t len);
 bool  rev_file_exists(const char *path);
 /* File modification time in seconds since epoch; 0 on failure. */
 f64   rev_file_mtime(const char *path);
+/* mkdir -p (single path, no parents beyond '/'). Refuses paths longer
+ * than REV_MKDIR_P_MAX bytes. EEXIST counts as success. */
+#define REV_MKDIR_P_MAX 384
+bool  rev_mkdir_p(const char *path);
 
 /* ---- strings ---------------------------------------------------------------*/
 /* Bounded, always-NUL-terminated copy. Returns dst. */
@@ -41,16 +45,16 @@ bool  rev_parse_u8(const char *s, size_t len, u32 *out);
 
 /* ---- easing ----------------------------------------------------------------*/
 enum {
-	REV_EASE_LINEAR = 0,
-	REV_EASE_SINE,
-	REV_EASE_QUAD,
-	REV_EASE_CUBIC,
-	REV_EASE_QUART,
-	REV_EASE_EXPO,
-	REV_EASE_BACK,
-	REV_EASE_ELASTIC,
-	REV_EASE_BOUNCE,
-	REV_EASE_COUNT
+        REV_EASE_LINEAR = 0,
+        REV_EASE_SINE,
+        REV_EASE_QUAD,
+        REV_EASE_CUBIC,
+        REV_EASE_QUART,
+        REV_EASE_EXPO,
+        REV_EASE_BACK,
+        REV_EASE_ELASTIC,
+        REV_EASE_BOUNCE,
+        REV_EASE_COUNT
 };
 /* Maps t in [0,1] through an in-out variant of the curve. */
 f64   rev_ease(int kind, f64 t);

@@ -25,6 +25,7 @@
 #include "render.h"
 #include "rev.h"
 #include "scene.h"
+#include "session.h"
 #include "theme.h"
 #include "util.h"
 #include "video.h"
@@ -93,6 +94,12 @@ static void usage(void)
 "                       control socket — the duplicate-instance guard\n"
 "                       (autostart entries carry it; needs the IPC\n"
 "                       socket, see docs/AUTOSTART.md)\n"
+"      --restore       launch whatever was launched last (theme, video,\n"
+"                       or pack) instead of a path on the command line —\n"
+"                       the remembered session in\n"
+"                       ~/.local/state/reverie/last-session.json, updated\n"
+"                       by every launch and runtime theme switch. Explicit\n"
+"                       flags given now win over the remembered ones\n"
 "  -f, --fps N         override the scene's target fps\n"
 "  -m, --monitor N     render only on monitor N\n"
 "  -o, --once          render one frame to PNG and exit (no display needed)\n"
@@ -106,7 +113,8 @@ static void usage(void)
 "  -v, --verbose       debug logging\n"
 "  -q, --quiet         errors only\n"
 "  -h, --help          this help\n"
-"\n"
+"\n");
+        printf(
 "environment:\n"
 "  REV_RENDERER    same as --renderer\n"
 "  REV_BACKEND     same as --backend\n"
@@ -371,6 +379,18 @@ static f64 fade_black_now(const IpcState *st, f64 now)
         return st->phase == 1 ? k : 1.0 - k;
 }
 
+/* A runtime theme switch (IPC THEME / playlist NEXT/PREV) is also "what
+ * was last launched": the session record's content follows it, so
+ * --restore replays what the user actually ended up on, not what they
+ * booted with. Best-effort — a failed update warns, the daemon keeps
+ * rendering. */
+static void session_note_switch(const char *path)
+{
+        char serr[256];
+        if (!rev_session_record_content(path, serr, sizeof serr))
+                LOGW("cannot update the session record (%s)", serr);
+}
+
 /* Loads `path` into `st->next` and starts (or redirects) the fade. Returns
  * false with a message when the theme cannot load — the active scene is
  * untouched in that case. */
@@ -399,6 +419,7 @@ static bool daemon_switch_theme(IpcState *st, const char *path, f64 fade_ms,
                 st->phase = 0;
                 LOGI("ipc: theme '%s' active (%d layers, instant)",
                      st->sf->path, rtscene_layer_count(st->sf->sc));
+                session_note_switch(st->sf->path);
                 return true;
         }
 
@@ -441,6 +462,7 @@ static void fade_advance(IpcState *st, f64 now)
                         st->have_next = false;
                         LOGI("ipc: theme '%s' active (%d layers)",
                              st->sf->path, rtscene_layer_count(st->sf->sc));
+                        session_note_switch(st->sf->path);
                         if (st->pl_n > 0) {
                                 /* keep the playlist index honest when the
                                  * switch came from THEME, not NEXT/PREV */
@@ -1015,6 +1037,20 @@ int main(int argc, char **argv)
         else if (a.verbosity < 0)
                 rev_log_set_level(REV_LOG_ERROR);
 
+        /* ---- --restore: the content slot arrives from the session record */
+        RevSession sess;   /* owns the restored tokens: a.scene_path /
+                              a.video_path point into sess.line — keep it
+                              alive for the whole of main() */
+        memset(&sess, 0, sizeof sess);
+        if (a.restore) {
+                if (!rev_session_apply(&a, &sess, err, sizeof err)) {
+                        fprintf(stderr, "reverie: %s\n", err);
+                        return 1;
+                }
+                LOGI("restore: replaying the last session (%s)",
+                     a.video_path ? a.video_path : a.scene_path);
+        }
+
         /* locals carried from the historical parser so the rest of main()
          * stays untouched; cli.c now owns parsing + validation */
         const char *scene_path = a.scene_path;
@@ -1112,6 +1148,18 @@ int main(int argc, char **argv)
                      scene_path, rtscene_layer_count(sf.sc), rtscene_fps(sf.sc),
                      rtscene_is_animated(sf.sc) ? "animated" : "static",
                      sf.pack_used ? " [packed]" : "");
+        }
+        /* ---- remember what was launched (--restore's memory) -------------
+         * Content just loaded successfully: this is "what was last
+         * launched". --once runs are screenshots, not wallpaper launches —
+         * they never touch the memory. Best-effort: a state-dir failure
+         * warns and keeps going (the wallpaper matters more than the
+         * note-taking). */
+        if (!once) {
+                char serr[256];
+                if (!rev_session_record(&a, serr, sizeof serr))
+                        LOGW("cannot record the session (%s) — --restore "
+                             "will replay the previous one", serr);
         }
         if (fps_override > 0)
                 LOGI("fps override: %d", fps_override);

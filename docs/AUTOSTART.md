@@ -1,4 +1,4 @@
-# Reverie — Autostart (XDG)
+# Reverie — Autostart (XDG) and `--restore`
 
 Reverie starts on login through the **XDG Autostart** convention: a
 `.desktop` entry in `$XDG_CONFIG_HOME/autostart` (default
@@ -10,43 +10,86 @@ launch coexist safely (see the duplicate guard below), and the daemon
 itself never writes any of these files: **consent means running
 `revtool autostart enable`.**
 
+## The model: autostart = restore
+
+Autostart does not remember anything of its own. The entry it writes is
+exactly:
+
+```
+Exec=<reverie binary> --restore --exit-if-running
+```
+
+`reverie --restore` launches **whatever was launched last** — theme
+folder, `.rev` scene, `.revpack`, or `--video` file. The daemon keeps
+that memory itself: every successful content launch records the
+wallpaper-defining subset of its command line (content path made
+**absolute**, plus `--scale`/`--no-loop`/`--fps`/`--monitor`/
+`--renderer`/`--backend` when they were given) into
+
+```
+$XDG_STATE_HOME/reverie/last-session.json     (default
+~/.local/state/reverie/last-session.json)
+```
+
+Runtime theme switches update the same record — switch fifty times over
+a session via `revtool ipc THEME`, and the next login restores the one
+you actually ended up on. Because the daemon owns the memory and
+autostart only replays it, "start on login" and "what was last
+launched" can never drift apart — there is no second list of arguments
+to go stale.
+
+Deliberate semantics, stated plainly:
+
+* The record replays the **command line**, not the environment:
+  `REV_RENDERER=cpu reverie themes/x` does not freeze `--renderer cpu`
+  into the record — the env var applies again at restore time if it is
+  still set.
+* `--once` screenshot runs are tool invocations, not wallpaper
+  launches: they never touch the memory.
+* A restoring invocation may still spell out flags — explicit wins:
+  `reverie --restore --renderer cpu` restores the content but forces
+  the CPU renderer. Only the content slot is exclusively the record's;
+  combining `--restore` with `--scene`/`--video`/a positional is a hard
+  error (ambiguous, therefore refused).
+* The record is re-parsed through the real argument parser at every
+  restore: a corrupt or hand-edited file can only fail with a named
+  error, never inject behavior a typed command line could not produce.
+  A record containing `--restore` itself is rejected (no replay loops).
+* Nothing recorded is ever executed by a shell — the `.desktop` Exec
+  line is the fixed pair of flags above.
+
 ## Commands
 
 ```
-revtool autostart enable [--scene PATH | --video PATH | any daemon flags...]
-revtool autostart disable
-revtool autostart status
+revtool autostart enable      # write the entry (no arguments — ever)
+revtool autostart disable     # remove the entry
+revtool autostart status      # entry state + what --restore would replay
 ```
 
-* `enable` writes two files:
-  * `$XDG_CONFIG_HOME/autostart/reverie.desktop` — the entry the session
-    manager launches. The `Exec` line is the reverie binary (the revtool
-    sibling, found via `/proc/self/exe`; falls back to the plain `reverie`
-    name resolved by the session `PATH`), the arguments you gave, and
-    `--exit-if-running` appended automatically.
-  * `$XDG_CONFIG_HOME/reverie/autostart.json` — the remembered argument
-    list. This is the memory of "which wallpaper mode and settings the
-    user chose": a later bare `revtool autostart enable` (no arguments)
-    re-enables exactly those.
-* `disable` removes the `.desktop` entry only; the remembered arguments
-  stay so the next enable restores them.
-* `status` reports enabled/disabled, both paths, the Exec line, and the
-  stored arguments — it never guesses: what it prints is what it read.
+* `enable` writes the single `.desktop` entry. The `Exec` line is the
+  reverie binary (the revtool sibling, found via `/proc/self/exe`;
+  falls back to the plain `reverie` name resolved by the session
+  `PATH`), `--restore`, and `--exit-if-running`. It takes NO arguments:
+  autostart restores the last session instead of pinning one. If you
+  want autostart to start a specific wallpaper, run reverie with it
+  once, then `revtool autostart enable`.
+* `disable` removes the `.desktop` entry and also deletes the legacy
+  `~/.config/reverie/autostart.json` (the argument memory of the older
+  mechanism, kept only to be cleaned up).
+* `status` reports enabled/disabled, the entry path, the Exec line, and
+  what `--restore` would replay right now (the session record — or an
+  honest "nothing recorded yet").
 
 Examples:
 
 ```
-revtool autostart enable --scene ~/.config/reverie/scenes/dawn.rev
-revtool autostart enable --video ~/Videos/waves.mp4 --scale fit
-revtool autostart enable            # re-enable what was last remembered
-revtool autostart status
-revtool autostart disable
+./build/reverie themes/moonlit-reverie    # launch what you like
+revtool autostart enable                  # start THAT on every login
+./build/reverie --video ~/vids/waves.mp4 --scale fit
+revtool autostart status                  # restores: --video ... --scale fit
+revtool autostart disable                 # off
+reverie --restore                         # manual: same replay, right now
 ```
-
-Arguments containing spaces are quoted per the Desktop Entry spec;
-`%` and `$` are refused outright (field-code specifiers a session
-manager would expand — a wallpaper argument is a path or a flag, never
-a specifier).
 
 ## The duplicate-instance guard
 
@@ -81,6 +124,14 @@ is the spec's, not Reverie's. Two failure modes are handled explicitly:
   ...). There is no retry loop — a compositor that appears later will
   find no wallpaper; re-run the entry or log in again. (A systemd user
   service with `Restart=on-failure` would add retries; see below.)
+* **Nothing ever launched** (`--restore` with no session record): the
+  daemon exits with `reverie: nothing to restore — no previous session
+  recorded (<path>)`. Run reverie once with any theme or video, and the
+  record exists from then on.
+* **The recorded file was deleted or moved**: the normal content-load
+  error names the path (recorded absolute, so the message says exactly
+  which file is gone). The record is NOT cleared by the failure — fix
+  the file or launch something else to overwrite it.
 * **Compositor without the wallpaper protocols**: Reverie's Wayland
   backend needs `zwlr_layer_shell_v1` (the wlroots-family layer shell)
   — compositors that do not implement it (some GNOME setups) fail at
@@ -103,7 +154,7 @@ is the spec's, not Reverie's. Two failure modes are handled explicitly:
   After=graphical-session.target
 
   [Service]
-  ExecStart=%h/.local/bin/reverie --scene %h/.config/reverie/scenes/dawn.rev --exit-if-running
+  ExecStart=%h/.local/bin/reverie --restore --exit-if-running
   Restart=on-failure
   RestartSec=2
 
@@ -111,20 +162,40 @@ is the spec's, not Reverie's. Two failure modes are handled explicitly:
   WantedBy=graphical-session.target
   ```
 
-  (Adjust the paths; the same `--exit-if-running` guard applies.)
-* No files are written outside `$XDG_CONFIG_HOME`. Nothing phones home.
+  (Adjust the path; the same `--exit-if-running` guard and the same
+  session memory apply — the unit and the .desktop entry are
+  interchangeable launchers.)
+* No files are written outside `$XDG_CONFIG_HOME` by revtool, or
+  outside `$XDG_STATE_HOME` by the daemon. Nothing phones home.
 * The `.desktop` entry uses only spec keys (`Type`, `Name`, `Comment`,
   `Exec`, `Terminal`) plus the optional `X-GNOME-Autostart-Phase` hint;
   environments that ignore the hint simply start it in the default
   phase.
 
+## Migration from the old mechanism
+
+Releases before `--restore` stored an argument list in
+`$XDG_CONFIG_HOME/reverie/autostart.json` and pinned it in the Exec
+line. Such an entry keeps working as-is (it is still a valid command
+line) until you re-run `revtool autostart enable`, which replaces it
+with the `--restore` entry; `revtool autostart disable` deletes the
+leftover JSON. There is no automatic migration: the old pin and the
+new memory are different behaviors, and the switch is one explicit
+command.
+
 ## Tested vs. manual
 
-Automated (unit, `tests/test_autostart.c`; e2e, `scripts/e2e.sh`):
-path resolution, enable writing both files with the quoted Exec line
-and the JSON roundtrip, status, disable-keeps-memory, argument restore,
-field-code rejection, media-mode arguments, the no-HOME refusal, and —
-live under Xvfb — the `--exit-if-running` yield to a running daemon.
+Automated (unit: tests/test_session.c, tests/test_autostart.c,
+tests/test_json.c, tests/test_cli.c; e2e: scripts/e2e.sh): the record's
+location and format, absolute-path recording, tool-flag exclusion, the
+restore merge (record fills, explicit current flags win), hostile and
+corrupt records rejected through the real parser (including a record
+containing `--restore`), runtime-switch content updates, the
+enable/disable/status lifecycle, the `--restore` Exec contract, legacy
+cleanup, and — live under Xvfb — a full record/replay roundtrip and the
+IPC-switch memory update. The JSON parser growth bug this work
+exposed (>8-element containers lost their first entries) is pinned by
+tests/test_json.c.
 
 Not automatable here (needs a real login session, which CI sandboxes
 cannot provide): a session manager actually launching the entry at

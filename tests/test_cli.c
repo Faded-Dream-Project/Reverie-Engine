@@ -3,8 +3,10 @@
  * Unit tests for the extracted argument parser (src/cli.c): the historical
  * contract must hold byte-for-byte (positional scenes, --shot legacy form,
  * the NAME=VALUE env-var guard, every error message), plus the new
- * --scene, --exit-if-running, and the media-mode family (--video,
- * --scale, --no-loop) with all its conflict rules.
+ * --scene, --exit-if-running, the media-mode family (--video,
+ * --scale, --no-loop) with all its conflict rules, and --restore
+ * (the session-record content slot: deferred media checks, conflict
+ * with any explicit content).
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -243,6 +245,49 @@ int main(void)
               !rev_cli_canon_renderer("Vk") && !rev_cli_canon_renderer(NULL) &&
               rev_cli_canon_backend("wayland") && !rev_cli_canon_backend("waylands"),
               "canon validators: exact vocabulary, case-sensitive");
+
+        /* ---- --restore (the session-record content slot) ------------------ */
+
+        CHECK(parse("--restore", &a, err, sizeof err, &usage_hint) &&
+              a.restore && !a.scene_path && !a.video_path,
+              "--restore parses and claims the content slot");
+        CHECK(parse("--restore --exit-if-running", &a, err, sizeof err, &usage_hint) &&
+              a.restore && a.exit_if_running,
+              "--restore composes with the daemon flags");
+        CHECK(parse("--restore --once", &a, err, sizeof err, &usage_hint) &&
+              a.restore && a.once,
+              "--restore composes with --once (screenshot the last wallpaper)");
+        CHECK(parse("--restore --scale fit", &a, err, sizeof err, &usage_hint) &&
+              a.restore && a.scale == REV_SCALE_FIT && a.scale_seen,
+              "--restore defers the --scale media check (content not known yet)");
+        CHECK(parse("--restore --no-loop", &a, err, sizeof err, &usage_hint) &&
+              a.restore && a.no_loop_seen,
+              "--restore defers the --no-loop media check");
+        CHECK(!parse("--restore --scene a.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--restore replays the last launched content") &&
+              strstr(err, "cannot be combined with"),
+              "--restore + --scene rejected");
+        CHECK(!parse("--restore --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "cannot be combined with --video"),
+              "--restore + --video rejected (message names --video)");
+        CHECK(!parse("--restore a.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "cannot be combined with"),
+              "--restore + positional rejected");
+        CHECK(!parse("a.rev --restore", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "cannot be combined with"),
+              "positional + --restore rejected (order independent)");
+        CHECK(parse("--restore --restore", &a, err, sizeof err, &usage_hint) &&
+              a.restore,
+              "a repeated --restore is idempotent, not an error");
+        CHECK(parse("--video a.mp4 --scale fit", &a, err, sizeof err, &usage_hint) &&
+              a.scale_seen && a.scale == REV_SCALE_FIT,
+              "scale_seen output marks an explicit --scale");
+        CHECK(parse("--video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              !a.scale_seen && !a.no_loop_seen,
+              "scale_seen/no_loop_seen stay false when unset (record merge key)");
+        CHECK(parse("--video a.mp4 --scale fill", &a, err, sizeof err, &usage_hint) &&
+              a.scale_seen && a.scale == REV_SCALE_FILL,
+              "an explicit --scale fill is seen even though it equals the default");
 
         printf(failures ? "cli: %d FAILURE(S)\n" : "cli: OK\n", failures);
         return failures ? 1 : 0;

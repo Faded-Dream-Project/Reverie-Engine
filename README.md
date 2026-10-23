@@ -185,6 +185,8 @@ reverie [options] <scene.rev | theme dir | theme.revpack>
   -R, --renderer R    force renderer: auto | vulkan | opengl | cpu
   -B, --backend B     force backend: auto | x11 | wayland
       --scene PATH    explicit scene/theme path (same slot as the positional)
+      --restore       launch whatever was launched LAST (theme, video, or
+                      pack) — the remembered session, no path needed
       --exit-if-running
                       exit 0 when another daemon owns the control socket
                       (duplicate-instance guard; autostart uses it)
@@ -199,6 +201,10 @@ reverie --scene themes/ripple-lake    # the same, spelled out
 reverie --video loops/waves.mp4       # media mode: video/GIF wallpaper
 reverie --video loop.gif --scale fit  # letterbox instead of cover-crop
 reverie --video demo.mp4 --no-loop    # hold the last frame at EOF
+reverie --restore                     # whatever was launched last — the
+                                      #   daemon remembers (absolute path,
+                                      #   runtime THEME switches included)
+reverie --restore --renderer cpu      # restore the content, override a flag
 
 Scene layers: image, gradient, solid, fluid, ripple, particles, video —
 with blend modes, blur, opacity, parallax, monitor selection, and
@@ -223,9 +229,10 @@ revtool theme   list|info|validate|pack|inspect  # theme toolkit
 revtool ipc     "NEXT 800"           # talk to the RUNNING daemon: switch
                                       #   themes, playlists, rotation, QUIT
                                       #   (docs/IPC.md — per-user socket)
-revtool autostart enable --scene ... # XDG Autostart at login, opt-in and
-                                      #   user-controlled; remembers the mode
-                                      #   (docs/AUTOSTART.md)
+revtool autostart enable             # XDG Autostart at login — restores the
+                                      #   last launched wallpaper via
+                                      #   `reverie --restore`; opt-in and
+                                      #   user-controlled (docs/AUTOSTART.md)
 
 While the daemon runs it accepts commands on a per-user control socket:
 `revtool ipc "PLAYLIST themes/ripple-lake themes/snowfall"`,

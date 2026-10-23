@@ -69,6 +69,27 @@ f64 rev_file_mtime(const char *path)
         return (f64)st.st_mtime;
 }
 
+bool rev_mkdir_p(const char *path)
+{
+        char tmp[REV_MKDIR_P_MAX];
+        if (snprintf(tmp, sizeof tmp, "%s", path) >= (int)sizeof tmp)
+                return false;
+        size_t len = strlen(tmp);
+        if (len == 0)
+                return false;
+        if (tmp[len - 1] == '/')
+                tmp[len - 1] = 0;
+        for (char *p = tmp + 1; *p; p++) {
+                if (*p == '/') {
+                        *p = 0;
+                        if (mkdir(tmp, 0755) != 0 && errno != EEXIST)
+                                return false;
+                        *p = '/';
+                }
+        }
+        return mkdir(tmp, 0755) == 0 || errno == EEXIST;
+}
+
 /* ---- strings ---------------------------------------------------------------*/
 
 char *rev_strncpy(char *dst, size_t cap, const char *src, size_t n)

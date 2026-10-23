@@ -1,13 +1,15 @@
 /* ============================================================================
  * Reverie Engine — cli.h
  * Command-line parsing, extracted from main() so the argument contract is
- * unit-testable (tests/test_cli.c). The parser is PURE: it fills a RevArgs
- * and returns; main() owns usage(), exit codes, and env-var fallbacks.
+ * unit-testable (tests/test_cli.c).
  *
- * Content modes (mutually exclusive):
+ * Content modes, mutually exclusive:
  *   - a positional path (compat: themes/<id>, any .rev scene, packs)
  *   - --scene PATH (the same slot, explicit)
  *   - --video PATH (media mode; wired in the media-mode commit)
+ *   - --restore (fills the content slot from the session record at
+ *     startup — not a fourth mode, but it cannot be combined with any
+ *     of the three above)
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -41,6 +43,10 @@ typedef struct {
         bool exit_if_running;     /* --exit-if-running: yield to a live
                                      daemon (IPC probe) instead of stacking
                                      a second wallpaper instance           */
+        bool restore;             /* --restore: content comes from the last
+                                     session record (see session.h) — an
+                                     error in combination with any explicit
+                                     content on the same line              */
 
         /* ---- test hook ---- */
         f64  shot_after;          /* --shot-after (or legacy --shot N F);
@@ -51,6 +57,10 @@ typedef struct {
         bool want_help;           /* -h/--help seen                        */
         bool show_usage;          /* accompany the parse error with usage() */
         int  verbosity;           /* -1 quiet, 0 default, +1 verbose       */
+        bool scale_seen;          /* --scale was explicit (the record merge
+                                     and the deferred media checks need to
+                                     tell an explicit FILL from the default)*/
+        bool no_loop_seen;        /* --no-loop was explicit                */
 } RevArgs;
 
 /* Scaling modes for media mode (--scale). Scenes keep their own layer

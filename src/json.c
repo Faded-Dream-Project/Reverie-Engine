@@ -168,11 +168,22 @@ static RJVal *jvalue(JP *p, RArena *ar)
                         if (!val)
                                 return NULL;
                         if (n == cap) {
-                                cap = cap ? cap * 2 : 8;
-                                v->keys = (char **)arena_alloc(ar, (size_t)cap * sizeof(char *));
-                                v->items = (RJVal **)arena_alloc(ar, (size_t)cap * sizeof(RJVal *));
-                                if (!v->keys || !v->items)
+                                int ncap = cap ? cap * 2 : 8;
+                                char **nk = (char **)arena_alloc(ar,
+                                                (size_t)ncap * sizeof(char *));
+                                RJVal **ni = (RJVal **)arena_alloc(ar,
+                                                (size_t)ncap * sizeof(RJVal *));
+                                if (!nk || !ni)
                                         return NULL;
+                                if (cap) {
+                                        memcpy(nk, v->keys,
+                                               (size_t)cap * sizeof(char *));
+                                        memcpy(ni, v->items,
+                                               (size_t)cap * sizeof(RJVal *));
+                                }
+                                v->keys = nk;
+                                v->items = ni;
+                                cap = ncap;
                         }
                         v->keys[n] = key;
                         v->items[n] = val;
@@ -206,10 +217,16 @@ static RJVal *jvalue(JP *p, RArena *ar)
                         if (!val)
                                 return NULL;
                         if (n == cap) {
-                                cap = cap ? cap * 2 : 8;
-                                v->items = (RJVal **)arena_alloc(ar, (size_t)cap * sizeof(RJVal *));
-                                if (!v->items)
+                                int ncap = cap ? cap * 2 : 8;
+                                RJVal **ni = (RJVal **)arena_alloc(ar,
+                                                (size_t)ncap * sizeof(RJVal *));
+                                if (!ni)
                                         return NULL;
+                                if (cap)
+                                        memcpy(ni, v->items,
+                                               (size_t)cap * sizeof(RJVal *));
+                                v->items = ni;
+                                cap = ncap;
                         }
                         v->items[n++] = val;
                         v->n = n;

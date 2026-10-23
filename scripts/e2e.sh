@@ -28,6 +28,13 @@ XDISPLAY=":97"
 XVFB_PID=""
 PASS=0; SKIP=0; FAIL=0
 
+# Isolate the daemon's session memory for the whole run: every daemon
+# launch below updates the last-launched record, and without this the
+# test run would rewrite the developer's real
+# ~/.local/state/reverie/last-session.json (their autostart --restore
+# would then replay a TEST scene instead of their wallpaper).
+export XDG_STATE_HOME="$OUT/xdg-state"
+
 # ---- optional local GPU stack (llvmpipe EGL + lavapipe Vulkan) --------------
 GPU_ROOT="${REV_GPU_ROOT:-$(cd .. && pwd)/gpulibs/root}"
 GPU_ENV=""
@@ -1096,6 +1103,12 @@ kill -0 $DPID 2>/dev/null && IPC_OK=0
 [ -S "$IPCSOCK" ] && IPC_OK=0
 # per-user permission bits on the live socket were checked at start; re-verify
 # via the log line only (the file is already unlinked after QUIT)
+# session memory follows the RUNTIME switches: the record must hold the last
+# switched-to theme (snowfall, absolute), not the boot scene (mountain-dusk)
+grep -q "themes/snowfall" "$XDG_STATE_HOME/reverie/last-session.json" \
+    2>/dev/null || IPC_OK=0
+grep -q "mountain-dusk" "$XDG_STATE_HOME/reverie/last-session.json" \
+    2>/dev/null && IPC_OK=0
 if [ "$IPC_OK" = 1 ]; then
     echo "    ipc:          PASS (ping/status/faded switch/playlist/next/bad-theme/QUIT)"
     PASS=$((PASS+1))
@@ -1109,29 +1122,54 @@ fi
 stop_xvfb
 
 # ---- Autostart: entry lifecycle + duplicate-instance guard -----------------
-# revtool autostart runs against a private XDG_CONFIG_HOME: enable writes
-# the .desktop entry (Exec carries the arguments and --exit-if-running) and
-# the remembered-arguments config; disable removes the entry and keeps the
-# config. The guard itself runs LIVE: a daemon owns the socket, a second
-# launch with --exit-if-running must yield cleanly.
+# revtool autostart runs against a private XDG_CONFIG_HOME/XDG_STATE_HOME:
+# enable (NO arguments — the --restore contract) writes the single .desktop
+# entry whose Exec line is "<bin> --restore --exit-if-running"; the argument
+# memory of the old mechanism is gone (enable with arguments is refused with
+# the redirect, disable cleans a leftover autostart.json). status reports
+# what --restore would replay. The guard itself runs LIVE below: a daemon
+# owns the socket, a second launch with --exit-if-running must yield cleanly.
 {
     AROOT="$OUT/xdg-home"
-    mkdir -p "$AROOT"
+    ASTATE="$OUT/as-state"
+    mkdir -p "$AROOT" "$ASTATE"
     AOK=1
-    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart enable \
-        --scene "$SCENE" >/dev/null 2>&1 || AOK=0
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart enable >/dev/null 2>&1 || AOK=0
     [ -f "$AROOT/autostart/reverie.desktop" ] || AOK=0
-    grep -q "Exec=.*reverie.*--exit-if-running" \
+    grep -q "Exec=.*reverie.*--restore --exit-if-running" \
         "$AROOT/autostart/reverie.desktop" 2>/dev/null || AOK=0
+    grep -q -- "--scene\|--video" \
+        "$AROOT/autostart/reverie.desktop" 2>/dev/null && AOK=0
+    [ -f "$AROOT/reverie/autostart.json" ] && AOK=0
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart enable --scene "$SCENE" \
+        >/dev/null 2>&1 && AOK=0
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart status 2>/dev/null \
+        | grep -q "enabled: yes" || AOK=0
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart status 2>/dev/null \
+        | grep -q "nothing recorded yet" || AOK=0
+    # a planted record shows up as what --restore would replay
+    mkdir -p "$ASTATE/reverie"
+    printf '{"version":1,"argv":["--scene","/tmp/planted-theme"]}' \
+        > "$ASTATE/reverie/last-session.json"
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart status 2>/dev/null \
+        | grep -q -- "restores: --scene /tmp/planted-theme" || AOK=0
+    # a leftover from the OLD mechanism (argument memory) must be cleaned
+    # (mkdir: enable no longer creates $XDG_CONFIG_HOME/reverie — only the
+    # old mechanism did, so the legacy file has to be planted by hand)
+    mkdir -p "$AROOT/reverie"
+    printf '{"args":["--scene","old.rev"]}' > "$AROOT/reverie/autostart.json"
     [ -f "$AROOT/reverie/autostart.json" ] || AOK=0
-    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart status \
-        2>/dev/null | grep -q "enabled: yes" || AOK=0
-    XDG_CONFIG_HOME="$AROOT" ./build/revtool autostart disable \
-        >/dev/null 2>&1 || AOK=0
+    XDG_CONFIG_HOME="$AROOT" XDG_STATE_HOME="$ASTATE" \
+        ./build/revtool autostart disable >/dev/null 2>&1 || AOK=0
     [ -f "$AROOT/autostart/reverie.desktop" ] && AOK=0
-    [ -f "$AROOT/reverie/autostart.json" ] || AOK=0
+    [ -f "$AROOT/reverie/autostart.json" ] && AOK=0
     if [ "$AOK" = 1 ]; then
-        echo "    autostart(cfg):PASS (enable/status/disable + memory kept)"
+        echo "    autostart(cfg):PASS (enable/status/disable, --restore exec, legacy memory cleaned)"
         PASS=$((PASS+1))
     else
         echo "    autostart(cfg):FAIL (entry lifecycle broken)"
@@ -1157,6 +1195,50 @@ if [ "$DRC" -eq 0 ] && grep -q "another reverie daemon owns the control socket" 
 else
     echo "    autostart(dup):FAIL (--exit-if-running guard, exit=$DRC)"
     cat "$OUT/dup2.log"
+    FAIL=$((FAIL+1))
+fi
+
+# ---- --restore: the last-launched memory, live -------------------------------
+# 1. restore(record): a daemon launch writes the record with the ABSOLUTE
+#    content path (the relative CLI path must not leak in — a login session
+#    has a different cwd)
+# 2. restore(replay): `reverie --restore` with no path loads that exact
+#    scene and reaches the running state
+# 3. restore(empty): a clean, named failure when nothing was ever launched
+# 4. restore(conflict): --restore refuses an explicit path on the same line
+start_xvfb
+RSOK=1
+RST="$OUT/restore-state"
+mkdir -p "$RST"
+DISPLAY="$XDISPLAY" XDG_STATE_HOME="$RST" timeout 6 ./build/reverie -R cpu \
+    "$SCENE" > "$OUT/res1.log" 2>&1 || true
+[ -f "$RST/reverie/last-session.json" ] || RSOK=0
+grep -q -- "\"$PWD/$SCENE\"" \
+    "$RST/reverie/last-session.json" 2>/dev/null || RSOK=0
+DISPLAY="$XDISPLAY" XDG_STATE_HOME="$RST" timeout 6 ./build/reverie -R cpu \
+    --restore > "$OUT/res2.log" 2>&1 || true
+grep -q "restore: replaying the last session" "$OUT/res2.log" 2>/dev/null || RSOK=0
+grep -q "scene '$PWD/$SCENE'" "$OUT/res2.log" 2>/dev/null || RSOK=0
+grep -q "x11: DISPLAY is not set" "$OUT/res2.log" 2>/dev/null && RSOK=0
+EMPTY="$OUT/restore-empty"
+mkdir -p "$EMPTY"
+XDG_STATE_HOME="$EMPTY" ./build/reverie --restore > "$OUT/res3.log" 2>&1
+RRC=$?
+[ "$RRC" -ne 0 ] || RSOK=0
+grep -q "nothing to restore" "$OUT/res3.log" 2>/dev/null || RSOK=0
+XDG_STATE_HOME="$RST" ./build/reverie --restore --scene "$SCENE" \
+    > "$OUT/res4.log" 2>&1
+RRC2=$?
+[ "$RRC2" -ne 0 ] || RSOK=0
+grep -q "cannot be combined with" "$OUT/res4.log" 2>/dev/null || RSOK=0
+stop_xvfb
+if [ "$RSOK" = 1 ]; then
+    echo "    restore:       PASS (record absolute / replay / empty refusal / conflict)"
+    PASS=$((PASS+1))
+else
+    echo "    restore:       FAIL (session memory broken)"
+    cat "$OUT/res1.log" "$OUT/res2.log" "$OUT/res3.log" "$OUT/res4.log" \
+        2>/dev/null
     FAIL=$((FAIL+1))
 fi
 

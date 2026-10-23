@@ -5,8 +5,11 @@
  * messages, same legacy --shot N FILE form, same NAME=VALUE env-var guard.
  * Added: --scene PATH (the explicit form of the positional), --video PATH
  * (the media mode, mutually exclusive with any scene), --scale
- * fill|fit|stretch|center and --no-loop (media mode only), and
- * --exit-if-running (yield to a live daemon via the IPC probe).
+ * fill|fit|stretch|center and --no-loop (media mode only),
+ * --exit-if-running (yield to a live daemon via the IPC probe), and
+ * --restore (replay the last launched content; the content slot is
+ * filled by the session record — an error next to any explicit
+ * scene/video).
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -104,9 +107,10 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
         a->scale = REV_SCALE_FILL;
         a->shot_after = -1;
         err[0] = 0;
-        /* Media-mode flags are recorded during the scan but validated once,
-         * after the whole line is parsed — see the post-loop checks. */
-        bool scale_seen = false, no_loop_seen = false;
+        /* Media-mode flags are recorded during the scan (a->scale_seen /
+         * a->no_loop_seen — they are parser outputs the session-record merge
+         * also needs) but validated once, after the whole line is parsed —
+         * see the post-loop checks. */
 
         #define NEED_VALUE(opt) do { \
                 if (i + 1 >= argc || option_like(argv[i + 1])) { \
@@ -174,12 +178,14 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                                 return false;
                         }
                         a->scale = m;
-                        scale_seen = true;
+                        a->scale_seen = true;
                 } else if (!strcmp(argv[i], "--no-loop")) {
                         a->no_loop = true;
-                        no_loop_seen = true;
+                        a->no_loop_seen = true;
                 } else if (!strcmp(argv[i], "--exit-if-running")) {
                         a->exit_if_running = true;
+                } else if (!strcmp(argv[i], "--restore")) {
+                        a->restore = true;
                 } else if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--list")) {
                         a->list = true;
                 } else if (!strcmp(argv[i], "--shot")) {
@@ -259,13 +265,30 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
          * `--scale stretch --video f.mp4` is the same command as
          * `--video f.mp4 --scale stretch`, and the old inline check made
          * the order significant for no reason. Orphaned flags (no --video
-         * anywhere) keep the historical error messages. */
-        if (scale_seen && !a->video_path) {
+         * anywhere) keep the historical error messages. With --restore the
+         * video may be arriving from the session record — the check is
+         * deferred to rev_session_apply(), which re-runs it once the merged
+         * line is known. */
+        if (a->scale_seen && !a->video_path && !a->restore) {
                 snprintf(err, errcap, "--scale applies to --video media mode");
                 return false;
         }
-        if (no_loop_seen && !a->video_path) {
+        if (a->no_loop_seen && !a->video_path && !a->restore) {
                 snprintf(err, errcap, "--no-loop applies to --video media mode");
+                return false;
+        }
+        /* --restore IS the content: the record supplies it. Combining it
+         * with an explicit scene/video/positional is ambiguous (which one
+         * should win?) and therefore a hard error, not a silent choice. */
+        if (a->restore && (a->scene_path || a->video_path)) {
+                snprintf(err, errcap, "--restore replays the last launched "
+                                     "content and cannot be combined with "
+                                     "%s",
+                         a->video_path
+                                 ? "--video"
+                                 : a->scene_path && a->scene_path[0] == '-'
+                                           ? "--scene"
+                                           : "a scene path");
                 return false;
         }
         return true;

@@ -75,6 +75,7 @@ CORE_SRC = \
 	src/cli.c \
 	src/log.c \
 	src/util.c \
+	src/session.c \
 	src/simd.c \
 	src/inflate.c \
 	src/png.c \

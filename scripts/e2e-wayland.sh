@@ -42,8 +42,12 @@ fi
 
 LIB="$GPU_ROOT/usr/lib/x86_64-linux-gnu"
 OUT=$(mktemp -d)
-XDG=/tmp/rev-e2e-wl.$$ 
+XDG=/tmp/rev-e2e-wl.$$
 mkdir -p "$XDG" && chmod 700 "$XDG"
+# keep the daemon's last-launched memory off the real user state dir
+# (same rationale as scripts/e2e.sh)
+XDG_STATE_HOME="$OUT/xdg-state"
+export XDG_STATE_HOME
 SOCK="rev-e2e-0"
 WESTON_PID=""
 PASS=0; FAIL=0
