@@ -156,8 +156,16 @@ make            # build/reverie + build/revtool
 make test       # run the test suite (inflate, PNG, SVG, scene, pack, wayland)
 scripts/e2e.sh  # Xvfb end-to-end, all renderer tiers present on the machine
 make assets     # regenerate scene assets using Reverie's own PNG encoder
-make install    # /usr/local/bin/{reverie,revtool}
+make install    # /usr/local/bin/{reverie,revtool} — BINARIES ONLY
+make install-themes  # opt-in: themes/ -> /usr/local/share/reverie/themes
 ```
+
+`make install` never ships the bundled themes: they live in the repo as
+ development and demo assets, and a wallpaper you did not ask for has no
+business landing on your disk. Install a theme the same way you got it —
+copy the folder, or a `.revpack` — anywhere you like (themes are
+self-contained; there is no registry and no install step). `make
+install-themes` exists for packagers who explicitly want the collection.
 
 Requirements: a C11 compiler, make, and that's it. No headers beyond libc.
 Video wallpapers are optional and controllable:
@@ -201,6 +209,9 @@ reverie --scene themes/ripple-lake    # the same, spelled out
 reverie --video loops/waves.mp4       # media mode: video/GIF wallpaper
 reverie --video loop.gif --scale fit  # letterbox instead of cover-crop
 reverie --video demo.mp4 --no-loop    # hold the last frame at EOF
+reverie --image walls/dusk.png        # static media mode: one PNG — the
+                                      #   engine's own codec, no FFmpeg
+reverie --image wall.png --scale fit  # the same placement vocabulary
 reverie --restore                     # whatever was launched last — the
                                       #   daemon remembers (absolute path,
                                       #   runtime THEME switches included)
@@ -219,6 +230,18 @@ fill|fit|stretch|center` (default fill — cover and crop), letterbox
 bars are opaque black, and playback paces at the source's own frame
 rate. `THEME`/playlist IPC commands report a clear error in media mode;
 `PING`/`STATUS`/`QUIT` work as usual.
+
+`--image` is the static sibling: one PNG through Reverie's own native
+codec (every color type, bit depth and interlacing — see
+[docs/PNG.md](docs/PNG.md)), so it works in EVERY build configuration,
+stub builds included, with zero FFmpeg involvement. It shares the
+`--scale` placement vocabulary and the black-bar semantics; GPU tiers
+upload the texture once and rebind it (a static wallpaper costs one
+upload total), the CPU tier places with the native bilinear sampler,
+and `STATUS` reports `mode=image`. Like every content mode it lands in
+the session memory — `--restore` and autostart replay images too.
+`--no-loop` is meaningless for a static image and is rejected as
+`--video`-only.
 
 revtool validate <scene.rev | theme>  # check a scene or theme
 revtool render  <scene.rev> ...       # offline PNG rendering (with simulated
@@ -242,7 +265,8 @@ idle power-save keeps working across switches.
 
 See docs/SCENE-FORMAT.md (the scene language), docs/THEMES.md (theme
 folders + packed themes), docs/IPC.md (runtime control),
-docs/VIDEO.md (video + media mode), docs/AUTOSTART.md (login
+docs/VIDEO.md (video + media mode), docs/IMAGE.md (static image mode),
+docs/AUTOSTART.md (login
 autostart), and docs/BUILD-DISTRO.md (per-distribution build
 packages — Alpine/Arch/Debian/Fedora/openSUSE/Void).
 ```

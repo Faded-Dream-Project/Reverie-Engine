@@ -3,7 +3,7 @@
  * The "last launched wallpaper" memory behind `reverie --restore`.
  *
  * The daemon records what it launched — a theme folder, a .rev scene, a
- * .revpack, or a --video file — into $XDG_STATE_HOME/reverie/last-session.json
+ * .revpack, a --video file, or a --image file — into $XDG_STATE_HOME/reverie/last-session.json
  * (default ~/.local/state/reverie/last-session.json). The record is the
  * WALLPAPER-DEFINING subset of the command line with the content path made
  * absolute; tool flags (--once/--out/--shot/...) are never recorded, and a
@@ -48,8 +48,10 @@ bool rev_session_path(char *buf, size_t cap, char *err, size_t errcap);
 
 /* Records the wallpaper-defining subset of a parsed command line (the
  * content path made absolute; tool flags are not representable here at
- * all). Best-effort at the call site: on failure the daemon keeps running
- * and the caller decides how loudly to warn. */
+ * all). --scale is recorded for BOTH media modes (video and image — it
+ * is placement, shared vocabulary); --no-loop only for --video, where it
+ * means something. Best-effort at the call site: on failure the daemon
+ * keeps running and the caller decides how loudly to warn. */
 bool rev_session_record(const RevArgs *a, char *err, size_t errcap);
 
 /* Updates ONLY the content of the existing record to `scene_path` (made
@@ -64,7 +66,7 @@ bool rev_session_record_content(const char *scene_path, char *err, size_t errcap
  * content pointers in `*a` reference s->line). Re-parses the record
  * through rev_cli_parse (rejecting --restore inside the record and records
  * with no content) and merges the result into `a`:
- *   - scene/video/scale/no-loop/fps/monitor/renderer/backend come from the
+ *   - scene/video/image/scale/no-loop/fps/monitor/renderer/backend come from the
  *     record UNLESS the current invocation set them explicitly;
  *   - tool flags (--once/--out/--shot/--list...) are untouched — they are
  *     properties of THIS invocation, not of the wallpaper;

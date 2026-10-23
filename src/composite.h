@@ -11,17 +11,17 @@
 #include "rev_types.h"
 
 typedef struct {
-	u32 *px;
-	u32 w, h;
+        u32 *px;
+        u32 w, h;
 } RFb;
 
 enum {
-	REV_BLEND_NORMAL = 0,
-	REV_BLEND_ADD,
-	REV_BLEND_SCREEN,
-	REV_BLEND_MULTIPLY,
-	REV_BLEND_OVERLAY,
-	REV_BLEND_COUNT
+        REV_BLEND_NORMAL = 0,
+        REV_BLEND_ADD,
+        REV_BLEND_SCREEN,
+        REV_BLEND_MULTIPLY,
+        REV_BLEND_OVERLAY,
+        REV_BLEND_COUNT
 };
 
 const char *rev_blend_name(int mode);
@@ -45,6 +45,15 @@ void rev_blur(RFb *fb, f64 radius);
 
 /* Bilinear resample. */
 void rev_resample_bilinear(const u32 *src, u32 sw, u32 sh, u32 *dst, u32 dw, u32 dh);
+/* Same sampler over the SUB-RECT [sx, sy, sw x sh] of a src_w-wide image
+ * (row stride = src_w): the visible-region resample for media placement —
+ * a 100x10000 source under fill converts only the strip the viewport
+ * shows, never a 1920x192000 intermediate. Clamping stays inside the
+ * sub-rect, exactly like the whole-image form clamps inside the image.
+ * rev_resample_bilinear() is the (0,0)-sub-rect special case. */
+void rev_resample_bilinear_sub(const u32 *src, u32 src_w, u32 src_h,
+                               u32 sx, u32 sy, u32 sw, u32 sh,
+                               u32 *dst, u32 dw, u32 dh);
 /* Nearest neighbor (pixel art). */
 void rev_resample_nearest(const u32 *src, u32 sw, u32 sh, u32 *dst, u32 dw, u32 dh);
 

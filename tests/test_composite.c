@@ -4,6 +4,10 @@
  * RGB by (1-black) with the SAME rounding on the SSE2 path (n >= 4) and the
  * scalar tail, and leave alpha untouched.
  *
+ * rev_resample_bilinear_sub: the media-placement sampler — identity copies,
+ * offset sub-rects, equivalence with a cropped whole-image resample, and
+ * transparent-texel handling inside the sub-rect.
+ *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
 #include <stdio.h>
@@ -131,6 +135,89 @@ int main(void)
                         if (p2[i] != (orig[i] & 0xFF000000u))
                                 ok = false;
                 CHECK(ok, "fade 7.0 clamps to full black");
+        }
+
+        /* ---- rev_resample_bilinear_sub: the media-placement sampler ------ */
+
+        /* 4x4 image with distinct opaque texels + a transparent one */
+        u32 img[16];
+        for (int i = 0; i < 16; i++)
+                img[i] = PX(255, (u32)(i * 3), (u32)(i * 5), (u32)(i * 7));
+        img[10] = PX(0, 0, 0, 0);    /* transparent texel inside row 2 */
+
+        /* 1:1 with the whole image is an exact copy (fx = fy = 0 every texel) */
+        {
+                u32 out[16];
+                rev_resample_bilinear_sub(img, 4, 4, 0, 0, 4, 4, out, 4, 4);
+                CHECK(memcmp(out, img, sizeof img) == 0,
+                      "bilinear_sub 1:1 whole image is an exact copy");
+        }
+
+        /* 1:1 of an interior sub-rect copies exactly those texels */
+        {
+                u32 out[4];
+                rev_resample_bilinear_sub(img, 4, 4, 1, 1, 2, 2, out, 2, 2);
+                CHECK(out[0] == img[1 * 4 + 1] && out[1] == img[1 * 4 + 2] &&
+                      out[2] == img[2 * 4 + 1] && out[3] == img[2 * 4 + 2],
+                      "bilinear_sub 1:1 interior sub-rect copies the region");
+        }
+
+        /* the (0,0) full-rect form is the whole-image function — regression
+         * guard against the two samplers drifting apart */
+        {
+                u32 a[15], b[15];
+                rev_resample_bilinear(img, 4, 4, a, 5, 3);
+                rev_resample_bilinear_sub(img, 4, 4, 0, 0, 4, 4, b, 5, 3);
+                CHECK(memcmp(a, b, sizeof a) == 0,
+                      "bilinear_sub (0,0) matches rev_resample_bilinear");
+        }
+
+        /* downscaling a sub-rect equals resampling the cropped image: the
+         * sampler only ever touches in-rect texels, so clamping inside the
+         * sub-rect and clamping inside the crop are the same thing */
+        {
+                u32 sub[9];    /* the crop of sub-rect (1,0,3,3) from the 4x4 */
+                for (u32 y = 0; y < 3; y++)
+                        for (u32 x = 0; x < 3; x++)
+                                sub[y * 3 + x] = img[y * 4 + (x + 1)];
+                u32 a[6], b[6];
+                rev_resample_bilinear(sub, 3, 3, a, 2, 3);
+                rev_resample_bilinear_sub(img, 4, 4, 1, 0, 3, 3, b, 2, 3);
+                CHECK(memcmp(a, b, sizeof a) == 0,
+                      "bilinear_sub downscale == cropped whole-image resample");
+        }
+
+        /* a fully transparent texel inside a 1:1 sub-rect stays exactly
+         * transparent (the wa == 0 branch of the sampler) */
+        {
+                u32 tr[4] = { PX(0, 0, 0, 0), PX(255, 5, 5, 5),
+                              PX(255, 6, 6, 6), PX(255, 7, 7, 7) };
+                u32 o2[4];
+                rev_resample_bilinear_sub(tr, 2, 2, 0, 0, 2, 2, o2, 2, 2);
+                CHECK(o2[0] == PX(0, 0, 0, 0),
+                      "transparent texel survives the 1:1 sub-rect sampler");
+        }
+
+        /* degenerate calls are no-ops, not crashes */
+        {
+                u32 out[4] = { 1, 2, 3, 4 };
+                rev_resample_bilinear_sub(NULL, 4, 4, 0, 0, 2, 2, out, 2, 2);
+                rev_resample_bilinear_sub(img, 4, 4, 9, 9, 2, 2, out, 2, 2);
+                rev_resample_bilinear_sub(img, 4, 4, 0, 0, 0, 0, out, 2, 2);
+                rev_resample_bilinear_sub(img, 0, 0, 0, 0, 2, 2, out, 2, 2);
+                rev_resample_bilinear_sub(img, 4, 4, 0, 0, 2, 2, NULL, 2, 2);
+                CHECK(out[0] == 1 && out[1] == 2 && out[2] == 3 && out[3] == 4,
+                      "degenerate sub-rect calls leave dst untouched");
+        }
+
+        /* an oversized sub-rect is clamped to the image, never read past
+         * the edge */
+        {
+                u32 a[16], b[16];
+                rev_resample_bilinear_sub(img, 4, 4, 1, 1, 9, 9, a, 4, 4);
+                rev_resample_bilinear_sub(img, 4, 4, 1, 1, 3, 3, b, 4, 4);
+                CHECK(memcmp(a, b, sizeof a) == 0,
+                      "oversized sub-rect clamps to the image bounds");
         }
 
         if (failures == 0) {

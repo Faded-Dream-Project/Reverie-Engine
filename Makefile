@@ -121,7 +121,7 @@ BINS  = $(BUILD)/reverie $(BUILD)/revtool
 TEST_SRC = $(wildcard tests/test_*.c)
 TEST_BIN = $(patsubst tests/%.c,$(BUILD)/%,$(TEST_SRC))
 
-.PHONY: all test assets install clean
+.PHONY: all test assets install install-themes clean
 
 all: $(BINS)
 
@@ -174,6 +174,17 @@ install: $(BINS)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(BUILD)/reverie $(DESTDIR)$(PREFIX)/bin/reverie
 	install -m 755 $(BUILD)/revtool $(DESTDIR)$(PREFIX)/bin/revtool
+
+# OPT-IN theme shipping. `install` deliberately installs BINARIES ONLY:
+# the themes in the repo root are development/demo assets, and a wallpaper
+# the user never asked for has no business on their disk. Themes are
+# self-contained folders/revpacks — users install exactly the ones they
+# want, wherever they want. Packagers who explicitly want the collection
+# (e.g. a -themes subpackage) run this target.
+install-themes: $(BINS)
+	install -d $(DESTDIR)$(PREFIX)/share/reverie/themes
+	cp -R themes/. "$(DESTDIR)$(PREFIX)/share/reverie/themes/"
+	find "$(DESTDIR)$(PREFIX)/share/reverie/themes" -type f -exec chmod 644 {} +
 
 clean:
 	rm -rf $(BUILD)

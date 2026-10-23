@@ -248,7 +248,9 @@ static const char *scale_name(int m)
 
 bool rev_session_record(const RevArgs *a, char *err, size_t errcap)
 {
-        const char *content = a->video_path ? a->video_path : a->scene_path;
+        const char *content = a->video_path ? a->video_path
+                          : a->image_path ? a->image_path
+                          : a->scene_path;
         if (!content) {
                 snprintf(err, errcap, "nothing to record — no content");
                 return false;
@@ -262,13 +264,15 @@ bool rev_session_record(const RevArgs *a, char *err, size_t errcap)
         /* Only what defines the wallpaper. Tool flags (--once/--out/--shot,
          * verbosity) are properties of a particular invocation, and env-var
          * fallbacks are deliberately NOT frozen here: the record replays
-         * the command line, not the environment. */
+         * the command line, not the environment. --scale is shared by both
+         * media modes; --no-loop only means something for --video. */
         char nfps[24], nmon[24];
         const char *toks[REV_SESSION_MAX_ARGS];
         int n = 0;
-        toks[n++] = a->video_path ? "--video" : "--scene";
+        toks[n++] = a->video_path ? "--video"
+                  : a->image_path ? "--image" : "--scene";
         toks[n++] = abs;
-        if (a->video_path && a->scale_seen) {
+        if ((a->video_path || a->image_path) && a->scale_seen) {
                 toks[n++] = "--scale";
                 toks[n++] = scale_name(a->scale);
         }
@@ -375,7 +379,7 @@ bool rev_session_apply(RevArgs *a, RevSession *s, char *err, size_t errcap)
                                       "(corrupt or hand-edited)");
                 return false;
         }
-        if (!ra.scene_path && !ra.video_path) {
+        if (!ra.scene_path && !ra.video_path && !ra.image_path) {
                 snprintf(err, errcap, "session record has no content");
                 return false;
         }
@@ -385,6 +389,7 @@ bool rev_session_apply(RevArgs *a, RevSession *s, char *err, size_t errcap)
          * (the sentinels are unambiguous — NULL / 0 / -1 / *_seen) */
         a->scene_path = ra.scene_path;
         a->video_path = ra.video_path;
+        a->image_path = ra.image_path;
         if (!a->scale_seen)
                 a->scale = ra.scale;
         if (!a->no_loop_seen)
@@ -400,8 +405,8 @@ bool rev_session_apply(RevArgs *a, RevSession *s, char *err, size_t errcap)
 
         /* the media-flag checks cli.c deferred past --restore (the content
          * they validate against was not known at parse time yet) */
-        if (a->scale_seen && !a->video_path) {
-                snprintf(err, errcap, "--scale applies to --video media mode");
+        if (a->scale_seen && !a->video_path && !a->image_path) {
+                snprintf(err, errcap, "--scale applies to --video or --image");
                 return false;
         }
         if (a->no_loop_seen && !a->video_path) {

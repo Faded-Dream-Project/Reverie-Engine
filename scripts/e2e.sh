@@ -668,6 +668,127 @@ sys.exit(0 if n and r/n > 180 and g/n < 70 and b/n < 70 else 1)
     stop_xvfb
 fi
 
+# ---- Static media mode (--image): native PNG, no FFmpeg anywhere ------------
+# These legs run in EVERY build configuration: the decoder is reverie's own
+# (src/png.c), so they double as the end-to-end exercise of the native codec.
+IMG_FIX="tests/fixtures/png_rgb8_40x25_i1.png"   # 40x25 opaque RGB
+
+# CLI contract: content-mode conflicts, video-only flags, restore exclusivity
+ICOK=1
+./build/reverie --image a.png --scene b.rev >/dev/null 2>&1 && ICOK=0
+./build/reverie --scene b.rev --image a.png >/dev/null 2>&1 && ICOK=0
+./build/reverie --image a.png --video b.mp4 >/dev/null 2>&1 && ICOK=0
+./build/reverie --image a.png positional.rev >/dev/null 2>&1 && ICOK=0
+./build/reverie --image a.png --image b.png >/dev/null 2>&1 && ICOK=0
+./build/reverie --image a.png --no-loop >/dev/null 2>&1 && ICOK=0
+./build/reverie --restore --image a.png >/dev/null 2>&1 && ICOK=0
+# a forgotten path (--image --scale fit) must name the real problem
+./build/reverie --image --scale fit >/dev/null 2>&1 && ICOK=0
+./build/reverie --image --scale fit 2>&1 | grep -q "needs a value" || ICOK=0
+# --scale before --image parses (position independent): the only failure
+# below is the missing file, never the 'applies to' parse error
+./build/reverie --scale fit --image nosuch.png -o > "$OUT/iord.log" 2>&1 || true
+grep -q "applies to" "$OUT/iord.log" && ICOK=0
+# a non-PNG must refuse cleanly through the native decoder's own message
+./build/reverie --image tests/fixtures/deflate_trunc.zlib -o > "$OUT/ibad.log" 2>&1 && ICOK=0
+grep -q "PNG:" "$OUT/ibad.log" 2>/dev/null || ICOK=0
+if [ "$ICOK" = 1 ]; then
+    echo "    image(cli):   PASS (conflicts + video-only flags + decoder refusal)"
+    PASS=$((PASS+1))
+else
+    echo "    image(cli):   FAIL (a bad --image command line was accepted)"
+    FAIL=$((FAIL+1))
+fi
+
+# offline placement, all four --scale modes (100x80 viewport, 40x25 source):
+# fill covers, fit letterboxes, center centers, stretch fills — judged on
+# the black-bar geometry, exactly the evidence the media legs use
+for MODE in fill fit center stretch; do
+    ./build/reverie --image "$IMG_FIX" --scale $MODE -o -s 100x80 \
+        -O "$OUT/img_$MODE.png" > "$OUT/img_$MODE.log" 2>&1
+done
+if python3 -c "
+import struct, zlib, sys
+def bars(path):
+    d = open(path,'rb').read(); pos, idat = 8, b''
+    while pos < len(d):
+        ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+        if typ == b'IDAT': idat += d[pos:pos+ln]
+        pos += ln + 4
+    raw = zlib.decompress(idat); W, H, stride = 100, 80, 401
+    def black(y, x): return tuple(raw[y*stride+1+x*4:y*stride+5+x*4]) == (0,0,0,255)
+    cols = any(all(black(y,x) for y in range(H)) for x in range(W))
+    rows = any(all(black(y,x) for x in range(W)) for y in range(H))
+    return cols, rows
+f = bars('$OUT/img_fill.png')
+t = bars('$OUT/img_fit.png')
+c = bars('$OUT/img_center.png')
+s = bars('$OUT/img_stretch.png')
+ok = (not f[0] and not f[1] and          # fill: cover-crop, no bars
+      not t[0] and t[1] and              # fit: letterbox rows only
+      c[0] and c[1] and                  # center: bars on both axes
+      not s[0] and not s[1])             # stretch: fills everything
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+    echo "    image(place): PASS (fill covers, fit letterboxes, center centers, stretch fills)"
+    PASS=$((PASS+1))
+else
+    echo "    image(place): FAIL (--scale placement geometry wrong)"
+    FAIL=$((FAIL+1))
+fi
+
+# GL tier: the RGBA pixel-layer path with the upload-once content id
+start_xvfb
+DISPLAY="$XDISPLAY" env $GPU_ENV timeout 8 ./build/reverie -R opengl \
+    --image "$IMG_FIX" --shot 1 "$OUT/igl" > "$OUT/igl.log" 2>&1 || true
+stop_xvfb
+if grep -q "renderer: opengl" "$OUT/igl.log" 2>/dev/null \
+   && [ -f "$OUT/igl.png" ]; then
+    echo "    image(gl):    PASS (GPU pixel-layer static image)"
+    PASS=$((PASS+1))
+elif grep -q "renderer: opengl" "$OUT/igl.log" 2>/dev/null; then
+    echo "    image(gl):    FAIL (GL tier produced no frame)"
+    cat "$OUT/igl.log"
+    FAIL=$((FAIL+1))
+else
+    echo "    image(gl):    SKIP (no libEGL / GL vendor on this system)"
+    SKIP=$((SKIP+1))
+fi
+
+# live session under Xvfb: STATUS reports mode=image, the launch lands in the
+# session memory, and --restore replays it as an image (the autostart story)
+start_xvfb
+ISOCK="$OUT/img.sock"
+ISTATE=$(mktemp -d)
+DISPLAY="$XDISPLAY" REV_IPC_SOCK="$ISOCK" XDG_STATE_HOME="$ISTATE" \
+    timeout 16 ./build/reverie -R cpu --image "$IMG_FIX" \
+    > "$OUT/iipc.log" 2>&1 &
+IPID=$!
+sleep 2
+./build/revtool ipc -s "$ISOCK" STATUS > "$OUT/iipc1.out" 2>&1
+./build/revtool ipc -s "$ISOCK" QUIT > "$OUT/iipc2.out" 2>&1
+sleep 1
+IREC="$ISTATE/reverie/last-session.json"
+IIP=1
+grep -q "mode=image" "$OUT/iipc1.out" 2>/dev/null || IIP=0
+grep -q '"--image"' "$IREC" 2>/dev/null || IIP=0
+kill -0 $IPID 2>/dev/null && IIP=0
+# the restore: same XDG state, no explicit content — the record drives it
+XDG_STATE_HOME="$ISTATE" ./build/reverie --restore -o -s 100x80 \
+    -O "$OUT/irest.png" > "$OUT/irest.log" 2>&1 || IIP=0
+grep -q "image mode" "$OUT/irest.log" 2>/dev/null || IIP=0
+if [ "$IIP" = 1 ]; then
+    echo "    image(live):  PASS (status mode=image, session recorded, --restore replays it)"
+    PASS=$((PASS+1))
+else
+    echo "    image(live):  FAIL (live image session incomplete)"
+    cat "$OUT/iipc.log" "$OUT/iipc1.out" "$OUT/irest.log" 2>/dev/null
+    kill $IPID 2>/dev/null; wait $IPID 2>/dev/null
+    FAIL=$((FAIL+1))
+fi
+rm -rf "$ISTATE"
+stop_xvfb
+
 # ---- Vulkan tier: GPU compute compositing, platform present -----------------
 # The tier composites every layer as a compute kernel; the finished frame is
 # copied out and presented via wl_shm/MIT-SHM.

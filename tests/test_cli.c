@@ -195,8 +195,8 @@ int main(void)
               a.shot_after == -3.0 && !strcmp(a.shot_file, "out.png"),
               "legacy --shot with negative seconds still parses");
         CHECK(!parse("--scale fill", &a, err, sizeof err, &usage_hint) &&
-              strstr(err, "--scale applies to --video media mode"),
-              "--scale without --video rejected");
+              strstr(err, "--scale applies to --video or --image"),
+              "--scale without --video/--image rejected");
         CHECK(!parse("--no-loop", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "--no-loop applies to --video media mode"),
               "--no-loop without --video rejected");
@@ -217,7 +217,7 @@ int main(void)
               a.no_loop && a.scale == REV_SCALE_FIT,
               "--no-loop + --scale both before --video parse");
         CHECK(!parse("--scale fill --scene a.rev", &a, err, sizeof err, &usage_hint) &&
-              strstr(err, "--scale applies to --video media mode"),
+              strstr(err, "--scale applies to --video or --image"),
               "--scale still rejected in scene mode (post-parse check)");
         CHECK(parse("--video a.mp4 --exit-if-running -R cpu", &a, err, sizeof err, &usage_hint) &&
               a.exit_if_running && !strcmp(a.renderer_pref, "cpu"),
@@ -226,6 +226,46 @@ int main(void)
               strstr(err, "looks like an environment variable") &&
               strstr(err, "a video was already given"),
               "env-var guard notes the earlier video");
+
+        /* ---- static media mode: --image (native PNG, same --scale) ------ */
+
+        CHECK(parse("--image wall.png", &a, err, sizeof err, &usage_hint) &&
+              !strcmp(a.image_path, "wall.png") && !a.scene_path &&
+              !a.video_path && a.scale == REV_SCALE_FILL,
+              "--image sets the static media slot (default fill)");
+        CHECK(!parse("--image a.png --image b.png", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "multiple images given"),
+              "--image twice rejected");
+        CHECK(!parse("--image a.png --scene b.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--image + --scene rejected");
+        CHECK(!parse("--scene b.rev --image a.png", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--scene + --image rejected (order independent)");
+        CHECK(!parse("--image a.png --video b.mp4", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--image + --video rejected");
+        CHECK(!parse("--video b.mp4 --image a.png", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "--video + --image rejected (order independent)");
+        CHECK(!parse("--image a.png positional.rev", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "conflicting content modes"),
+              "positional after --image rejected");
+        CHECK(!parse("--image --scale fit", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "option '--image' needs a value") && usage_hint,
+              "--image forgotten path names its real problem");
+        CHECK(parse("--image a.png --scale fit", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_FIT,
+              "--scale fit parses next to --image");
+        CHECK(parse("--scale center --image a.png", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_CENTER && !strcmp(a.image_path, "a.png"),
+              "--scale before --image parses (position independent)");
+        CHECK(!parse("--image a.png --no-loop", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--no-loop applies to --video media mode"),
+              "--no-loop is --video-only (a static image has no loop)");
+        CHECK(parse("--image a.png --exit-if-running -R cpu", &a, err, sizeof err, &usage_hint) &&
+              a.exit_if_running && !strcmp(a.renderer_pref, "cpu"),
+              "--image composes with the daemon flags");
 
         /* ---- renderer/backend vocabulary ---------------------------------- */
 
@@ -249,7 +289,7 @@ int main(void)
         /* ---- --restore (the session-record content slot) ------------------ */
 
         CHECK(parse("--restore", &a, err, sizeof err, &usage_hint) &&
-              a.restore && !a.scene_path && !a.video_path,
+              a.restore && !a.scene_path && !a.video_path && !a.image_path,
               "--restore parses and claims the content slot");
         CHECK(parse("--restore --exit-if-running", &a, err, sizeof err, &usage_hint) &&
               a.restore && a.exit_if_running,
@@ -270,6 +310,9 @@ int main(void)
         CHECK(!parse("--restore --video a.mp4", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "cannot be combined with --video"),
               "--restore + --video rejected (message names --video)");
+        CHECK(!parse("--restore --image a.png", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "cannot be combined with --image"),
+              "--restore + --image rejected (message names --image)");
         CHECK(!parse("--restore a.rev", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "cannot be combined with"),
               "--restore + positional rejected");

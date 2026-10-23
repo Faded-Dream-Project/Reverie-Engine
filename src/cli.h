@@ -7,9 +7,12 @@
  *   - a positional path (compat: themes/<id>, any .rev scene, packs)
  *   - --scene PATH (the same slot, explicit)
  *   - --video PATH (media mode; wired in the media-mode commit)
+ *   - --image PATH (static media mode: one PNG through the native codec,
+ *     no FFmpeg anywhere in the path — same --scale placement vocabulary
+ *     as --video)
  *   - --restore (fills the content slot from the session record at
- *     startup — not a fourth mode, but it cannot be combined with any
- *     of the three above)
+ *     startup — not a fifth mode, but it cannot be combined with any
+ *     of the four above)
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -22,6 +25,8 @@ typedef struct {
         /* ---- content ---- */
         const char *scene_path;   /* positional or --scene; NULL when none */
         const char *video_path;   /* --video media mode; NULL when absent  */
+        const char *image_path;   /* --image static media mode; NULL when
+                                     absent (native PNG, no FFmpeg)        */
 
         /* ---- selection ---- */
         const char *renderer_pref;/* --renderer / -R value ("auto" unset)  */
@@ -36,8 +41,11 @@ typedef struct {
         const char *out_png;      /* --out (default reverie.png)           */
 
         /* ---- media mode ---- */
-        int  scale;               /* --scale: REV_SCALE_* (default FILL)   */
-        bool no_loop;             /* --no-loop: hold last frame at EOF     */
+        int  scale;               /* --scale: REV_SCALE_* (default FILL) —
+                                     applies to --video AND --image       */
+        bool no_loop;             /* --no-loop: hold last frame at EOF
+                                     (--video only: a static image has no
+                                     loop to decline)                      */
 
         /* ---- daemon ---- */
         bool exit_if_running;     /* --exit-if-running: yield to a live

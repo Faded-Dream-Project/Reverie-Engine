@@ -4,12 +4,13 @@
  * loop that used to live in main(): same option set, same accept/reject
  * messages, same legacy --shot N FILE form, same NAME=VALUE env-var guard.
  * Added: --scene PATH (the explicit form of the positional), --video PATH
- * (the media mode, mutually exclusive with any scene), --scale
- * fill|fit|stretch|center and --no-loop (media mode only),
+ * (the media mode, mutually exclusive with any scene), --image PATH (the
+ * static media mode — native PNG, same --scale vocabulary), --scale
+ * fill|fit|stretch|center (video + image), --no-loop (video only),
  * --exit-if-running (yield to a live daemon via the IPC probe), and
  * --restore (replay the last launched content; the content slot is
  * filled by the session record — an error next to any explicit
- * scene/video).
+ * scene/video/image).
  *
  * Proprietary — see LICENSE. Copyright (c) 2026 FemBoyGamerTechGuy.
  * ==========================================================================*/
@@ -31,6 +32,12 @@ static void set_scene(RevArgs *a, const char *path, char *err, size_t errcap)
                          "cannot be combined");
                 return;
         }
+        if (a->image_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --image and a scene "
+                         "cannot be combined");
+                return;
+        }
         a->scene_path = path;
 }
 
@@ -46,7 +53,34 @@ static void set_video(RevArgs *a, const char *path, char *err, size_t errcap)
                          "cannot be combined");
                 return;
         }
+        if (a->image_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --video and --image "
+                         "cannot be combined");
+                return;
+        }
         a->video_path = path;
+}
+
+static void set_image(RevArgs *a, const char *path, char *err, size_t errcap)
+{
+        if (a->image_path) {
+                snprintf(err, errcap, "multiple images given");
+                return;
+        }
+        if (a->scene_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --image and a scene "
+                         "cannot be combined");
+                return;
+        }
+        if (a->video_path) {
+                snprintf(err, errcap,
+                         "conflicting content modes: --image and --video "
+                         "cannot be combined");
+                return;
+        }
+        a->image_path = path;
 }
 
 int rev_scale_mode(const char *name)
@@ -168,6 +202,11 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                         set_video(a, argv[++i], err, errcap);
                         if (err[0])
                                 return false;
+                } else if (!strcmp(argv[i], "--image")) {
+                        NEED_VALUE(argv[i]);
+                        set_image(a, argv[++i], err, errcap);
+                        if (err[0])
+                                return false;
                 } else if (!strcmp(argv[i], "--scale")) {
                         NEED_VALUE(argv[i]);
                         const char *val = argv[++i];
@@ -265,12 +304,15 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
          * `--scale stretch --video f.mp4` is the same command as
          * `--video f.mp4 --scale stretch`, and the old inline check made
          * the order significant for no reason. Orphaned flags (no --video
-         * anywhere) keep the historical error messages. With --restore the
-         * video may be arriving from the session record — the check is
-         * deferred to rev_session_apply(), which re-runs it once the merged
-         * line is known. */
-        if (a->scale_seen && !a->video_path && !a->restore) {
-                snprintf(err, errcap, "--scale applies to --video media mode");
+         * or --image anywhere) keep the historical error messages. With
+         * --restore the media may be arriving from the session record —
+         * the check is deferred to rev_session_apply(), which re-runs it
+         * once the merged line is known.
+         * --scale applies to BOTH media modes (video and image — placement
+         * is the same problem); --no-loop is --video-only because a static
+         * image has no loop to decline. */
+        if (a->scale_seen && !a->video_path && !a->image_path && !a->restore) {
+                snprintf(err, errcap, "--scale applies to --video or --image");
                 return false;
         }
         if (a->no_loop_seen && !a->video_path && !a->restore) {
@@ -278,17 +320,19 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                 return false;
         }
         /* --restore IS the content: the record supplies it. Combining it
-         * with an explicit scene/video/positional is ambiguous (which one
-         * should win?) and therefore a hard error, not a silent choice. */
-        if (a->restore && (a->scene_path || a->video_path)) {
+         * with an explicit scene/video/image/positional is ambiguous (which
+         * one should win?) and therefore a hard error, not a silent choice. */
+        if (a->restore && (a->scene_path || a->video_path || a->image_path)) {
                 snprintf(err, errcap, "--restore replays the last launched "
                                      "content and cannot be combined with "
                                      "%s",
                          a->video_path
                                  ? "--video"
-                                 : a->scene_path && a->scene_path[0] == '-'
-                                           ? "--scene"
-                                           : "a scene path");
+                                 : a->image_path
+                                           ? "--image"
+                                           : a->scene_path && a->scene_path[0] == '-'
+                                                     ? "--scene"
+                                                     : "a scene path");
                 return false;
         }
         return true;

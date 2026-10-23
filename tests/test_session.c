@@ -6,7 +6,9 @@
  * runtime-switch content update (other flags carried, media flags dropped),
  * and the --restore merge (record fills, explicit current flags win,
  * tool flags untouched, corrupt/hostile records rejected through the real
- * parser — including a record containing --restore itself).
+ * parser — including a record containing --restore itself). The --image
+ * static media mode gets the same legs: it records --image + --scale, and
+ * restores through the identical replay path.
  *
  * Every leg points XDG_STATE_HOME at a fresh temp directory; the last leg
  * checks the no-HOME-no-XDG refusal.
@@ -163,6 +165,32 @@ int main(void)
                       "scale/no-loop/fps/monitor/renderer recorded");
         }
 
+        /* ---- recording a static media (--image) launch ----------------- */
+        fresh_xdg();
+        {
+                CHECK(parse_spec("--image|walls/dusk.png|--scale|center|"
+                                 "-m|0|-R|cpu",
+                                 &a, err, sizeof err) &&
+                      rev_session_record(&a, err, sizeof err),
+                      "image launch records successfully");
+                CHECK(load_tokens(&s, err, sizeof err) && s.argc == 8,
+                      "image record holds content + its wallpaper flags");
+                char want[600];
+                snprintf(want, sizeof want, "%s/walls/dusk.png", cwd);
+                CHECK(tok_eq(&s, 0, "--image") && tok_eq(&s, 1, want),
+                      "image content recorded absolute under --image");
+                CHECK(tok_eq(&s, 2, "--scale") && tok_eq(&s, 3, "center") &&
+                      tok_eq(&s, 4, "--monitor") && tok_eq(&s, 5, "0") &&
+                      tok_eq(&s, 6, "--renderer") && tok_eq(&s, 7, "cpu"),
+                      "--scale is recorded for images (shared placement)");
+                int has_no_loop = 0;
+                for (int i = 0; i < s.argc; i++)
+                        if (!strcmp(s.argv[i], "--no-loop"))
+                                has_no_loop = 1;
+                CHECK(!has_no_loop,
+                      "--no-loop never recorded for a static image");
+        }
+
         /* ---- defaults are not recorded; tool flags are not representable -- */
         fresh_xdg();
         {
@@ -220,6 +248,50 @@ int main(void)
                       "tool flags survive untouched; restore is consumed");
         }
 
+        /* ---- restore: the --image roundtrip ------------------------------ */
+        fresh_xdg();
+        {
+                CHECK(parse_spec("--image|/abs/wall.png|--scale|fit|-f|12",
+                                 &a, err, sizeof err) &&
+                      rev_session_record(&a, err, sizeof err),
+                      "record the image launch");
+                CHECK(parse_spec("--restore|--once|-O|shot.png", &a, err,
+                                 sizeof err),
+                      "restoring invocation with tool flags parses");
+                CHECK(rev_session_apply(&a, &s, err, sizeof err),
+                      "apply merges the image record");
+                CHECK(a.image_path && !strcmp(a.image_path, "/abs/wall.png") &&
+                      !a.scene_path && !a.video_path,
+                      "image content comes from the record");
+                CHECK(a.scale == REV_SCALE_FIT && a.fps_override == 12 &&
+                      !a.no_loop,
+                      "image wallpaper flags come from the record");
+        }
+
+        /* ---- restore: --scale against an IMAGE record is legal; --no-loop
+         * is not (video-only) ------------------------------------------------ */
+        fresh_xdg();
+        {
+                CHECK(parse_spec("--image|/abs/wall.png|--scale|fit",
+                                 &a, err, sizeof err) &&
+                      rev_session_record(&a, err, sizeof err),
+                      "record the image launch");
+                CHECK(parse_spec("--restore|--scale|stretch", &a, err,
+                                 sizeof err),
+                      "--restore --scale parses (deferred)");
+                CHECK(rev_session_apply(&a, &s, err, sizeof err) &&
+                      a.scale == REV_SCALE_STRETCH,
+                      "explicit --scale against an image record wins");
+                CHECK(parse_spec("--restore|--no-loop", &a, err, sizeof err),
+                      "--restore --no-loop parses (deferred)");
+                char e2[256];
+                RevArgs ra = a;
+                CHECK(!rev_session_apply(&ra, &s, e2, sizeof e2) &&
+                      strstr(e2, "--no-loop applies to --video media mode")
+                              != NULL,
+                      "--no-loop against an image record fails at apply");
+        }
+
         /* ---- restore: explicit current flags win -------------------------- */
         fresh_xdg();
         {
@@ -250,7 +322,7 @@ int main(void)
                       "--restore --scale parses (deferred)");
                 char e2[256];
                 CHECK(!rev_session_apply(&a, &s, e2, sizeof e2) &&
-                      strstr(e2, "--scale applies to --video media mode")
+                      strstr(e2, "--scale applies to --video or --image")
                               != NULL,
                       "--scale against a scene record fails at apply");
         }
@@ -298,7 +370,7 @@ int main(void)
                                    "\"/x\",\"--scale\",\"fit\"]}"),
                       "plant a scene record with media flags (hand-edited)");
                 CHECK(!rev_session_apply(&a, &s, err, sizeof err) &&
-                      strstr(err, "--scale applies to --video") != NULL,
+                      strstr(err, "--scale applies to --video or --image") != NULL,
                       "scene record carrying --scale fails the re-parse");
         }
         fresh_xdg();

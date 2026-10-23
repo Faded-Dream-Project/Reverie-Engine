@@ -20,10 +20,10 @@ Exec=<reverie binary> --restore --exit-if-running
 ```
 
 `reverie --restore` launches **whatever was launched last** — theme
-folder, `.rev` scene, `.revpack`, or `--video` file. The daemon keeps
-that memory itself: every successful content launch records the
-wallpaper-defining subset of its command line (content path made
-**absolute**, plus `--scale`/`--no-loop`/`--fps`/`--monitor`/
+folder, `.rev` scene, `.revpack`, `--video` file, or `--image` file.
+The daemon keeps that memory itself: every successful content launch
+records the wallpaper-defining subset of its command line (content path
+made **absolute**, plus `--scale`/`--no-loop`/`--fps`/`--monitor`/
 `--renderer`/`--backend` when they were given) into
 
 ```
@@ -49,8 +49,8 @@ Deliberate semantics, stated plainly:
 * A restoring invocation may still spell out flags — explicit wins:
   `reverie --restore --renderer cpu` restores the content but forces
   the CPU renderer. Only the content slot is exclusively the record's;
-  combining `--restore` with `--scene`/`--video`/a positional is a hard
-  error (ambiguous, therefore refused).
+  combining `--restore` with `--scene`/`--video`/`--image`/a positional
+  is a hard error (ambiguous, therefore refused).
 * The record is re-parsed through the real argument parser at every
   restore: a corrupt or hand-edited file can only fail with a named
   error, never inject behavior a typed command line could not produce.
@@ -126,8 +126,8 @@ is the spec's, not Reverie's. Two failure modes are handled explicitly:
   service with `Restart=on-failure` would add retries; see below.)
 * **Nothing ever launched** (`--restore` with no session record): the
   daemon exits with `reverie: nothing to restore — no previous session
-  recorded (<path>)`. Run reverie once with any theme or video, and the
-  record exists from then on.
+  recorded (<path>)`. Run reverie once with any theme, video, or image,
+  and the record exists from then on.
 * **The recorded file was deleted or moved**: the normal content-load
   error names the path (recorded absolute, so the message says exactly
   which file is gone). The record is NOT cleared by the failure — fix

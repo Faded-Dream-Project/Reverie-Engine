@@ -75,6 +75,7 @@ static void usage(void)
 "\n"
 "usage: reverie [options] <scene.rev | theme dir | theme.revpack>\n"
 "       reverie [options] --video <file.mp4 | file.gif | ...>\n"
+"       reverie [options] --image <file.png>\n"
 "\n"
 "options:\n"
 "  -R, --renderer R    force renderer: auto | vulkan | opengl | cpu\n"
@@ -85,8 +86,13 @@ static void usage(void)
 "                       wallpaper (independent of .rev scenes; needs the\n"
 "                       FFmpeg libraries at runtime, which are OPTIONAL\n"
 "                       at build time)\n"
-"      --scale MODE    media placement: fill (cover, crop — default) |\n"
-"                       fit (letterbox) | stretch | center (native size)\n"
+"      --image PATH    static media mode: one PNG as the wallpaper,\n"
+"                       decoded by reverie's own native PNG codec — no\n"
+"                       FFmpeg anywhere in the path (works in every\n"
+"                       build configuration)\n"
+"      --scale MODE    media placement (--video and --image alike):\n"
+"                       fill (cover, crop — default) | fit (letterbox) |\n"
+"                       stretch | center (native size)\n"
 "      --no-loop       media mode: hold the last frame at end-of-file\n"
 "                       instead of looping (the default loops)\n"
 "      --exit-if-running\n"
@@ -95,8 +101,8 @@ static void usage(void)
 "                       (autostart entries carry it; needs the IPC\n"
 "                       socket, see docs/AUTOSTART.md)\n"
 "      --restore       launch whatever was launched last (theme, video,\n"
-"                       or pack) instead of a path on the command line —\n"
-"                       the remembered session in\n"
+"                       image, or pack) instead of a path on the command\n"
+"                       line — the remembered session in\n"
 "                       ~/.local/state/reverie/last-session.json, updated\n"
 "                       by every launch and runtime theme switch. Explicit\n"
 "                       flags given now win over the remembered ones\n"
@@ -349,6 +355,11 @@ static void scene_file_free(SceneFile *sf)
 /* reserved raster serial for the synthetic fade layer: real serials are
  * small process-global monotonic counts, so this can never alias one */
 #define REV_FADE_CID 0x7FFFFFFFull
+/* reserved raster serial for the static --image layer (one below the media
+ * black background's REV_FADE_CID-1): the image never changes, so the GPU
+ * tiers upload its texture ONCE and every later frame rebinds it — a
+ * static wallpaper costs one upload total, however many hours it runs */
+#define REV_MEDIA_CID (REV_FADE_CID - 2)
 
 typedef struct {
         SceneFile *sf;          /* ACTIVE scene (rendered + watched)      */
@@ -620,7 +631,7 @@ static void ipc_handler(void *ctx, const IpcMsg *msg, IpcReply *rep)
         }
 }
 
-/* ---- media mode (--video): playback state, IPC, placement ------------------- */
+/* ---- media mode (--video / --image): playback state, IPC, placement --- */
 
 static const char *scale_name(int mode)
 {
@@ -634,6 +645,7 @@ static const char *scale_name(int mode)
 
 typedef struct {
         const char *path;      /* the media file                        */
+        const char *mode;      /* "video" | "image" (STATUS reporting)  */
         bool loop;
         int scale;
         RRenderer *rend;
@@ -659,11 +671,19 @@ static void ipc_handler_media(void *ctx, const IpcMsg *msg, IpcReply *rep)
                 bool vis = !m->plat->surface_visible ||
                            m->plat->surface_visible(m->plat);
                 rep->ok = true;
-                snprintf(rep->text, sizeof rep->text,
-                         "mode=video path=%.200s renderer=%s backend=%s "
-                         "visible=%d scale=%s loop=%d",
-                         m->path, m->rend->name, m->plat->name,
-                         vis ? 1 : 0, scale_name(m->scale), m->loop ? 1 : 0);
+                if (!strcmp(m->mode, "image"))
+                        snprintf(rep->text, sizeof rep->text,
+                                 "mode=image path=%.200s renderer=%s "
+                                 "backend=%s visible=%d scale=%s",
+                                 m->path, m->rend->name, m->plat->name,
+                                 vis ? 1 : 0, scale_name(m->scale));
+                else
+                        snprintf(rep->text, sizeof rep->text,
+                                 "mode=video path=%.200s renderer=%s "
+                                 "backend=%s visible=%d scale=%s loop=%d",
+                                 m->path, m->rend->name, m->plat->name,
+                                 vis ? 1 : 0, scale_name(m->scale),
+                                 m->loop ? 1 : 0);
         } else if (!strcmp(cmd, "QUIT")) {
                 rep->ok = true;
                 snprintf(rep->text, sizeof rep->text, "bye");
@@ -711,7 +731,7 @@ typedef struct {
         u32 sx, sy, sw, sh;    /* source region mapping onto it          */
 } RMediaClip;
 
-static bool media_visible_rect(const RVideoFrame *vf, const RScaleRect *r,
+static bool media_visible_rect(u32 vw, u32 vh, const RScaleRect *r,
                                u32 W, u32 H, RMediaClip *c)
 {
         const i32 dx1 = (i32)W < r->dx + (i32)r->w ? (i32)W : r->dx + (i32)r->w;
@@ -722,14 +742,14 @@ static bool media_visible_rect(const RVideoFrame *vf, const RScaleRect *r,
                 return false;
         c->dw = (u32)(dx1 - c->dx0);
         c->dh = (u32)(dy1 - c->dy0);
-        const f64 kx = (f64)vf->w / (f64)r->w;    /* source px per placed px */
-        const f64 ky = (f64)vf->h / (f64)r->h;
+        const f64 kx = (f64)vw / (f64)r->w;    /* source px per placed px */
+        const f64 ky = (f64)vh / (f64)r->h;
         c->sx = (u32)(((f64)c->dx0 - (f64)r->dx) * kx + 0.5);
         c->sy = (u32)(((f64)c->dy0 - (f64)r->dy) * ky + 0.5);
         c->sw = (u32)((f64)c->dw * kx + 0.5);
         c->sh = (u32)((f64)c->dh * ky + 0.5);
-        if (c->sx + c->sw > vf->w) c->sw = vf->w > c->sx ? vf->w - c->sx : 0;
-        if (c->sy + c->sh > vf->h) c->sh = vf->h > c->sy ? vf->h - c->sy : 0;
+        if (c->sx + c->sw > vw) c->sw = vw > c->sx ? vw - c->sx : 0;
+        if (c->sy + c->sh > vh) c->sh = vh > c->sy ? vh - c->sy : 0;
         return c->sw && c->sh;
 }
 
@@ -766,7 +786,7 @@ static void place_media_rgba(const RVideoFrame *vf, int mode, RFb *fb)
                 return;
         RScaleRect r = rev_scale_place(mode, W, H, vf->w, vf->h);
         RMediaClip c;
-        if (!media_visible_rect(vf, &r, W, H, &c))
+        if (!media_visible_rect(vf->w, vf->h, &r, W, H, &c))
                 return;
         if (!media_scratch_grow((size_t)c.dw * (c.dh + 1) + 16))
                 return;
@@ -785,22 +805,58 @@ static void place_media_rgba(const RVideoFrame *vf, int mode, RFb *fb)
         }
 }
 
+/* Places a decoded static image into a CPU framebuffer under a scaling
+ * mode — the --image twin of place_media_rgba(), with the native bilinear
+ * sampler standing in for swscale (no FFmpeg anywhere on this path).
+ * Same media-mode semantics: opaque black bars, transparent texels
+ * composite over that black, and the same visible-strip bounding so a
+ * 100x10000 source under fill converts only what the viewport shows. */
+static void place_image_rgba(const RevImage *img, int mode, RFb *fb)
+{
+        const u32 W = fb->w, H = fb->h;
+        for (size_t i = 0; i < (size_t)W * H; i++)
+                fb->px[i] = 0xFF000000u;
+        if (!img || !img->px || !img->w || !img->h)
+                return;
+        RScaleRect r = rev_scale_place(mode, W, H, img->w, img->h);
+        RMediaClip c;
+        if (!media_visible_rect(img->w, img->h, &r, W, H, &c))
+                return;
+        if (!media_scratch_grow((size_t)c.dw * (c.dh + 1) + 16))
+                return;
+        rev_resample_bilinear_sub(img->px, img->w, img->h,
+                                  c.sx, c.sy, c.sw, c.sh,
+                                  g_media_scratch, c.dw, c.dh);
+        RFb src = { g_media_scratch, c.dw, c.dh };
+        rev_comp_blend_at(fb, &src, c.dx0, c.dy0, REV_BLEND_NORMAL, 1.0);
+}
+
 /* One media frame through the active renderer. GPU tiers receive a
  * single layer command (YUV planes as vsim, RGBA frames as a pixel
  * layer); the CPU tier converts straight into the framebuffer. A frame
  * that is not decoded yet still presents — black on the CPU tier, the
  * cleared accumulation on GPU tiers — so the compositor always has a
  * buffer. `vd` must be address-stable across frames (renderers key
- * per-layer GPU state on the descriptor's address). */
+ * per-layer GPU state on the descriptor's address).
+ *
+ * `img` is the static --image content (NULL in video mode); its layer
+ * carries a stable content id, so GPU tiers upload the texture ONCE and
+ * rebind it for every later frame. An RGBA image layer needs no video
+ * capability — wants_layers alone gates it, unlike the YUV path. */
 static void render_media_frame(RRenderer *rend, const RVideoFrame *vf,
-                               int mode, RFb *fb, int win)
+                               const RevImage *img, int mode, RFb *fb,
+                               int win)
 {
         const u32 W = fb->w, H = fb->h;
-        const bool gpu_layers = rend->wants_layers && rend->wants_video;
+        const bool gpu_layers = rend->wants_layers &&
+                                (img != NULL || rend->wants_video);
         if (!gpu_layers) {
                 if (!rend->begin(rend, win, W, H))
                         return;
-                place_media_rgba(vf, mode, fb);
+                if (img)
+                        place_image_rgba(img, mode, fb);
+                else
+                        place_media_rgba(vf, mode, fb);
                 rend->end(rend, fb);
                 return;
         }
@@ -826,7 +882,27 @@ static void render_media_frame(RRenderer *rend, const RVideoFrame *vf,
                 bg.content_id = REV_FADE_CID - 1;
                 rend->layer(rend, &bg);
         }
-        if (vf && vf->w) {
+        if (img && img->px) {
+                /* static image layer: stable content id = the texture uploads
+                 * once per (renderer, image) and every later frame is a
+                 * pure rebind + sample — the static-wallpaper fast path */
+                RScaleRect r = rev_scale_place(mode, W, H, img->w, img->h);
+                RLayerCmd cmd;
+                memset(&cmd, 0, sizeof cmd);
+                cmd.px = img->px;
+                cmd.w = img->w;
+                cmd.h = img->h;
+                cmd.place_w = r.w;
+                cmd.place_h = r.h;
+                cmd.dx = r.dx;
+                cmd.dy = r.dy;
+                cmd.blend = REV_BLEND_NORMAL;
+                cmd.opacity = 1.0;
+                cmd.blur = 0.0;
+                cmd.linear = true;
+                cmd.content_id = REV_MEDIA_CID;
+                rend->layer(rend, &cmd);
+        } else if (vf && vf->w) {
                 static RSimVideo vd;    /* one video: one stable descriptor */
                 RScaleRect r = rev_scale_place(mode, W, H, vf->w, vf->h);
                 RLayerCmd cmd;
@@ -1048,7 +1124,8 @@ int main(int argc, char **argv)
                         return 1;
                 }
                 LOGI("restore: replaying the last session (%s)",
-                     a.video_path ? a.video_path : a.scene_path);
+                     a.video_path ? a.video_path
+                     : a.image_path ? a.image_path : a.scene_path);
         }
 
         /* locals carried from the historical parser so the rest of main()
@@ -1114,20 +1191,24 @@ int main(int argc, char **argv)
                 return 0;
         }
 
-        if (!scene_path && !a.video_path) {
+        if (!scene_path && !a.video_path && !a.image_path) {
                 usage();
                 return 1;
         }
 
         LOGI("reverie %s — backend=%s renderer=%s", REV_VERSION, backend_pref, renderer_pref);
 
-        /* ---- content: a scene/theme, or the --video media mode ---------- */
-        const bool media = a.video_path != NULL;
+        /* ---- content: a scene/theme, the --video media mode, or the
+         * --image static media mode (native PNG — no FFmpeg involved) --- */
+        const bool media = a.video_path != NULL || a.image_path != NULL;
         SceneFile sf;
         memset(&sf, 0, sizeof sf);
         char *base_dir = NULL;
         RevVideo *vid = NULL;
-        if (media) {
+        RevImage img;               /* static --image content (px stays NULL
+                                       in every other mode) */
+        memset(&img, 0, sizeof img);
+        if (a.video_path) {
                 RVideoSource vsrc = { .path = a.video_path };
                 vid = rev_video_open(&vsrc, !a.no_loop, err, sizeof err);
                 if (!vid) {
@@ -1137,6 +1218,14 @@ int main(int argc, char **argv)
                 LOGI("media '%s': video mode, scale=%s, loop=%s",
                      a.video_path, scale_name(a.scale),
                      a.no_loop ? "off (hold last frame at EOF)" : "on");
+        } else if (a.image_path) {
+                if (!rev_png_decode_file(a.image_path, &img, err, sizeof err)) {
+                        fprintf(stderr, "reverie: %s\n", err);
+                        return 1;
+                }
+                LOGI("media '%s': image mode, %ux%u, scale=%s "
+                     "(native PNG decode)",
+                     a.image_path, img.w, img.h, scale_name(a.scale));
         } else {
                 base_dir = rev_path_dirname(scene_path);
                 if (!scene_load(&sf, scene_path, base_dir, err, sizeof err)) {
@@ -1171,7 +1260,7 @@ int main(int argc, char **argv)
                         fprintf(stderr, "reverie: out of memory\n");
                         return 1;
                 }
-                if (media) {
+                if (vid) {
                         /* first decoded frame, placed per --scale; the
                          * decode thread needs a moment to start */
                         const RVideoFrame *vf = NULL;
@@ -1180,15 +1269,19 @@ int main(int argc, char **argv)
                                 usleep(2000);
                         }
                         place_media_rgba(vf, a.scale, &fb);
+                } else if (a.image_path) {
+                        /* already decoded, synchronously, before this point */
+                        place_image_rgba(&img, a.scale, &fb);
                 } else {
                         rtscene_render(sf.sc, &fb, 0, 0.0, 1.0 / 60.0);
                 }
-                RevImage img = { out_w, out_h, fb.px };
-                if (!rev_png_encode_file(out_png, &img, err, sizeof err)) {
+                RevImage shot = { out_w, out_h, fb.px };
+                if (!rev_png_encode_file(out_png, &shot, err, sizeof err)) {
                         fprintf(stderr, "reverie: %s\n", err);
                         free(fb.px);
                         if (vid)
                                 rev_video_close(vid);
+                        rev_image_free(&img);
                         free(base_dir);
                         return 1;
                 }
@@ -1196,6 +1289,7 @@ int main(int argc, char **argv)
                 free(fb.px);
                 if (vid)
                         rev_video_close(vid);
+                rev_image_free(&img);
                 media_scratch_free();
                 scene_file_free(&sf);
                 free(base_dir);
@@ -1257,6 +1351,7 @@ int main(int argc, char **argv)
                 platform_destroy(plat);
                 if (vid)
                         rev_video_close(vid);
+                rev_image_free(&img);
                 scene_file_free(&sf);
                 free(base_dir);
                 return 1;
@@ -1273,6 +1368,7 @@ int main(int argc, char **argv)
                 platform_destroy(plat);
                 if (vid)
                         rev_video_close(vid);
+                rev_image_free(&img);
                 scene_file_free(&sf);
                 free(base_dir);
                 return 1;
@@ -1321,7 +1417,8 @@ int main(int argc, char **argv)
         st.run = &g_run;
         MediaIpc mipc;
         memset(&mipc, 0, sizeof mipc);
-        mipc.path = a.video_path;
+        mipc.path = a.video_path ? a.video_path : a.image_path;
+        mipc.mode = a.image_path ? "image" : "video";
         mipc.loop = !a.no_loop;
         mipc.scale = a.scale;
         mipc.rend = rend;
@@ -1706,16 +1803,20 @@ int main(int argc, char **argv)
                 if (render_now) {
                         /* media mode: advance the playhead ONCE per frame
                          * (frozen while hidden — dt is 0 above), then the
-                         * same per-monitor present machinery */
-                        const RVideoFrame *vf = media
+                         * same per-monitor present machinery. Static image
+                         * mode has no playhead: the same RevImage every
+                         * frame (GPU tiers rebind the cached texture). */
+                        const RVideoFrame *vf = vid
                                 ? rev_video_display(vid, dt) : NULL;
+                        const RevImage *mimg = a.image_path ? &img : NULL;
                         for (int i = 0; i < nmon; i++) {
                                 if (winidx[i] < 0 || !fbs[i].px)
                                         continue;
                                 f64 r_t0 = rev_monotonic();
                                 if (media) {
-                                        render_media_frame(rend, vf, a.scale,
-                                                           &fbs[i], winidx[i]);
+                                        render_media_frame(rend, vf, mimg,
+                                                           a.scale, &fbs[i],
+                                                           winidx[i]);
                                 } else if (gpu_layers) {
                                         fl.w = fbs[i].w;
                                         fl.h = fbs[i].h;
@@ -1839,9 +1940,9 @@ int main(int argc, char **argv)
                                                 snprintf(path, sizeof path, "%s.%d.png", shot_file, i);
                                         else
                                                 snprintf(path, sizeof path, "%s.png", shot_file);
-                                        RevImage img = { sw, sh, shot };
+                                        RevImage snap = { sw, sh, shot };
                                         char e2[256] = { 0 };
-                                        if (rev_png_encode_file(path, &img, e2, sizeof e2))
+                                        if (rev_png_encode_file(path, &snap, e2, sizeof e2))
                                                 LOGI("screenshot: %s (%ux%u)", path, sw, sh);
                                         else
                                                 LOGW("screenshot failed: %s", e2);
@@ -1952,8 +2053,13 @@ int main(int argc, char **argv)
                  * (uploads happen at video speed, not render speed). */
                 int fps = fps_override > 0
                         ? fps_override
-                        : (media ? (int)(rev_video_fps(vid) + 0.5)
-                                 : rtscene_fps(sf.sc));
+                        : (vid ? (int)(rev_video_fps(vid) + 0.5)
+                               : (media ? 2 : rtscene_fps(sf.sc)));
+                /* a static image paces at 2 fps: nothing changes between
+                 * frames, the GPU tier is a cached-texture rebind, and the
+                 * CPU tier re-places twice a second — while keeping the IPC
+                 * pump responsive (a 1 s command latency would brush the
+                 * 2 s client timeout). --fps overrides if you disagree */
                 if (fps_override <= 0 && plat->monitor_refresh) {
                         /* cap scene fps to the fastest connected display — the
                          * extra frames could never be shown (they would just
@@ -2027,6 +2133,7 @@ int main(int argc, char **argv)
         platform_destroy(plat);
         if (vid)
                 rev_video_close(vid);
+        rev_image_free(&img);
         media_scratch_free();
         scene_file_free(&sf);
         scene_file_free(&st.next);
