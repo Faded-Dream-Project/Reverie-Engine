@@ -82,8 +82,8 @@ jobs:
           if ldd build/reverie | grep -iE 'libav(codec|format|util)|libswscale'; then
             echo "FAIL: the ENABLE_FFMPEG=0 build links FFmpeg"; exit 1
           fi
-          ./build/reverie --scene scenes/mountain-dusk.rev -o -s 64x36 -O stub-scene.png
-          ./build/reverie --video scenes/mountain-dusk.rev 2>&1 | grep -q "no video support" \
+          ./build/reverie --scene themes/mountain-dusk/scene.rev -o -s 64x36 -O stub-scene.png
+          ./build/reverie --video themes/mountain-dusk/scene.rev 2>&1 | grep -q "no video support" \
             || { echo "FAIL: media mode did not refuse on the stub build"; exit 1; }
           # ENABLE_FFMPEG=1 with NO headers anywhere must be a clear error
           mv contrib /tmp/ff-contrib-hidden
