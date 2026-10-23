@@ -385,22 +385,30 @@ static u32 id_compositor, id_shell, id_seat, id_output, id_surface, id_layer_sur
 static u32 id_shm, id_pool, id_buf[2];
 static int pool_fd = -1;
 static u32 pool_size_seen;
-static int attach_count;              /* attach #1 -> slot 0, #2 -> slot 1, #3 -> slot 0 again */
+static volatile int attach_count;     /* attach #1 -> slot 0, #2 -> slot 1, #3 -> slot 0 again.
+                                        * volatile: written by the server thread, POLLED by
+                                        * the main thread — a plain int let the optimizer
+                                        * hoist the poll out of its wait loop (exposed by
+                                        * an ASan build's layout shift, 2026-10) */
 static bool saw_pool, saw_buf[2], saw_attach, saw_cycling;
 static bool saw_layer0, saw_ns_reverie, saw_size00, saw_anchor15, saw_zone_neg1, saw_interact0, saw_ack77;
-static bool closed_sent, pointer_sent, saw_configure_sent;
+static bool closed_sent, saw_configure_sent;
+static volatile int retire_on_sync; /* test gate: the NEXT roundtrip retires the
+                                        * layer surface (set at teardown — burst-leg
+                                        * syncs must NOT trigger it) */
 static volatile int hold_releases;   /* test gate: server skips wl_buffer.release */
 static volatile int hold_frame_cbs;   /* test gate: server DEFERS wl_callback.done —
                                         * a starved surface gets no latch, exactly
                                         * like a compositor not drawing it      */
 static u32 held_cb;                  /* the deferred callback object id           */
-static int frame_cb_replies;         /* wl_callback.done replies sent           */
+static volatile int frame_cb_replies; /* wl_callback.done replies sent (server thread
+                                        * increments; main thread reads the counter) */
 static int pending_fd = -1;           /* fd captured from the stream (SCM_RIGHTS) */
 /* GPU-premul contract (vulkan tier hands premultiplied bytes): the next
  * presented frame must appear in the pool VERBATIM — set before presenting,
  * consumed by the server thread's pixel verification */
 static volatile int expect_verbatim;
-static u32 expect_px100, expect_px7;
+static volatile u32 expect_px100, expect_px7;   /* main sets, server verifies */
 
 static int failures = 0;
 #define CHECK(cond, msg) \
@@ -560,7 +568,6 @@ static void send_pointer_events(void)
                 s_put32(b + 12, 0);        /* released */
                 s_send(id_pointer, 3, b, 16);   /* button release */
         }
-        pointer_sent = true;
 }
 
 /* ---- the server thread: the whole conversation ------------------------------- */
@@ -614,11 +621,33 @@ static void *server(void *arg)
                 u8 t = s_type_of(obj);
 
                 if (t == T_DISPLAY && op == 0) {
-                        /* a later roundtrip: after the pointer events have been
-                         * consumed, retire the layer surface (closed) first */
-                        if (pointer_sent && !closed_sent) {
+                        /* a later roundtrip: retire the layer surface right
+                         * before replying when the test asks for it (the
+                         * teardown leg) — gated explicitly because the
+                         * drop-accounting leg now syncs too, and closed must
+                         * not fire there */
+                        if (retire_on_sync && !closed_sent) {
                                 s_send(id_layer_surface, 1, NULL, 0);
                                 closed_sent = true;
+                        }
+                        /* Release flush. A real compositor releases a wl_buffer
+                         * when it is done scanning it out — not only when the
+                         * next commit arrives. The drop-accounting scenario
+                         * (hold releases, burst three presents) leaves both
+                         * slots in flight while the client's subsequent
+                         * presents are dropped BEFORE any commit exists that
+                         * could trigger releases — a deadlock the old
+                         * "usleep until releases land" could only win by
+                         * thread-timing luck (it flipped with the ASan
+                         * build's code layout; pristine-tree repro 2026-10).
+                         * Flushing held releases on every roundtrip makes it
+                         * deterministic: the test syncs right after clearing
+                         * the hold, and the sync callback lands after the
+                         * release events (wire order), so both slots are
+                         * provably free when wlshim_sync() returns. */
+                        if (attach_count >= 2 && !hold_releases) {
+                                s_send(id_buf[0], 0, NULL, 0);   /* release */
+                                s_send(id_buf[1], 0, NULL, 0);   /* release */
                         }
                         reply_sync(s_get32(msg + 8));
                         continue;
@@ -1065,7 +1094,11 @@ int main(void)
                         CHECK(frame_cb_replies >= 2,
                               "server saw and answered the frame callback requests");
                         hold_releases = 0;
-                        usleep(100000);        /* releases land; both slots free */
+                        wlshim_sync();         /* server flushes the held releases
+                                                 * on the roundtrip — the sync
+                                                 * callback lands after them (wire
+                                                 * order), so both slots are
+                                                 * provably free on return */
 
                         /* 5c. GPU-premultiplied input (vulkan tier): the
                          * presenter must take it VERBATIM — one memcpy, no
@@ -1139,6 +1172,7 @@ int main(void)
 
                 /* 6. roundtrip: the server retires the layer surface right
                  * before replying — closed must be dispatched by then. */
+                retire_on_sync = 1;
                 wlshim_sync();
                 CHECK(wlshim_should_close(), "layer surface closed detected");
         }
