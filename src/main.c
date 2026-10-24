@@ -1498,6 +1498,20 @@ int main(int argc, char **argv)
         bool prev_visible = true;
         bool prev_active = true;
         bool idle_note_shown = false;
+        /* transition-log damper (defense in depth for the idle state): the
+         * wlshim debounce should make hidden/visible transitions rare and
+         * meaningful, but a compositor that flip-flops its latch answers
+         * would still buy a log line per flap. After FLAPS_MAX transitions
+         * inside FLAPS_WIN seconds the transition logs go quiet (one line
+         * says so, once) until the state holds stable for FLAPS_SETTLE
+         * seconds — rendering/pacing are NEVER affected, only the logging. */
+#define IDLE_FLAPS_MAX 6
+#define IDLE_FLAPS_WIN 30.0
+#define IDLE_FLAPS_SETTLE 5.0
+        f64 idle_flap_t[IDLE_FLAPS_MAX] = {0};
+        int idle_flap_n = 0;
+        bool idle_flap_quiet = false;
+        f64 idle_last_stable = 0;
         /* idle watchdog (REV_IDLE_AUDIT_S, default 30, 0 = off): after this
          * many SECONDS of continuous "hidden", force one 1 s full-rate
          * audit burst. If the visibility evidence ever wedges (a compositor
@@ -1670,19 +1684,53 @@ int main(int argc, char **argv)
 
                 if (prof_on && visible && nframe_ms < PERF_RING)
                         frame_ms[nframe_ms++] = dt * 1000.0;
-                if (!visible && !idle_note_shown) {
-                        idle_note_shown = true;
-                        if (wsi_probe)
-                                LOGI("idle: no surface is being shown — "
-                                     "rendering at probe rate only (WSI "
-                                     "presents ~4 Hz carry the frame "
-                                     "requests; scene clock frozen)");
-                        else
-                                LOGI("idle: no surface is being shown — rendering paused "
-                                     "(compositor probe ~4 Hz, scene clock frozen)");
-                } else if (visible && idle_note_shown) {
-                        idle_note_shown = false;
-                        LOGI("idle: surface visible again — rendering resumed");
+                const bool idle_flip = (!visible && !idle_note_shown) ||
+                                       (visible && idle_note_shown);
+                if (idle_flip) {
+                        /* record the transition for the damper */
+                        memmove(idle_flap_t, idle_flap_t + 1,
+                                sizeof idle_flap_t - sizeof idle_flap_t[0]);
+                        idle_flap_t[IDLE_FLAPS_MAX - 1] = now;
+                        if (idle_flap_n < IDLE_FLAPS_MAX)
+                                idle_flap_n++;
+                        const bool flapping = idle_flap_n == IDLE_FLAPS_MAX &&
+                              now - idle_flap_t[0] <= IDLE_FLAPS_WIN;
+                        idle_last_stable = now;
+                        if (flapping && !idle_flap_quiet) {
+                                idle_flap_quiet = true;
+                                idle_note_shown = !visible;    /* keep the
+                                 * state machine in step — the damper only
+                                 * silences LOGS, never bookkeeping */
+                                LOGW("idle: visibility state is oscillating — "
+                                     "transition logs suppressed until it "
+                                     "settles (rendering itself is unaffected)");
+                        } else if (!idle_flap_quiet) {
+                                if (!visible) {
+                                        idle_note_shown = true;
+                                        if (wsi_probe)
+                                                LOGI("idle: no surface is being shown — "
+                                                     "rendering at probe rate only (WSI "
+                                                     "presents ~4 Hz carry the frame "
+                                                     "requests; scene clock frozen)");
+                                        else
+                                                LOGI("idle: no surface is being shown — "
+                                                     "rendering paused (compositor probe "
+                                                     "~4 Hz, scene clock frozen)");
+                                } else {
+                                        idle_note_shown = false;
+                                        LOGI("idle: surface visible again — "
+                                             "rendering resumed");
+                                }
+                        } else {
+                                /* quiet: state still moves, bookkeeping only */
+                                idle_note_shown = !visible;
+                        }
+                } else if (idle_flap_quiet &&
+                           now - idle_last_stable >= IDLE_FLAPS_SETTLE) {
+                        idle_flap_quiet = false;
+                        idle_flap_n = 0;
+                        LOGI("idle: visibility settled after oscillating — "
+                             "transition logs re-enabled");
                 }
                 if (visible) {
                         if (prev_visible) {
@@ -2079,7 +2127,11 @@ int main(int argc, char **argv)
                  * frames, the GPU tier is a cached-texture rebind, and the
                  * CPU tier re-places twice a second — while keeping the IPC
                  * pump responsive (a 1 s command latency would brush the
-                 * 2 s client timeout). --fps overrides if you disagree */
+                 * 2 s client timeout). --fps overrides if you disagree.
+                 * Visibility at this pace lives on the wlshim idle probes
+                 * (fired inside wait_frame between the sparse presents —
+                 * see wlshim.c), NOT on present timestamps, so 0.5 s pacing
+                 * cannot starve the 0.25 s evidence window. */
                 if (fps_override <= 0 && plat->monitor_refresh) {
                         /* cap scene fps to the fastest connected display — the
                          * extra frames could never be shown (they would just

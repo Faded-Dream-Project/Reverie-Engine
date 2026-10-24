@@ -49,6 +49,7 @@
 
 #include "log.h"
 #include "rev_types.h"
+#include "util.h"
 #include "wlshim.h"
 
 /* ---- tiny server helpers (mirrored from tests/test_wayland.c) -------------- */
@@ -1003,9 +1004,13 @@ int main(void)
 
                         wlshim_set_vis_timeout(0.08);
                         hold_frame_cbs = 1;          /* compositor stops latching */
-                        usleep(200000);              /* > grace (2x80ms) and > vis */
+                        /* > the DEBOUNCED window: 2x80 ms grace is subsumed by
+                         * 80 ms starvation + one 250 ms probe interval of
+                         * debounce (both visibility branches carry it — a
+                         * slow-paced surface must not flap hidden/visible) */
+                        usleep(400000);
                         CHECK(!wlshim_surface_visible(),
-                              "WSI starvation past the window: hidden — present "
+                              "WSI starvation past the debounced window: hidden — present "
                               "backpressure would NOT have proven this");
                         /* the engine's probe response: render_vk arms a fresh
                          * frame request right before every present; the commit
@@ -1014,7 +1019,9 @@ int main(void)
                               "probe render armed its frame request");
                         CHECK(wlshim_wsi_test_commit(win),
                               "probe present committed on the WSI surface");
-                        usleep(50000);
+                        /* past the debounced window again: the held probe
+                         * request buys no evidence */
+                        usleep(400000);
                         CHECK(!wlshim_surface_visible(),
                               "probe unanswered while the compositor sleeps");
                         hold_frame_cbs = 0;          /* compositor comes back */
@@ -1146,9 +1153,14 @@ int main(void)
                         int replies_before = frame_cb_replies;
                         int att5 = attach_count;
                         hold_frame_cbs = 1;         /* compositor stops drawing us */
-                        usleep(150000);             /* > the 80ms starvation window */
+                        /* > the DEBOUNCED window: 80 ms starvation + one
+                         * 250 ms probe interval of grace (the debounce is
+                         * what keeps a slow-paced shown surface — a static
+                         * --image at 2 fps — from oscillating hidden/
+                         * visible ~2 Hz; see wlshim_surface_visible) */
+                        usleep(400000);
                         CHECK(!wlshim_surface_visible(),
-                              "starvation past the window: hidden (rendering would pause)");
+                              "starvation past the debounced window: hidden (rendering would pause)");
                         wlshim_pump(NULL);           /* fires the first idle probe */
                         usleep(50000);
                         CHECK(attach_count > att5,
@@ -1165,6 +1177,29 @@ int main(void)
                               "probe answered by the revived compositor — visible again");
                         CHECK(frame_cb_replies > replies_before,
                               "the deferred callback was answered on the wire");
+
+                        /* REGRESSION (the field-report flap): between a
+                         * static --image's own 2 fps presents the surface
+                         * lives ENTIRELY on idle-probe answers — the daemon
+                         * paces through wait_frame() and the probes fired
+                         * inside that wait must keep the latch evidence
+                         * flowing. Simulate the gap precisely: no presents
+                         * for 4 x 0.45 s, an absolute grid deadline, and a
+                         * healthy compositor answering every probe. Before
+                         * the fix the evidence went stale mid-sleep and the
+                         * visibility flipped every ~0.5 s — ~2 Hz of
+                         * pause/resume log spam and a 1.4 fps perf line. */
+                        wlshim_wait_frame(0.05);   /* collect pending cb: slot free */
+                        bool slow_stable = true;
+                        for (int i = 0; i < 4; i++) {
+                                f64 dl = rev_monotonic() + 0.45;
+                                while (rev_monotonic() < dl)
+                                        wlshim_wait_frame(dl - rev_monotonic());
+                                if (!wlshim_surface_visible())
+                                        slow_stable = false;
+                        }
+                        CHECK(slow_stable,
+                              "static-image gap (probes answered) stays visible — no flap");
                         wlshim_set_vis_timeout(-1);  /* restore env/default */
                         hold_frame_cbs = 0;
                         free(frame);

@@ -72,12 +72,26 @@ A wallpaper daemon runs all day, and most of that time nobody is looking
 at it. On the wl_shm present path the shim watches `wl_callback.done`
 traffic: when a surface stops being latched — a fullscreen app covering
 the wallpaper, the display going to sleep — the callbacks stop, and after
-a 250 ms starvation window the daemon **stops rendering entirely**: no GPU
+a **debounced** starvation window (the `REV_WL_VIS_MS` window PLUS one
+250 ms probe interval) the daemon **stops rendering entirely**: no GPU
 work, no simulations, no presents, the animation clock frozen. An idle
 probe re-attaches the current buffer ~4 Hz (a same-pixels repaint — the
 cheapest unambiguous "are you still there?"), and the first latched
 callback resumes full-rate rendering exactly where the scene froze.
-`REV_WL_VIS_MS` tunes the starvation window.
+`REV_WL_VIS_MS` tunes the starvation half of the window.
+
+The debounce and the probe cadence are load-bearing together: a
+slow-paced surface — a static `--image` paces at 2 fps — lives on probe
+answers between its own sparse presents, and the probes fire both from
+the platform pump (once per frame tick) **and from inside
+`wlshim_wait_frame`** during long pacing sleeps, so the latch evidence
+never goes stale mid-sleep. Before both halves existed, such surfaces
+oscillated hidden/visible ~2 Hz forever — a field report logged the
+flap: "rendering paused"/"resumed" alternating every half second and
+a 1.4 fps perf line. A genuinely hidden surface still trips inside the
+debounced window because its probes go unanswered; and a log damper in
+the daemon silences transition logging if a compositor ever oscillates
+its latch answers anyway (rendering itself is never affected).
 
 **The WSI swapchain path (`REV_VK_PRESENT=wsi`) idles too.** The shim
 cannot re-attach swapchain buffers (the driver owns the commits), so the
@@ -429,7 +443,7 @@ selects.
 | `REV_WL_LIB`        | explicit `libwayland-client.so` path for the shim (tests pin a known library; default: system soname) |
 | `REV_GL_FLUID_SW`   | `1` = run the GPU fluid solver even on software GL (test hook; hardware GL always uses it) |
 | `REV_WL_TRACE`      | `1` = dump raw Wayland wire traffic to stderr (diagnostics) |
-| `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long flips the daemon to paused — see "Idle power-save") |
+| `REV_WL_VIS_MS`     | idle power-save starvation window in ms (default 250; a wl_shm-presented surface unlatched this long — plus one 250 ms probe-interval debounce — flips the daemon to paused — see "Idle power-save") |
 | `REV_IDLE_AUDIT_S`  | idle watchdog interval in seconds (default 30, 0 = off): after this long continuously hidden, a 1 s full-rate audit burst guards against a wedged idle detector |
 | `REV_X11_DPMS_FILE` | TEST hook: a file naming the display level (`on`/`standby`/`suspend`/`off`) that overrides the X11 DPMS wire query — drives the idle machinery deterministically on any server |
 | `REV_HOTPLUG_S`     | monitor re-enumeration / window reconcile interval in seconds (default 2, `0` = off; disabled automatically when `-m` pinned a monitor). See "Output hotplug" |

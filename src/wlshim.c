@@ -1287,6 +1287,12 @@ bool wlshim_present_cpu(int win, const u32 *rgba, u32 w, u32 h, bool premultipli
 
 /* ---- visibility / idle power-save ------------------------------------------ */
 
+/* Idle probes are throttled to this cadence and only sent for starved
+ * windows. It also sets the visibility debounce: a wl_shm window counts as
+ * hidden only after the evidence window (REV_WL_VIS_MS) AND one full probe
+ * interval have passed with no latch — see wlshim_surface_visible. */
+#define WL_PROBE_INTERVAL 0.25
+
 /* A visible surface gets wl_callback.done at the compositor's repaint rate.
  * A gap far past that means the surface is not being drawn at all — most
  * often a fullscreen app covering the wallpaper, or the display asleep —
@@ -1341,7 +1347,14 @@ bool wlshim_surface_visible(void)
                         any_ours = true;
                         if (now - w->wsi_since < 2.0 * vis)
                                 return true;    /* grace: no callback yet possible */
-                        if (w->last_done > 0 && now - w->last_done < vis)
+                        /* latched recently — same vis + one-probe-interval
+                         * debounce as the wl_shm branch below: while hidden,
+                         * the daemon's WSI probe presents run at the idle
+                         * pace (one per WL_PROBE_INTERVAL), so a shown
+                         * surface's freshest evidence can be one interval
+                         * old at the check. Without the grace a slow-paced
+                         * WSI surface flaps exactly like the wl_shm one. */
+                        if (w->last_done > 0 && now - w->last_done < vis + WL_PROBE_INTERVAL)
                                 return true;    /* latched recently */
                         continue;
                 }
@@ -1350,7 +1363,19 @@ bool wlshim_surface_visible(void)
                 any_ours = true;
                 f64 last = w->last_done > w->last_present ? w->last_done
                                                           : w->last_present;
-                if (now - last < vis)
+                /* DEBOUNCED hidden: the evidence window PLUS one probe
+                 * interval. A shown-but-slow surface (a static --image paces
+                 * at 2 fps — 0.5 s between presents) lives entirely on idle
+                 * probe answers between its own frames; the probes fire at
+                 * WL_PROBE_INTERVAL cadence, so their evidence can be up to
+                 * one interval old at any check. Demanding freshness inside
+                 * the bare evidence window made such surfaces oscillate
+                 * hidden/visible ~2 Hz forever (field report: an image
+                 * wallpaper flapping 'rendering paused'/'resumed' every
+                 * half second). One probe interval of grace absorbs the
+                 * cadence; a genuinely hidden surface still trips within
+                 * vis + interval because its probes go unanswered. */
+                if (now - last < vis + WL_PROBE_INTERVAL)
                         return true;
         }
         return !any_ours;
@@ -1444,9 +1469,9 @@ static void shim_probe(ShimWin *w)
         S.flush(S.display);
 }
 
-/* Probes are throttled to ~4 Hz and only sent for starved windows. */
-#define WL_PROBE_INTERVAL 0.25
-
+/* Probes are throttled to ~4 Hz and only sent for starved windows —
+ * fired from wlshim_pump() at frame ticks AND from wlshim_wait_frame()
+ * during long pacing sleeps (see the comment there). */
 static void shim_idle_probes(void)
 {
         f64 now = rev_monotonic();
@@ -1567,6 +1592,19 @@ bool wlshim_wait_frame(f64 seconds)
                         S.dispatch(S.display);
                 else
                         S.dispatch_pending(S.display);
+
+                /* Keep visibility evidence alive DURING the pacing sleep:
+                 * wlshim_pump() (which fires the idle probes) only runs once
+                 * per frame tick, but a slow-paced surface sleeps far longer
+                 * than the evidence window between ticks (static --image: 2
+                 * fps pacing, 0.25 s window). Without probes inside the wait
+                 * the evidence went stale mid-sleep, the tick's visibility
+                 * check flipped hidden, the pump's probe flipped it back —
+                 * a ~2 Hz flap of pause/resume logs and a 1.4 fps perf line
+                 * (field report). shim_idle_probes() self-throttles to the
+                 * 4 Hz cadence and only touches starved windows, so this is
+                 * a no-op at full frame rates. */
+                shim_idle_probes();
 
                 bool any = false;
                 for (int i = 0; i < S.nwins; i++) {
