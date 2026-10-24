@@ -22,7 +22,7 @@ typedef int64_t   i64;
 typedef float     f32;
 typedef double    f64;
 
-#define REV_VERSION "0.2.0-dev"
+#define REV_VERSION "0.1.0"
 
 /* Straight (non-premultiplied) 8-bit RGBA color. */
 typedef struct { u8 r, g, b, a; } RColor;
