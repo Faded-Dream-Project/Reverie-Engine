@@ -300,6 +300,40 @@ int main(void)
                 CHECK(bad2 == NULL, "unterminated comment refused");
         }
 
+        /* 12. comma-separated path coordinates: Illustrator writes
+         *     "M0,90 L14,44", Inkscape writes "M0 90 L14 44" — the SVG
+         *     grammar allows both, and the comma form used to parse as a
+         *     failed path (silently blank layer). */
+        {
+                const char *spaces =
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>"
+                        "<path d='M8 8 L56 8 L56 56 L8 56 Z' fill='#ffcc00'/>"
+                        "</svg>";
+                const char *commas =
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>"
+                        "<path d='M8,8 L56,8 L56,56 L8,56 Z' fill='#ffcc00'/>"
+                        "</svg>";
+                const char *mixed =
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='64' height='64'>"
+                        "<path d='M8,8L56,8L56,56L8,56Z' fill='#ffcc00'/>"
+                        "</svg>";
+                u32 *ref = render(spaces);
+                CHECK(ref != NULL, "space-separated path parses (reference)");
+                u32 *rc = render(commas);
+                CHECK(rc != NULL, "comma-separated path parses");
+                if (ref && rc)
+                        CHECK(memcmp(ref, rc, (size_t)W * H * 4) == 0,
+                              "comma path renders identical to space path");
+                free(rc);
+                u32 *rm = render(mixed);
+                CHECK(rm != NULL, "comma-as-only-separator path parses");
+                if (ref && rm)
+                        CHECK(memcmp(ref, rm, (size_t)W * H * 4) == 0,
+                              "comma-only path renders identical");
+                free(rm);
+                free(ref);
+        }
+
         if (g_fails == 0)
                 printf("  svg: OK\n");
         return g_fails != 0;

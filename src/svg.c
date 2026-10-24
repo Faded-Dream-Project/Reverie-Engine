@@ -552,8 +552,11 @@ typedef struct {
 
 static void ps_ws(PScan *s)
 {
-	while (*s->p && isspace((unsigned char)*s->p))
+	while (*s->p && (isspace((unsigned char)*s->p) || *s->p == ','))
 		s->p++;
+	/* commas are coordinate separators exactly like whitespace in the SVG
+	 * grammar ("M0,90 L14,44") — Illustrator exports them, Inkscape uses
+	 * spaces; before this the comma form silently rendered nothing */
 }
 
 static bool ps_num(PScan *s, f64 *out)
