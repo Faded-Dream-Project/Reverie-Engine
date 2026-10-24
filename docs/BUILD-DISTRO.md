@@ -54,6 +54,24 @@ are found on every architecture without editing anything.
 * Autostart: an XDG-Autostart-aware session; systemd is optional
   (docs/AUTOSTART.md).
 
+## Release packages
+
+Binary packages — `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL,
+openSUSE), `.pkg.tar.zst` (Arch), `.apk` (Alpine), `.xbps` (Void), and
+a portable `.tar.gz` — are built by CI **inside each distribution's
+own container** (the `package` job, on `v*` tags) so the FFmpeg
+sonames, libc, and package format always match the target. Every
+package carries both binaries (`reverie` and `revtool`) plus the
+documentation, and every build is self-tested: the freshly built
+package is installed back into the container it was built in before it
+is allowed to become a release artifact.
+
+`scripts/make-package.sh <debian|fedora|opensuse|arch|alpine|void|tarball>
+[version] [release]` is the builder — run it from a built checkout
+inside the matching environment, and it stages `/usr/bin` +
+`/usr/share/doc/reverie`, builds the package, installs it, checks both
+binaries answer `--help`, and removes it again.
+
 ## What is actually verified where
 
 * **CI containers** (`.github/workflows/ci.yml`, job `distro-matrix`):

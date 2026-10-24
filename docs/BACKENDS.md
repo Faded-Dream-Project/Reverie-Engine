@@ -276,7 +276,7 @@ selects.
   while a real GPU sat behind it). The selected device, its type, Vulkan
   version, driver version, and the honest hardware/software verdict are
   logged.
-* **GPU compute compositing (0.2.0 — the fix for the third field report):**
+* **GPU compute compositing (dev 0.2.0 — the fix for the third field report):**
   the tier used to be PRESENT-ONLY (the engine composited on the CPU and
   uploaded finished frames; the reporter measured sim climbing to 37.5 ms
   on ripple-lake). Now every layer operation runs as a SPIR-V compute
@@ -308,13 +308,13 @@ selects.
   that stalled on failed presents is what made the WSI path report
   `gpu=0.0 "unavailable"` in the fifth field report while init had just
   logged the queries as available.
-* **Present paths (mechanism unchanged since 0.1.1, fed by GPU frames —
-  staging fixed in 0.2.0 after the fourth field report):**
+* **Present paths (mechanism unchanged since dev 0.1.1, fed by GPU frames —
+  staging fixed in dev 0.2.0 after the fourth field report):**
   - *platform present (default)* — the finished image is copied to a
     host-visible buffer and handed to the backend's proven presenter
     (MIT-SHM on X11, wl_shm on Wayland). Same pixels, same window, the
     mechanism every field report confirmed; the GPU does all the rendering.
-    The 0.2.0 fix, in two parts:
+    The dev 0.2.0 fix, in two parts:
     - **The staging buffer is HOST_CACHED memory.** It used to prefer
       DEVICE_LOCAL among host-visible types, which on a discrete GPU means
       a BAR window into VRAM: *uncached* CPU reads, ~500 ns per 4-byte
@@ -352,7 +352,7 @@ selects.
     presented FIFO, zero-copy. Surfaces that only offer _SRGB swapchain
     formats get one sRGB-decode compute pass first so the blit's encode
     roundtrips to the identity.
-    The 0.2.0 wedge-free acquire flow (fifth field report: 1.0 fps,
+    The dev 0.2.0 wedge-free acquire flow (fifth field report: 1.0 fps,
     frozen wallpaper, `frame p50` exactly 1000.0 ms): images are acquired
     in 8 ms slices with the platform event queue pumped between attempts
     (Wayland WSI releases and input flow while waiting), a frame gives up
@@ -362,7 +362,7 @@ selects.
     fence is reset only after an image is actually acquired — the old
     code reset it first and could return without ever submitting, leaving
     every later frame waiting a dead fence for a full second each.
-  The default stays platform-SHM because the 0.1.0 WSI path had a black
+  The default stays platform-SHM because the dev 0.1.0 WSI path had a black
   screen on one real XWayland stack; both paths are E2E-tested and
   pixel-exact. Device loss (`VK_ERROR_DEVICE_LOST`) at submit or present
   is reported explicitly and stops presenting; OUT_OF_DATE recreates the
@@ -459,7 +459,7 @@ selects.
 ## Troubleshooting
 
 * **WSI present wedged at exactly 1 s/frame + every blue rendered red
-  (0.2.0 postmortem, the fifth field report)** — field report:
+  (dev 0.2.0 postmortem, the fifth field report)** — field report:
   `REV_VK_PRESENT=wsi` on the GTX 1050 Ti ran at 1.0–1.6 fps with the
   wallpaper frozen and `frame p50` pinned at exactly 1000.0 ms; separately,
   choosing the Vulkan tier turned the theme's blue/purple into
@@ -637,7 +637,7 @@ selects.
   single-threaded solver; if `render+present` dominates on a *hardware*
   GPU, look at the driver path instead. Truly idle-CPU simulation means
   GPU compute — which both GPU tiers now do (`-R opengl`, and `-R vulkan`
-  since 0.2.0; the CPU tier keeps its documented single-core cost).
+  since dev 0.2.0; the CPU tier keeps its documented single-core cost).
 * **`eglCreateWindowSurface failed (0x300b)` with `--renderer opengl` on
   Wayland (dev-cycle postmortem)** — field report: with `REV_WAYLAND_GPU=1`
   active, the GL tier died at "renderer init" with EGL error 0x300b
@@ -666,7 +666,7 @@ selects.
   (Mesa ships both; hybrid NVIDIA setups must point EGL at a vendor that
   supports the Wayland platform).
 * **`invalid arguments for zwlr_layer_surface_v1#N.set_size` at startup
-  (0.1.6 postmortem)** — field report on a strict compositor: BOTH Wayland
+  (dev 0.1.6 postmortem)** — field report on a strict compositor: BOTH Wayland
   paths (`REV_WAYLAND_GPU=1` and the raw client behind `--renderer
   opengl`) died at "monitor 0: window creation failed" with a
   `wl_display` error naming `set_size`, a request reverie's opcode table
@@ -686,13 +686,13 @@ selects.
   the shim's `wl_message` metadata, and both fake servers from the
   canonical XML: `set_size(0,0)+anchor(all)+zone(-1)+interactivity(none)`
   in real opcodes, `ack_configure` at opcode 6, per-request wire sizes
-  enforced, and an A/B proof that the 0.1.5 client fails the corrected
+  enforced, and an A/B proof that the dev 0.1.5 client fails the corrected
   suite with the exact field symptom while the fixed one passes. Bonus
   fix: the pre-v4 `damage` fallback now sends the protocol's 16-byte
   payload with logical coordinates. If you still see a compositor error
-  after 0.1.6, run with `REV_WL_TRACE=1` and check the reported
+  after dev 0.1.6, run with `REV_WL_TRACE=1` and check the reported
   request name against the XML tables in `tests/test_wayland.c`.
-* **`REV_WAYLAND_GPU=1` segfaults at startup / listener tables (0.1.5
+* **`REV_WAYLAND_GPU=1` segfaults at startup / listener tables (dev 0.1.5
   postmortem)** — field report on KWin: the daemon died with a silent
   SIGSEGV right after loading the scene, before any backend log line.
   Root cause: `wl_output` was bound at **version 4** but its listener
@@ -703,7 +703,7 @@ selects.
   the handler pointer is read past the array into whatever sits there and
   called — depending on the binary layout that is a wild jump (segfault,
   the field report) or a NULL (libwayland aborts with `listener function
-  for opcode N of wl_output is NULL`, the local weston repro). The 0.1.4
+  for opcode N of wl_output is NULL`, the local weston repro). The dev 0.1.4
   regression net missed it because the fake compositor never sent v4-only
   events and the weston E2E ran the raw client only. Fixed by covering
   every event of the bound version (six slots for wl_output, wl_shm
@@ -712,7 +712,7 @@ selects.
   path, teaching the fake server the v4 burst, and adding
   `e2e-wayland.sh` part C (shim against live weston — the old table
   aborts there, verified A/B).
-* **GPU mode presented nothing (0.1.5)** — with the shim active the
+* **GPU mode presented nothing (dev 0.1.5)** — with the shim active the
   default `REV_VK_PRESENT=platform` path called `wlshim_present_cpu`,
   which logged "CPU present requested in GPU mode" and returned false —
   every frame was rendered and dropped. The shim now runs its own
@@ -722,9 +722,9 @@ selects.
   the raw client's presenter; the fake-compositor test mmaps the pool
   and checks pixels + cycling. `REV_VK_PRESENT=wsi` keeps the true
   swapchain path (driver-owned buffers on the shim's wl_surface).
-* **"wlshim: missing libwayland symbols" / shim never activates (0.1.4
+* **"wlshim: missing libwayland symbols" / shim never activates (dev 0.1.4
   postmortem)** — the GPU-on-Wayland path (`REV_WAYLAND_GPU=1`) was dead on
-  arrival from 0.1.0 through 0.1.3: init failed at the symbol gate and the
+  arrival from dev 0.1.0 through dev 0.1.3: init failed at the symbol gate and the
   platform silently fell back to the raw client, so nobody noticed. Five bug
   families, all invisible until a *real* libwayland actually marshals the
   shim's hand-written metadata:
@@ -746,7 +746,7 @@ selects.
   (5) the layer surface was registered in `S.wins[]` only *after* waiting
   for configure — the configure listener searches by `S.nwins`, so the
   event missed, and the dispatch loop blocked forever on the next read
-  (daemon alive, desktop black). Fixed in 0.1.4; the regression net is
+  (daemon alive, desktop black). Fixed in dev 0.1.4; the regression net is
   `tests/test_wlshim.c`: the shim runs end-to-end against the strict fake
   compositor with a genuine libwayland-client doing the marshalling —
   binds prove our interface metadata, `get_layer_surface` proves the
@@ -755,11 +755,11 @@ selects.
 * **"compositor lacks ... zwlr_layer_shell_v1"** — GNOME Wayland, or a
   compositor without layer-shell (stock weston is another). See the caveat
   above; use X11 (XWayland counts as X11) or a wlroots/KDE compositor.
-  Since 0.1.2 the message also reports how many globals were parsed, so a
+  Since dev 0.1.2 the message also reports how many globals were parsed, so a
   false positive of this kind is immediately visible (see the postmortem
   below).
 * **"compositor lacks ... zwlr_layer_shell_v1" on a compositor that HAS
-  layer-shell (0.1.2 postmortem)** — field report: a stacking compositor
+  layer-shell (dev 0.1.2 postmortem)** — field report: a stacking compositor
   advertised 57 globals (layer shell at #52, `wl_output` at #57), yet the
   engine claimed layer shell was missing and fell back to XWayland. Root
   cause: the registry's global table had a fixed capacity of **48** and
@@ -770,15 +770,15 @@ selects.
   had its own 48-entry copy); the message now includes the parsed count;
   a flood regression test replays the exact field layout (57 globals,
   shell at #52, output at #57) and fails on the old code.
-* **Black screen on a Wayland session (0.1.0 postmortem)** — the classic
-  0.1.0 failure chain on such sessions: the Wayland client failed its
+* **Black screen on a Wayland session (dev 0.1.0 postmortem)** — the classic
+  dev 0.1.0 failure chain on such sessions: the Wayland client failed its
   handshake (bug below), the engine auto-fell back to X11 — which under a
   Wayland session means **XWayland** (detected and logged as such since
-  0.1.1) — and the vulkan tier presented through its WSI swapchain, which
+  dev 0.1.1) — and the vulkan tier presented through its WSI swapchain, which
   some real-driver XWayland stacks silently drop: every call succeeds, the
-  window never updates. 0.1.1 fixes both links: the Wayland handshake now
+  window never updates. dev 0.1.1 fixes both links: the Wayland handshake now
   works natively (so the fallback usually never happens), and the vulkan
-  tier defaults to the platform presenter that the pre-0.1.0 engine shipped
+  tier defaults to the platform presenter that the pre-dev 0.1.0 engine shipped
   (MIT-SHM into the same desktop window — the mechanism field-proven to
   show). `REV_VK_PRESENT=wsi` restores the swapchain path if you want to
   benchmark it. If the fallback still shows black on your stack, bisect it:
@@ -789,7 +789,7 @@ selects.
   restacked by the WM, not mis-rendered. (`--shot FILE --shot-after N` and
   the legacy `--shot N FILE` forms are both accepted.)
 * **"compositor error … code 0: invalid object N" / "layer surface did not
-  configure" (0.1.2 postmortem)** — the raw client encoded the whole
+  configure" (dev 0.1.2 postmortem)** — the raw client encoded the whole
   `zwlr_layer_surface_v1` request family with opcodes shifted off the
   protocol's numbering: `get_layer_surface` was sent as opcode 1 (which is
   *destroy*), `ack_configure` as opcode 6 (also *destroy*), plus a
@@ -799,20 +799,20 @@ selects.
   never configured, no window was created, and the desktop stayed black
   while the daemon ran on. The fake-compositor test had agreed with the
   wrong numbering because client and test were written together (same class
-  of bug as the 0.1.0 framing swap). Fixed in 0.1.3: correct opcodes, layer
+  of bug as the dev 0.1.0 framing swap). Fixed in dev 0.1.3: correct opcodes, layer
   enum BACKGROUND=0 (was sending 1 = bottom), no set_size (the size comes
   from `configure`), and the fake compositor is now a *strict* one — it
   tracks every object id, validates opcode and wire size of every request,
   and answers violations with a real `wl_display.error` exactly like KWin.
   The daemon also exits with an error when no window could be created
   instead of running windowless.
-* **"protocol parse error" / "registry roundtrip timed out" (0.1.0
+* **"protocol parse error" / "registry roundtrip timed out" (dev 0.1.0
   postmortem)** — the wire client *encoded* requests with the correct header
   layout (`word1 = (size << 16) | opcode`) but *decoded* events with the two
   16-bit fields swapped, so the first real compositor message failed
   framing; the sync callback then never fired and the roundtrip timed out.
   The fake-compositor test had missed it because both sides of that test
-  shared the same swapped decoder. Fixed in 0.1.1; the regression net is now
+  shared the same swapped decoder. Fixed in dev 0.1.1; the regression net is now
   triple: the fake compositor uses the real format, a golden-byte test pins
   our first 24 wire bytes to a capture from real libwayland, and
   `scripts/e2e-wayland.sh` runs the client against a genuine weston.

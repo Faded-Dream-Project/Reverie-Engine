@@ -153,7 +153,10 @@ neither requires the other.
   positional, `--scene`, or a second `--video` is a hard error),
   `--scale fill|fit|stretch|center` (default **fill**: cover the
   viewport, center-crop the excess), `--no-loop` (hold the last frame at
-  EOF; the default loops), `--fps N` (pacing override).
+  EOF; the default loops), `--fps N` (pacing override). The valueless
+  shorthands `--fill`/`--fit`/`--stretch`/`--center` may stand between
+  the content flag and its path: `reverie --video --stretch clip.mp4`
+  is the same as `--scale stretch`.
 * **Scaling math** (`rev_scale_place()` in geom.c, unit-tested in
   tests/test_scale.c): `fill` covers and crops (negative placement
   offsets are legal — the GPU tiers clip natively); `fit` contains and
