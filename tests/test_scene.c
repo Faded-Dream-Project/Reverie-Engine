@@ -29,7 +29,9 @@ static int g_fails = 0;
 #define W 128
 #define H 96
 
-static RArena *g_arenas[32];
+static int litpx(u32 p) { return (p & 0x00ffffff) != 0; }
+
+static RArena *g_arenas[64];
 static int g_narenas;
 
 static void drain_arenas(void)
@@ -50,7 +52,7 @@ static RTScene *compile(const char *text, char *err, size_t errcap)
                 arena_destroy(ar);
                 return NULL;
         }
-        if (g_narenas < 32)
+        if (g_narenas < 64)
                 g_arenas[g_narenas++] = ar;
         return sc;
 }
@@ -931,6 +933,263 @@ int main(void)
                         free(fb.px);
                         rtscene_free(sc);
                 }
+        }
+
+        /* 9. sprite placement: a smaller image at an explicit rect
+         * (pos + anchor + scale) — the "images composited into a bigger
+         * image" vocabulary. Fixture: 64x48 RGBA. */
+        {
+                const char *txt =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer corner {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    pos = (0.25, 0.75)"
+                        "    anchor = topleft"
+                        "    scale = 0.5"
+                        "  }"
+                        "}";
+                RTScene *sc = compile(txt, err, sizeof err);
+                CHECK(sc != NULL, "compile placed sprite: %s", err);
+                if (sc) {
+                        RFb fb = { calloc((size_t)W * H, 4), W, H };
+                        rtscene_render(sc, &fb, 0, 0.0, 1.0 / 30.0);
+                        /* rect: 32x24 at (32, 72) */
+                        size_t lit = 0;
+                        for (u32 y = 72; y < 96; y++)
+                                for (u32 x = 32; x < 64; x++)
+                                        if (litpx(fb.px[y * W + x]))
+                                                lit++;
+                        CHECK(lit > (size_t)32 * 24 * 3 / 4,
+                              "sprite fills its rect (%zu of 768)", lit);
+                        CHECK(litpx(fb.px[80 * W + 40]), "inside rect lit");
+                        CHECK(!litpx(fb.px[80 * W + 16]), "left of rect black");
+                        CHECK(!litpx(fb.px[80 * W + 70]), "right of rect black");
+                        CHECK(!litpx(fb.px[68 * W + 40]), "above rect black");
+                        free(fb.px);
+                        rtscene_free(sc);
+                }
+        }
+
+        /* 10. default anchor (center): sprite centroid lands on pos */
+        {
+                const char *txt =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer c {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    pos = (0.5, 0.5)"
+                        "    scale = 0.5"
+                        "  }"
+                        "}";
+                RTScene *sc = compile(txt, err, sizeof err);
+                CHECK(sc != NULL, "compile centered sprite: %s", err);
+                if (sc) {
+                        RFb fb = { calloc((size_t)W * H, 4), W, H };
+                        rtscene_render(sc, &fb, 0, 0.0, 1.0 / 30.0);
+                        double sx = 0, sy = 0;
+                        size_t n = 0;
+                        for (u32 y = 0; y < H; y++)
+                                for (u32 x = 0; x < W; x++)
+                                        if (litpx(fb.px[y * W + x])) {
+                                                sx += x;
+                                                sy += y;
+                                                n++;
+                                        }
+                        CHECK(n > 400, "sprite rendered (%zu px)", n);
+                        if (n) {
+                                CHECK(abs((int)(sx / n) - 64) <= 2,
+                                      "centroid x ~ 64 (got %.1f)", sx / n);
+                                CHECK(abs((int)(sy / n) - 48) <= 2,
+                                      "centroid y ~ 48 (got %.1f)", sy / n);
+                        }
+                        free(fb.px);
+                        rtscene_free(sc);
+                }
+        }
+
+        /* 11. animated pos: the sprite drifts (anim pos_x, linear) */
+        {
+                const char *txt =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer d {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    scale = 0.5"
+                        "    anim pos_x { from = 0.2; to = 0.8; dur = 2; ease = linear; mode = once }"
+                        "  }"
+                        "}";
+                RTScene *sc = compile(txt, err, sizeof err);
+                CHECK(sc != NULL, "compile drifting sprite: %s", err);
+                if (sc) {
+                        for (int k = 0; k < 2; k++) {
+                                f64 t = k == 0 ? 0.5 : 1.0;   /* pos_x 0.35 / 0.5 */
+                                RFb fb = { calloc((size_t)W * H, 4), W, H };
+                                rtscene_render(sc, &fb, 0, t, 1.0 / 30.0);
+                                double sx = 0;
+                                size_t n = 0;
+                                for (u32 y = 0; y < H; y++)
+                                        for (u32 x = 0; x < W; x++)
+                                                if (litpx(fb.px[y * W + x])) {
+                                                        sx += x;
+                                                        n++;
+                                                }
+                                int want = k == 0 ? 44 : 64;   /* 0.35*128 / 0.5*128 */
+                                CHECK(n > 400, "drift render at t=%g (%zu px)", t, n);
+                                if (n)
+                                        CHECK(abs((int)(sx / n) - want) <= 3,
+                                              "drift centroid at t=%g ~ %d (got %.1f)",
+                                              t, want, sx / n);
+                                free(fb.px);
+                        }
+                        rtscene_free(sc);
+                }
+        }
+
+        /* 12. explicit size rects: stretch fills, fit letterboxes inside,
+         * tile patterns — all bounded to the rect */
+        {
+                const char *txt =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer s {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    pos = (0.5, 0.5)"
+                        "    size = (0.5, 0.25)"
+                        "  }"
+                        "}";
+                RTScene *sc = compile(txt, err, sizeof err);
+                CHECK(sc != NULL, "compile size sprite: %s", err);
+                if (sc) {
+                        RFb fb = { calloc((size_t)W * H, 4), W, H };
+                        rtscene_render(sc, &fb, 0, 0.0, 1.0 / 30.0);
+                        /* rect 64x24 centered: x in [32,96), y in [36,60).
+                         * Default fit for an explicit size is stretch -> the
+                         * whole rect is covered. */
+                        size_t lit = 0;
+                        for (u32 y = 36; y < 60; y++)
+                                for (u32 x = 32; x < 96; x++)
+                                        if (litpx(fb.px[y * W + x]))
+                                                lit++;
+                        CHECK(lit > (size_t)64 * 24 * 9 / 10,
+                              "stretch fills the size rect (%zu of 1536)", lit);
+                        CHECK(!litpx(fb.px[70 * W + 64]), "below rect black");
+                        free(fb.px);
+                        rtscene_free(sc);
+                }
+                /* fit = fit letterboxes INSIDE the rect */
+                const char *txt2 =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer s {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    pos = (0.5, 0.5)"
+                        "    size = (0.5, 0.25)"
+                        "    fit = fit"
+                        "  }"
+                        "}";
+                RTScene *sc2 = compile(txt2, err, sizeof err);
+                CHECK(sc2 != NULL, "compile fit-in-rect sprite: %s", err);
+                if (sc2) {
+                        RFb fb = { calloc((size_t)W * H, 4), W, H };
+                        rtscene_render(sc2, &fb, 0, 0.0, 1.0 / 30.0);
+                        /* 64x48 source contained in 64x24 rect -> 32x24 at
+                         * the rect center: columns [48,80) lit, [32,48) not */
+                        u32 lit_left = 0, lit_mid = 0;
+                        for (u32 y = 36; y < 60; y++) {
+                                for (u32 x = 33; x < 46; x++)
+                                        if (litpx(fb.px[y * W + x]))
+                                                lit_left++;
+                                for (u32 x = 50; x < 78; x++)
+                                        if (litpx(fb.px[y * W + x]))
+                                                lit_mid++;
+                        }
+                        CHECK(lit_left == 0, "letterbox bar inside rect is empty (%u)", lit_left);
+                        CHECK(lit_mid > (size_t)24 * 24 * 3 / 4,
+                              "contained sprite in rect center (%u)", lit_mid);
+                        free(fb.px);
+                        rtscene_free(sc2);
+                }
+                /* tile: native tiles bounded to the rect — MULTI-row grid
+                 * (the first cut read the source at +y*iw and ran off the
+                 * image buffer on the second tile row; ASan caught it) */
+                const char *txt3 =
+                        "scene {"
+                        "  layer bg { type = solid  color = #000000 }"
+                        "  layer s {"
+                        "    type = image"
+                        "    src = \"fixtures/png_rgba8_i0.png\""
+                        "    pos = (0.5, 0.5)"
+                        "    size = (0.75, 0.75)"
+                        "    fit = tile"
+                        "  }"
+                        "}";
+                RTScene *sc3 = compile(txt3, err, sizeof err);
+                CHECK(sc3 != NULL, "compile tile sprite: %s", err);
+                if (sc3) {
+                        RFb fb = { calloc((size_t)W * H, 4), W, H };
+                        rtscene_render(sc3, &fb, 0, 0.0, 1.0 / 30.0);
+                        /* rect 96x72 centered: x in [16,112), y in [12,84);
+                         * native 64x48 tiles -> two tile rows, whole rect
+                         * patterned */
+                        size_t lit = 0;
+                        for (u32 y = 12; y < 84; y++)
+                                for (u32 x = 16; x < 112; x++)
+                                        if (litpx(fb.px[y * W + x]))
+                                                lit++;
+                        CHECK(lit > (size_t)96 * 72 * 9 / 10,
+                              "tile fills the size rect (%zu of 6912)", lit);
+                        free(fb.px);
+                        rtscene_free(sc3);
+                }
+        }
+
+        /* 13. placement validation: size+scale, bad anchor, bad pos shape */
+        {
+                RTScene *sc = compile("scene { layer x { type = image "
+                                      "src = \"fixtures/png_rgba8_i0.png\" "
+                                      "size = (0.5, 0.5)  scale = 2 } }",
+                                      err, sizeof err);
+                CHECK(sc == NULL, "size + scale rejected");
+                CHECK(strstr(err, "mutually exclusive"), "error names the conflict: %s", err);
+        }
+        {
+                RTScene *sc = compile("scene { layer x { type = image "
+                                      "src = \"fixtures/png_rgba8_i0.png\" "
+                                      "pos = (0.5, 0.5)  anchor = diagonal } }",
+                                      err, sizeof err);
+                CHECK(sc == NULL, "unknown anchor rejected");
+                CHECK(strstr(err, "anchor"), "error names anchor: %s", err);
+        }
+        {
+                RTScene *sc = compile("scene { layer x { type = image "
+                                      "src = \"fixtures/png_rgba8_i0.png\" "
+                                      "pos = 7 } }", err, sizeof err);
+                CHECK(sc == NULL, "non-tuple pos rejected");
+                CHECK(strstr(err, "pos must be"), "error names pos: %s", err);
+        }
+        {
+                RTScene *sc = compile("scene { layer x { type = image "
+                                      "src = \"fixtures/png_rgba8_i0.png\" "
+                                      "pos = (0.5, 0.5)  anim pos { from = 0; to = 1; dur = 1 } } }",
+                                      err, sizeof err);
+                CHECK(sc == NULL, "anim target 'pos' rejected");
+                CHECK(strstr(err, "pos_x"), "error suggests pos_x: %s", err);
+        }
+        {
+                /* percent tuple + named anchor parse */
+                RTScene *sc = compile("scene { layer x { type = image "
+                                      "src = \"fixtures/png_rgba8_i0.png\" "
+                                      "pos = (50%, 25%)  anchor = bottomleft  scale = 1 } }",
+                                      err, sizeof err);
+                CHECK(sc != NULL, "percent pos + named anchor compile: %s", err);
+                if (sc)
+                        rtscene_free(sc);
         }
 
         drain_arenas();

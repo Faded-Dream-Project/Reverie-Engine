@@ -66,6 +66,56 @@ resampled bilinearly (or nearest with `smooth = false`). SVG files may carry
 the usual XML prolog — declaration, generator comments, BOM — exactly as
 Inkscape/Illustrator/Figma export them.
 
+### Sprite placement — a smaller image inside a bigger frame
+
+Without any of the properties below, an image layer covers the whole frame
+with the `fit` semantics above. **Any** of `pos`, `size`, or `scale` (or a
+`pos_x`/`pos_y`/`scale` anim) switches the layer into sprite mode: the
+image is composited at an explicit rectangle, and everything else — blend,
+opacity, blur, parallax, monitor scoping, GPU tiers — keeps working.
+
+| Property | Type        | Default     | Notes                                   |
+|----------|-------------|-------------|-----------------------------------------|
+| `pos`    | tuple       | `(0.5, 0.5)`| where the anchor point goes, frame-relative; `(50%, 25%)` also parses |
+| `size`   | num / tuple | frame       | the rect's size, frame-relative; a bare number is a square |
+| `scale`  | number      | 1           | multiplier on the image's NATIVE pixel size (1 = exact texels) |
+| `anchor` | ident/tuple | `center`    | which rect point sits at `pos`: `topleft top topright left center right bottomleft bottom bottomright`, or `(x, y)` |
+
+- `size` and `scale` are mutually exclusive: `size` names the rect;
+  `scale` derives it from the source.
+- With `size`, `fit` applies **inside the rect** and the default becomes
+  `stretch` (the rect is the spec — author `fill` to crop, `fit` to
+  letterbox, `tile` to pattern). With `scale` the rect already has the
+  source aspect, so `fit` is moot.
+- `pos` may sit outside 0..1 — sprites can hang off the edge or drift
+  fully across the frame.
+- Native-size sprites (`scale = 1`, or a `size` matching the source) take a
+  byte-exact fast path — pixel art stays crisp.
+
+`pos_x`, `pos_y`, and `scale` are animatable, so sprites **move**:
+
+```
+layer moon {
+    type = image
+    src = "assets/moon.svg"
+    pos = (0.8, 0.22)
+    scale = 0.18
+    anim scale { from = 0.16; to = 0.2; dur = 20s; ease = sine; mode = pingpong }
+}
+
+layer satellite {
+    type = image
+    src = "assets/sat.png"
+    scale = 0.05
+    anim pos_x { from = -0.1; to = 1.1; dur = 90s; mode = loop }
+    anim pos_y { from = 0.3;  to = 0.35; dur = 90s; ease = sine; mode = loop }
+}
+```
+
+The anim target list is `opacity blur parallax force angle strength radius
+pos_x pos_y scale` (numeric `from`/`to` — animate `pos_x` and `pos_y`
+separately to steer).
+
 ## `type = gradient`
 
 ```

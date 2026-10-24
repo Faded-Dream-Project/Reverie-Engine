@@ -220,8 +220,10 @@ reverie --restore --renderer cpu      # restore the content, override a flag
 
 Scene layers: image, gradient, solid, fluid, ripple, particles, video —
 with blend modes, blur, opacity, parallax, monitor selection, and
-keyframe animations. Video layers: `type = video; src = "loop.mp4";
-loop = true; paused = false; fit = fill`.
+keyframe animations. Image layers composite smaller images at authored
+rects (pos/size/scale/anchor, animatable — drifting sprites, tiled
+panels, pixel-perfect placements). Video layers: `type = video; src =
+"loop.mp4"; loop = true; paused = false; fit = fill`.
 
 The `--video` media mode is fully independent of the scene system: it
 needs no `.rev` file, and scenes need no FFmpeg. It reuses the same

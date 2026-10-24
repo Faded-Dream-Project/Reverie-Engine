@@ -33,6 +33,9 @@ enum {
         AT_ANGLE,
         AT_STRENGTH,
         AT_RADIUS,
+        AT_POS_X,
+        AT_POS_Y,
+        AT_SCALE,
         AT_COUNT
 };
 
@@ -56,6 +59,16 @@ typedef struct RTLayer {
         char *src;            /* resolved asset path */
         int fit;
         bool smooth;
+
+        /* image-layer placement (sprite mode): a smaller image composited
+         * at an explicit rect instead of covering the whole frame. Any of
+         * pos/size/scale (or a pos_x/pos_y/scale anim) switches it on. */
+        bool placed;
+        bool has_size;          /* size given — the rect is authoritative  */
+        f64 pos_x, pos_y;       /* anchor point, frame-relative           */
+        f64 size_w, size_h;     /* rect size, frame-relative (has_size)   */
+        f64 scale;              /* native-size multiplier (no has_size)   */
+        f64 anchor_x, anchor_y; /* which rect point sits at pos           */
 
         int gshape;           /* 0 linear, 1 radial */
         f64 gangle;
@@ -190,6 +203,23 @@ static bool val_num(const RVal *v, f64 *out)
         return v && v->kind == RV_NUM && out && (*out = v->num, true);
 }
 
+/* A frame-relative number: plain numbers pass through, `50%` tokens (the
+ * lexer parks the unit on str) divide by 100. Durations and other units
+ * are rejected — `pos = (6s, 3)` is an author error, not 6. */
+static bool num_rel(const RVal *v, f64 *out)
+{
+        f64 n;
+        if (!val_num(v, &n))
+                return false;
+        char unit = (char)(uintptr_t)v->str;
+        if (unit && unit != '%')
+                return false;
+        if (unit == '%')
+                n /= 100.0;
+        *out = n;
+        return true;
+}
+
 static bool val_str(const RVal *v, const char **out)
 {
         return v && v->kind == RV_STR && out && (*out = v->str, true);
@@ -266,7 +296,7 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
         static const char *pshape_names[] = { "soft", "disc", "glow", "spark", "star", "ring" };
         static const char *ease_names[] = { "linear", "sine", "quad", "cubic", "quart", "expo", "back", "elastic", "bounce" };
         static const char *mode_names[] = { "once", "loop", "pingpong" };
-        static const char *anim_targets[] = { "opacity", "blur", "parallax", "force", "angle", "strength", "radius" };
+        static const char *anim_targets[] = { "opacity", "blur", "parallax", "force", "angle", "strength", "radius", "pos_x", "pos_y", "scale" };
 
         for (int li = 0; li < ir->nlayers; li++) {
                 const RLayerIR *L = ir->layers[li];
@@ -366,6 +396,7 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                         if (!have)
                                 { fail(err, errcap, "layer '%s': asset not found: %s", rt->name, path); goto bad; }
                         rt->src = path;
+                        bool fit_given = getp(L->props, L->nprops, "fit") != NULL;
                         if ((v = getp(L->props, L->nprops, "fit"))) {
                                 int f = map_ident(v, fit_names, 4);
                                 if (f < 0)
@@ -373,6 +404,86 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                                                     rt->name, v->str); goto bad; }
                                 rt->fit = f;
                         }
+
+                        /* ---- sprite placement (see docs/SCENE-FORMAT.md) ----
+                         * A whole-frame image layer keeps the historical
+                         * fit semantics; pos/size/scale opt the layer into
+                         * an explicit rect — the "smaller image composited
+                         * into a bigger frame" vocabulary. */
+                        rt->pos_x = 0.5;
+                        rt->pos_y = 0.5;
+                        rt->scale = 1.0;
+                        rt->anchor_x = 0.5;
+                        rt->anchor_y = 0.5;
+                        if ((v = getp(L->props, L->nprops, "pos"))) {
+                                if (v->kind == RV_TUPLE && v->n == 2 &&
+                                    num_rel(v->items[0], &rt->pos_x) &&
+                                    num_rel(v->items[1], &rt->pos_y)) {
+                                        rt->placed = true;
+                                } else {
+                                        { fail(err, errcap, "layer '%s': pos must be an (x, y) pair, frame-relative "
+                                                    "(0..1 or %%)", rt->name); goto bad; }
+                                }
+                        }
+                        if ((v = getp(L->props, L->nprops, "size"))) {
+                                f64 sw = 0, sh = 0;
+                                bool ok = false;
+                                if (v->kind == RV_TUPLE && v->n == 2)
+                                        ok = num_rel(v->items[0], &sw) &&
+                                             num_rel(v->items[1], &sh);
+                                else
+                                        ok = num_rel(v, &sw);   /* square */
+                                if (!ok || sw <= 0 || sh <= 0)
+                                        { fail(err, errcap, "layer '%s': size must be > 0, frame-relative "
+                                                    "(w, h) or w", rt->name); goto bad; }
+                                rt->size_w = sw;
+                                rt->size_h = sh;
+                                rt->has_size = true;
+                                rt->placed = true;
+                        }
+                        if ((v = getp(L->props, L->nprops, "scale"))) {
+                                f64 scv;
+                                if (!num_rel(v, &scv) || scv <= 0)
+                                        { fail(err, errcap, "layer '%s': scale must be a number > 0 "
+                                                    "(1 = native pixels)", rt->name); goto bad; }
+                                if (rt->has_size)
+                                        { fail(err, errcap, "layer '%s': size and scale are mutually exclusive — "
+                                                    "size names the rect, scale multiplies the native size",
+                                                    rt->name); goto bad; }
+                                rt->scale = scv;
+                                rt->placed = true;
+                        }
+                        if ((v = getp(L->props, L->nprops, "anchor"))) {
+                                static const char *anchor_names[] = {
+                                        "topleft", "top", "topright", "left", "center",
+                                        "right", "bottomleft", "bottom", "bottomright"
+                                };
+                                static const f64 anchor_xy[9][2] = {
+                                        { 0, 0 }, { 0.5, 0 }, { 1, 0 },
+                                        { 0, 0.5 }, { 0.5, 0.5 }, { 1, 0.5 },
+                                        { 0, 1 }, { 0.5, 1 }, { 1, 1 },
+                                };
+                                int an = map_ident(v, anchor_names, 9);
+                                if (an >= 0) {
+                                        rt->anchor_x = anchor_xy[an][0];
+                                        rt->anchor_y = anchor_xy[an][1];
+                                } else if (v->kind == RV_TUPLE && v->n == 2 &&
+                                           num_rel(v->items[0], &rt->anchor_x) &&
+                                           num_rel(v->items[1], &rt->anchor_y)) {
+                                        /* tuple form, e.g. (0.5, 1) */
+                                } else {
+                                        { fail(err, errcap, "layer '%s': anchor must be topleft|top|topright|left|"
+                                                    "center|right|bottomleft|bottom|bottomright or (x, y)",
+                                                    rt->name); goto bad; }
+                                }
+                                rt->anchor_x = rev_clampf(rt->anchor_x, 0, 1);
+                                rt->anchor_y = rev_clampf(rt->anchor_y, 0, 1);
+                        }
+                        /* an explicit rect is the spec: without a stated
+                         * fit, stretch to exactly it (fill/fit can still be
+                         * authored — they crop/letterbox WITHIN the rect) */
+                        if (rt->has_size && !fit_given)
+                                rt->fit = FIT_STRETCH;
                 } else if (rt->type == LT_GRADIENT) {
                         if ((v = getp(L->props, L->nprops, "shape"))) {
                                 int s = map_ident(v, shape_names, 2);
@@ -623,8 +734,14 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
                         int target = map_ident(&tmp, anim_targets, AT_COUNT);
                         if (target < 0)
                                 { fail(err, errcap, "layer '%s' (line %d): anim target '%s' not animatable "
-                                            "(opacity|blur|parallax|force|angle|strength|radius)",
+                                            "(opacity|blur|parallax|force|angle|strength|radius|pos_x|pos_y|scale)",
                                             rt->name, a->line, a->target); goto bad; }
+                        /* a placement anim is a placement: pos_x/pos_y/scale
+                         * switch an image layer into sprite mode even with
+                         * no static pos/scale authored */
+                        if (rt->type == LT_IMAGE &&
+                            (target == AT_POS_X || target == AT_POS_Y || target == AT_SCALE))
+                                rt->placed = true;
                         RTAnim *ra = &rt->anims[rt->nanims++];
                         memset(ra, 0, sizeof *ra);
                         ra->target = target;
@@ -656,8 +773,12 @@ RTScene *rtscene_compile_assets(const RSceneIR *ir, RArena *ir_arena,
         return sc;
 
 bad:
-        for (int i = 0; i < sc->n; i++)
+        for (int i = 0; i < sc->n; i++) {
                 free(sc->layers[i].name);
+                free(sc->layers[i].src);   /* image/video asset path (a
+                                              * validation failure AFTER the
+                                              * src parse used to leak it) */
+        }
         free(sc->layers);
         free(sc->title);
         free(sc->base_dir);
@@ -801,6 +922,7 @@ static f64 anim_eval(const RTAnim *a, f64 t)
 
 typedef struct {
         f64 opacity, blur, parallax, force, angle, strength, radius;
+        f64 pos_x, pos_y, scale;      /* image sprite placement (animatable) */
 } Eff;
 
 static void eval_props(const RTLayer *L, f64 t, Eff *e)
@@ -812,6 +934,9 @@ static void eval_props(const RTLayer *L, f64 t, Eff *e)
         e->angle = L->gangle;
         e->strength = L->r_strength;
         e->radius = L->f_radius;
+        e->pos_x = L->pos_x;
+        e->pos_y = L->pos_y;
+        e->scale = L->scale;
         for (int i = 0; i < L->nanims; i++) {
                 f64 v = anim_eval(&L->anims[i], t);
                 switch (L->anims[i].target) {
@@ -822,12 +947,18 @@ static void eval_props(const RTLayer *L, f64 t, Eff *e)
                 case AT_ANGLE:    e->angle = v;    break;
                 case AT_STRENGTH: e->strength = v; break;
                 case AT_RADIUS:   e->radius = v;   break;
+                case AT_POS_X:    e->pos_x = v;    break;
+                case AT_POS_Y:    e->pos_y = v;    break;
+                case AT_SCALE:    e->scale = v;    break;
                 default: break;
                 }
         }
         e->opacity = rev_clampf(e->opacity, 0, 1);
         e->blur = rev_clampf(e->blur, 0, 512);
         e->parallax = rev_clampf(e->parallax, 0, 1);
+        /* an animated scale can cross zero — clamp to a sane sprite range
+         * (a sub-pixel rect is a degenerate but harmless blit) */
+        e->scale = e->scale > 0.001 ? (e->scale < 64.0 ? e->scale : 64.0) : 0.001;
 }
 
 /* --------------------------------------------------------------------------
@@ -935,8 +1066,160 @@ static bool load_source(RTScene *sc, RTLayer *L, RTLayerInst *in, char *err, siz
         return true;
 }
 
-static void build_image_raster(RFb *fb, RTLayer *L, RTLayerInst *in)
+/* ---- sprite placement ------------------------------------------------- */
+
+/* Row-wise copy of a (cw x ch) block into fb at (dx, dy), clipped to the
+ * destination. Source rows have stride srow. */
+static void rect_copy(RFb *fb, const u32 *src, u32 srow, i32 dx, i32 dy, u32 cw, u32 ch)
 {
+        for (u32 r = 0; r < ch; r++) {
+                i32 y = dy + (i32)r;
+                if (y < 0 || y >= (i32)fb->h)
+                        continue;
+                i32 x0 = dx < 0 ? -dx : 0;
+                i32 x1 = (i32)cw - ((dx + (i32)cw > (i32)fb->w) ? dx + (i32)cw - (i32)fb->w : 0);
+                if (x1 <= x0)
+                        continue;
+                memcpy(fb->px + (size_t)y * fb->w + (size_t)(x0 + dx),
+                       src + (size_t)r * srow + (size_t)x0,
+                       (size_t)(x1 - x0) * 4);
+        }
+}
+
+/* The placed-sprite branch of build_image_raster: the raster is a
+ * full-frame (parallax-oversized) TRANSPARENT canvas with the image
+ * composited at its rect — every downstream consumer (blend/blur/parallax,
+ * GPU emission, the layer composite) keeps working unchanged.
+ * W/H are the VISIBLE frame dims; fb is the oversized canvas. */
+static void build_placed_raster(RFb *fb, RTLayer *L, RTLayerInst *in,
+                                const Eff *e, f64 W, f64 H)
+{
+        memset(fb->px, 0, (size_t)fb->w * fb->h * 4);
+
+        /* rect dims, in visible-frame pixels */
+        u32 rw, rh;
+        int fit = FIT_STRETCH;
+        if (L->has_size) {
+                f64 pw = L->size_w * W, ph = L->size_h * H;
+                rw = pw >= 1.0 ? (u32)(pw + 0.5) : 1;
+                rh = ph >= 1.0 ? (u32)(ph + 0.5) : 1;
+                fit = L->fit;
+        } else {
+                f64 pw = in->src_w * e->scale, ph = in->src_h * e->scale;
+                rw = pw >= 1.0 ? (u32)(pw + 0.5) : 1;
+                rh = ph >= 1.0 ? (u32)(ph + 0.5) : 1;
+        }
+
+        /* rect origin: the anchor point of the rect sits at pos */
+        i32 ox = (i32)(e->pos_x * W - L->anchor_x * (f64)rw + 0.5);
+        i32 oy = (i32)(e->pos_y * H - L->anchor_y * (f64)rh + 0.5);
+        /* shift into the oversized canvas (the composite places the raster
+         * centered, so the visible frame is inset by the oversize margin) */
+        ox += (i32)(((f64)fb->w - W) / 2.0);
+        oy += (i32)(((f64)fb->h - H) / 2.0);
+
+        if (in->img_is_svg) {
+                /* SVGs scale natively into whatever rect they are given */
+                u32 *tmp = (u32 *)malloc((size_t)rw * rh * 4);
+                if (!tmp)
+                        return;
+                rev_svg_render(in->svg, tmp, rw, rh);
+                rect_copy(fb, tmp, rw, ox, oy, rw, rh);
+                free(tmp);
+                return;
+        }
+
+        /* PNG sprite */
+        u32 iw = in->img.w, ih = in->img.h;
+
+        if (fit == FIT_TILE) {
+                /* native-size tiles filling the rect (and clipped to it);
+                 * every tile reads the image from its row 0 — the grid
+                 * offset is only in DESTINATION space */
+                for (u32 y = 0; y < rh; y += ih) {
+                        u32 ch = ih < rh - y ? ih : rh - y;
+                        for (u32 x = 0; x < rw; x += iw) {
+                                u32 cw = iw < rw - x ? iw : rw - x;
+                                rect_copy(fb, in->img.px, iw, ox + (i32)x, oy + (i32)y, cw, ch);
+                        }
+                }
+                return;
+        }
+
+        if (fit == FIT_FILL) {
+                /* cover: center-crop the source to the rect aspect, then
+                 * resample the crop into the rect — exactly the media
+                 * placement sampler's role */
+                f64 sr = (f64)iw / ih, dr = (f64)rw / rh;
+                u32 sx = 0, sy = 0, sw = iw, sh = ih;
+                if (sr > dr) {
+                        u32 c = (u32)(ih * dr + 0.5);
+                        sx = (iw - c) / 2;
+                        sw = c;
+                } else if (sr < dr) {
+                        u32 c = (u32)(iw / dr + 0.5);
+                        sy = (ih - c) / 2;
+                        sh = c;
+                }
+                u32 *tmp = (u32 *)malloc((size_t)rw * rh * 4);
+                if (!tmp)
+                        return;
+                if (L->smooth || (sw == iw && sh == ih && rw == iw && rh == ih)) {
+                        rev_resample_bilinear_sub(in->img.px, iw, ih, sx, sy, sw, sh,
+                                                  tmp, rw, rh);
+                } else {
+                        /* pixel-art cover: crop copy, then nearest */
+                        u32 *crop = (u32 *)malloc((size_t)sw * sh * 4);
+                        if (crop) {
+                                for (u32 r = 0; r < sh; r++)
+                                        memcpy(crop + (size_t)r * sw,
+                                               in->img.px + (size_t)(sy + r) * iw + sx,
+                                               (size_t)sw * 4);
+                                rev_resample_nearest(crop, sw, sh, tmp, rw, rh);
+                                free(crop);
+                        }
+                }
+                rect_copy(fb, tmp, rw, ox, oy, rw, rh);
+                free(tmp);
+                return;
+        }
+
+        if (rw == iw && rh == ih) {
+                /* native-size fast path: byte-exact, no resample round trip */
+                rect_copy(fb, in->img.px, iw, ox, oy, iw, ih);
+                return;
+        }
+
+        u32 dw = rw, dh = rh;
+        i32 bx = ox, by = oy;
+        if (fit == FIT_CONTAIN) {
+                /* letterbox INSIDE the rect */
+                f64 s = (f64)rw / iw < (f64)rh / ih ? (f64)rw / iw : (f64)rh / ih;
+                dw = (u32)((f64)iw * s + 0.5);
+                dh = (u32)((f64)ih * s + 0.5);
+                if (dw < 1) dw = 1;
+                if (dh < 1) dh = 1;
+                bx = ox + (i32)(((f64)rw - (f64)dw) / 2.0);
+                by = oy + (i32)(((f64)rh - (f64)dh) / 2.0);
+        }
+        u32 *tmp = (u32 *)malloc((size_t)dw * dh * 4);
+        if (!tmp)
+                return;
+        if (L->smooth)
+                rev_resample_bilinear(in->img.px, iw, ih, tmp, dw, dh);
+        else
+                rev_resample_nearest(in->img.px, iw, ih, tmp, dw, dh);
+        rect_copy(fb, tmp, dw, bx, by, dw, dh);
+        free(tmp);
+}
+
+static void build_image_raster(RFb *fb, RTLayer *L, RTLayerInst *in,
+                               const Eff *e, f64 W, f64 H)
+{
+        if (L->placed) {
+                build_placed_raster(fb, L, in, e, W, H);
+                return;
+        }
         if (in->img_is_svg) {
                 memset(fb->px, 0, (size_t)fb->w * fb->h * 4);
                 rev_svg_render(in->svg, fb->px, fb->w, fb->h);
@@ -1659,7 +1942,7 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                                 LOGW("layer '%s': %s", L->name, err);
                                                 continue;
                                         }
-                                        build_image_raster(&in->raster, L, in);
+                                        build_image_raster(&in->raster, L, in, &e, W, H);
                                 }
                                 sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
                                 in->raster_ok = true;
@@ -1667,11 +1950,11 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 in->content_id = content_serial_next();
                         }
 
-                        /* gradient angle is the ONLY raster-affecting animated
-                         * property (opacity/blur/parallax are applied at composite
-                         * time) — rebuild only when the angle actually animates,
-                         * and write it cleanly instead of blending over the
-                         * previous frame's raster */
+                        /* raster-affecting animated properties: a gradient's
+                         * angle and an image sprite's placement (opacity/
+                         * blur/parallax apply at composite time) — rebuild
+                         * only when one actually animates, and write cleanly
+                         * instead of blending over the previous raster */
                         if (L->type == LT_GRADIENT) {
                                 bool angle_anim = false;
                                 for (int a = 0; a < L->nanims && !angle_anim; a++)
@@ -1679,6 +1962,22 @@ static void render_core(RTScene *sc, RFb *fb, RTFrameList *fl, int mon, f64 t, f
                                 if (angle_anim) {
                                         f64 ms = rev_monotonic();
                                         build_gradient_raster(&in->raster, L, &e);
+                                        sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
+                                        in->content_id = content_serial_next();
+                                }
+                        } else if (L->type == LT_IMAGE && L->placed) {
+                                /* pos_x/pos_y/scale anims move the sprite — the
+                                 * raster must follow, like an animated gradient
+                                 * angle; a fresh content serial makes the GPU
+                                 * tiers re-upload */
+                                bool place_anim = false;
+                                for (int a = 0; a < L->nanims && !place_anim; a++)
+                                        place_anim = (L->anims[a].target == AT_POS_X ||
+                                                      L->anims[a].target == AT_POS_Y ||
+                                                      L->anims[a].target == AT_SCALE);
+                                if (place_anim) {
+                                        f64 ms = rev_monotonic();
+                                        build_image_raster(&in->raster, L, in, &e, W, H);
                                         sc->prof_raster_ms += (rev_monotonic() - ms) * 1000.0;
                                         in->content_id = content_serial_next();
                                 }
