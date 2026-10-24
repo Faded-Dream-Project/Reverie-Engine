@@ -17,7 +17,8 @@ reverie --image walls/dusk.png --scale fit -o   # offline: one PNG out, no displ
 
 ## Placement — the shared media vocabulary
 
-`--scale` is the SAME placement vocabulary as `--video` (position
+`--fill`/`--fit`/`--stretch`/`--center` are the valueless shorthands
+for `--scale MODE`. `--scale` is the SAME placement vocabulary as `--video` (position
 independent, `--scale` may come before or after `--image`):
 
 | mode     | behavior                                                        |

@@ -6,7 +6,8 @@
  * Added: --scene PATH (the explicit form of the positional), --video PATH
  * (the media mode, mutually exclusive with any scene), --image PATH (the
  * static media mode — native PNG, same --scale vocabulary), --scale
- * fill|fit|stretch|center (video + image), --no-loop (video only),
+ * fill|fit|stretch|center (video + image; --fill/--fit/--stretch/--center
+ * are the valueless shorthands), --no-loop (video only),
  * --exit-if-running (yield to a live daemon via the IPC probe), and
  * --restore (replay the last launched content; the content slot is
  * filled by the session record — an error next to any explicit
@@ -131,6 +132,25 @@ static bool option_like(const char *s)
         return s[0] == '-' && s[1] == '-';
 }
 
+/* Valueless flags that may legally stand between a content option and its
+ * path: `--video --stretch clip.mp4` is how the 2026-10 field report
+ * spelled it, so the path is taken as deferred and the flag is parsed
+ * normally. Options that TAKE values (--scale and friends) do not defer —
+ * `--video --scale stretch` is still the forgotten-path error. */
+static bool valueless_flag(const char *s)
+{
+        static const char *const names[] = {
+                "--fill", "--fit", "--stretch", "--center",
+                "--no-loop", "--exit-if-running",
+                "-o", "--once", "-v", "--verbose", "-q", "--quiet",
+                "-l", "--list",
+        };
+        for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+                if (strcmp(s, names[i]) == 0)
+                        return true;
+        return false;
+}
+
 bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
 {
         memset(a, 0, sizeof *a);
@@ -141,6 +161,10 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
         a->scale = REV_SCALE_FILL;
         a->shot_after = -1;
         err[0] = 0;
+        /* deferred content path state: 's'/'v'/'i' while a --scene/--video/
+         * --image waits for its path behind valueless flags */
+        char pending = 0;
+        const char *pending_name = NULL;
         /* Media-mode flags are recorded during the scan (a->scale_seen /
          * a->no_loop_seen — they are parser outputs the session-record merge
          * also needs) but validated once, after the whole line is parsed —
@@ -155,6 +179,22 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
         } while (0)
 
         for (int i = 1; i < argc; i++) {
+                /* deferred content path: --video --stretch clip.mp4 set a
+                 * pending slot; the first bare positional fills it */
+                if (pending && argv[i][0] != '-' && !strchr(argv[i], '=')) {
+                        const char *path = argv[i];
+                        char kind = pending;
+                        pending = 0;
+                        if (kind == 'v')
+                                set_video(a, path, err, errcap);
+                        else if (kind == 'i')
+                                set_image(a, path, err, errcap);
+                        else
+                                set_scene(a, path, err, errcap);
+                        if (err[0])
+                                return false;
+                        continue;
+                }
                 if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fps")) {
                         NEED_VALUE(argv[i]);
                         a->fps_override = atoi(argv[++i]);
@@ -193,17 +233,44 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                                 return false;
                         }
                 } else if (!strcmp(argv[i], "--scene")) {
-                        NEED_VALUE(argv[i]);
+                        if (i + 1 >= argc || option_like(argv[i + 1])) {
+                                if (i + 1 < argc && valueless_flag(argv[i + 1])) {
+                                        pending = 's';
+                                        pending_name = "--scene";
+                                        continue;
+                                }
+                                snprintf(err, errcap, "option '--scene' needs a value");
+                                a->show_usage = true;
+                                return false;
+                        }
                         set_scene(a, argv[++i], err, errcap);
                         if (err[0])
                                 return false;
                 } else if (!strcmp(argv[i], "--video")) {
-                        NEED_VALUE(argv[i]);
+                        if (i + 1 >= argc || option_like(argv[i + 1])) {
+                                if (i + 1 < argc && valueless_flag(argv[i + 1])) {
+                                        pending = 'v';
+                                        pending_name = "--video";
+                                        continue;
+                                }
+                                snprintf(err, errcap, "option '--video' needs a value");
+                                a->show_usage = true;
+                                return false;
+                        }
                         set_video(a, argv[++i], err, errcap);
                         if (err[0])
                                 return false;
                 } else if (!strcmp(argv[i], "--image")) {
-                        NEED_VALUE(argv[i]);
+                        if (i + 1 >= argc || option_like(argv[i + 1])) {
+                                if (i + 1 < argc && valueless_flag(argv[i + 1])) {
+                                        pending = 'i';
+                                        pending_name = "--image";
+                                        continue;
+                                }
+                                snprintf(err, errcap, "option '--image' needs a value");
+                                a->show_usage = true;
+                                return false;
+                        }
                         set_image(a, argv[++i], err, errcap);
                         if (err[0])
                                 return false;
@@ -217,6 +284,15 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                                 return false;
                         }
                         a->scale = m;
+                        a->scale_seen = true;
+                } else if (!strcmp(argv[i], "--fill") || !strcmp(argv[i], "--fit") ||
+                           !strcmp(argv[i], "--stretch") || !strcmp(argv[i], "--center")) {
+                        /* media-mode shorthand: `--stretch` IS `--scale
+                         * stretch`. The 2026-10 field report ran
+                         * `--video --stretch f.mp4` and died on "option
+                         * '--video' needs a value" — the placement modes
+                         * were documented but not spellable as flags. */
+                        a->scale = rev_scale_mode(argv[i] + 2);
                         a->scale_seen = true;
                 } else if (!strcmp(argv[i], "--no-loop")) {
                         a->no_loop = true;
@@ -299,6 +375,12 @@ bool rev_cli_parse(int argc, char **argv, RevArgs *a, char *err, size_t errcap)
                         if (err[0])
                                 return false;
                 }
+        }
+        if (pending) {
+                /* a deferred content option that never met its path */
+                snprintf(err, errcap, "option '%s' needs a value", pending_name);
+                a->show_usage = true;
+                return false;
         }
         /* Media-only flags are rejected here, once the whole line is known:
          * `--scale stretch --video f.mp4` is the same command as

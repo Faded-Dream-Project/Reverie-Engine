@@ -216,6 +216,32 @@ int main(void)
         CHECK(parse("--no-loop --scale fit --video a.mp4", &a, err, sizeof err, &usage_hint) &&
               a.no_loop && a.scale == REV_SCALE_FIT,
               "--no-loop + --scale both before --video parse");
+
+        /* ---- valueless scale shorthands (--fill/--fit/--stretch/--center) */
+        /* the 2026-10 field report: `--video --stretch f.mp4` died on
+         * "option '--video' needs a value" because --stretch was not a flag */
+        CHECK(parse("--video --stretch a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_STRETCH && !strcmp(a.video_path, "a.mp4"),
+              "--stretch after --video parses as the scale mode");
+        CHECK(parse("--stretch --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_STRETCH,
+              "--stretch before --video parses");
+        CHECK(parse("--image wall.png --fit", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_FIT && !strcmp(a.image_path, "wall.png"),
+              "--fit applies to --image");
+        CHECK(parse("--center --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_CENTER,
+              "--center parses");
+        CHECK(parse("--fill --video a.mp4", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_FILL,
+              "--fill parses (explicit default)");
+        CHECK(parse("--image w.png --stretch --scale fit", &a, err, sizeof err, &usage_hint) &&
+              a.scale == REV_SCALE_FIT,
+              "later --scale wins over an earlier shorthand");
+        CHECK(!parse("--stretch", &a, err, sizeof err, &usage_hint) &&
+              strstr(err, "--scale applies to --video or --image"),
+              "orphaned --stretch rejected like --scale");
+
         CHECK(!parse("--scale fill --scene a.rev", &a, err, sizeof err, &usage_hint) &&
               strstr(err, "--scale applies to --video or --image"),
               "--scale still rejected in scene mode (post-parse check)");

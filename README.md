@@ -208,6 +208,7 @@ reverie ripple-lake.revpack           # packed theme — no extraction
 reverie --scene themes/ripple-lake    # the same, spelled out
 reverie --video loops/waves.mp4       # media mode: video/GIF wallpaper
 reverie --video loop.gif --scale fit  # letterbox instead of cover-crop
+reverie --video --stretch waves.mp4   # the same, as a valueless flag
 reverie --video demo.mp4 --no-loop    # hold the last frame at EOF
 reverie --image walls/dusk.png        # static media mode: one PNG — the
                                       #   engine's own codec, no FFmpeg
@@ -228,7 +229,9 @@ backends, renderers, IPC socket, screenshot hook and idle power-save
 (payback freezes while hidden); media placement is `--scale
 fill|fit|stretch|center` (default fill — cover and crop), letterbox
 bars are opaque black, and playback paces at the source's own frame
-rate. `THEME`/playlist IPC commands report a clear error in media mode;
+rate. `--fill`/`--fit`/`--stretch`/`--center` are valueless shorthands
+for `--scale MODE` (they may sit between the content flag and its
+path). `THEME`/playlist IPC commands report a clear error in media mode;
 `PING`/`STATUS`/`QUIT` work as usual.
 
 `--image` is the static sibling: one PNG through Reverie's own native
