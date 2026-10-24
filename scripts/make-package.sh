@@ -184,6 +184,14 @@ alpine)
         # abuild-keygen -a -n: append, non-interactive; the abuild group
         # membership lets it install the public key system-wide
         su builder -c "abuild-keygen -a -n" >/dev/null 2>&1 || true
+        # install the builder's public key as ROOT: abuild -r signs the
+        # package, then 'apk index' (as the builder, via abuild-sudo) must
+        # VERIFY that signature against /etc/apk/keys — an untrusted key
+        # aborts the whole build at "Failed to create index" (first tag
+        # run's lesson: the .apk was already built when it died)
+        for K in /home/builder/.abuild/*.rsa.pub; do
+                [ -f "$K" ] && cp "$K" /etc/apk/keys/ && break
+        done
         su builder -c "cd '$WORK' && abuild -r" >/dev/null || {
                 echo "FAIL: abuild -r failed" >&2; exit 1; }
         APKF=$(find /home/builder/packages -name 'reverie-*.apk' 2>/dev/null | head -1)
