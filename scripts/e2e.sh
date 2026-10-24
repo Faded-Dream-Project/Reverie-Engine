@@ -463,6 +463,41 @@ if command -v ffmpeg >/dev/null 2>&1; then
         echo "    video(gl):    SKIP (no libEGL / GL vendor on this system)"
         SKIP=$((SKIP+1))
     fi
+
+    # live session: the --video launch lands in the session memory and
+    # --restore replays it as a video (the autostart story, video side —
+    # same record machinery as the image leg below, proven end to end)
+    start_xvfb
+    VSOCK="$OUT/vid.sock"
+    VSTATE=$(mktemp -d)
+    DISPLAY="$XDISPLAY" REV_IPC_SOCK="$VSOCK" XDG_STATE_HOME="$VSTATE" \
+        timeout 16 ./build/reverie -R cpu --video "$VDIR/assets/loop.mp4" \
+        > "$OUT/vipc.log" 2>&1 &
+    VPNPID=$!
+    sleep 2
+    ./build/revtool ipc -s "$VSOCK" STATUS > "$OUT/vipc1.out" 2>&1
+    ./build/revtool ipc -s "$VSOCK" QUIT > "$OUT/vipc2.out" 2>&1
+    sleep 1
+    VREC="$VSTATE/reverie/last-session.json"
+    VVP=1
+    grep -q "mode=video" "$OUT/vipc1.out" 2>/dev/null || VVP=0
+    grep -q '"--video"' "$VREC" 2>/dev/null || VVP=0
+    kill -0 $VPNPID 2>/dev/null && VVP=0
+    # the restore: same XDG state, no explicit content — the record drives it
+    XDG_STATE_HOME="$VSTATE" ./build/reverie --restore -o -s 8x8 \
+        -O "$OUT/vrest.png" > "$OUT/vrest.log" 2>&1 || VVP=0
+    grep -q "video mode" "$OUT/vrest.log" 2>/dev/null || VVP=0
+    if [ "$VVP" = 1 ]; then
+        echo "    video(live):  PASS (status mode=video, session recorded, --restore replays it)"
+        PASS=$((PASS+1))
+    else
+        echo "    video(live):  FAIL (live video session incomplete)"
+        cat "$OUT/vipc.log" "$OUT/vipc1.out" "$OUT/vrest.log" 2>/dev/null
+        kill $VPNPID 2>/dev/null; wait $VPNPID 2>/dev/null
+        FAIL=$((FAIL+1))
+    fi
+    rm -rf "$VSTATE"
+    stop_xvfb
     else
         echo "    video(cpu):   SKIP (video support refused in this build)"
         echo "    video(gl):    SKIP (video support refused in this build)"
