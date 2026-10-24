@@ -144,33 +144,58 @@ arch)
         echo "built+verified: $PKG"
         ;;
 
-# ---- Alpine: .apk (v2 format, two concatenated tar.gz sections) -------------
+# ---- Alpine: .apk via abuild (as an unprivileged builder — abuild refuses
+# ---- root; the pattern is the one FDK's packaging pipeline proved) ---------
 alpine)
-        command -v tar >/dev/null || { echo "tar missing" >&2; exit 2; }
-        WORK=$(mktemp -d)
-        # data section first: its hash goes into .PKGINFO
-        ( cd "$STG" && tar -czf "$WORK/data.tar.gz" usr/ )
-        DATAHASH=$(sha256sum "$WORK/data.tar.gz" | cut -d' ' -f1)
-        DATASIZE=$(wc -c < "$WORK/data.tar.gz" | tr -d ' ')
-        {
-                echo "pkgname = reverie"
-                echo "pkgver = ${VER}-r${REL}"
-                echo "arch = x86_64"
-                echo "pkgdesc = $DESC_SHORT"
-                echo "url = $URL"
-                echo "size = ${DATASIZE}"
-                echo "builddate = $(date -u +%s)"
-                echo "license = Proprietary"
-                echo "datahash = ${DATAHASH}"
-        } > "$STG/.PKGINFO"
-        ( cd "$STG" && tar -czf "$WORK/control.tar.gz" .PKGINFO )
-        PKG="reverie-${VER}-r${REL}.apk"
-        cat "$WORK/control.tar.gz" "$WORK/data.tar.gz" > "$PKG"
+        command -v abuild >/dev/null || { echo "abuild missing (apk add alpine-sdk)" >&2; exit 2; }
+        command -v adduser >/dev/null || { echo "adduser missing" >&2; exit 2; }
+        WORK=/home/builder/reverie-build
+        id builder >/dev/null 2>&1 || adduser -D builder
+        addgroup builder abuild 2>/dev/null || true
         rm -rf "$WORK"
-        apk add --allow-untrusted "./$PKG" >/dev/null
+        mkdir -p "$WORK"
+        # the builder needs the prebuilt tree inside its own workdir ($startdir)
+        cp -r build "$WORK/build"
+        cp README.md CHANGELOG.md LICENSE "$WORK/"
+        cp -r docs "$WORK/docs"
+        rm -rf "$WORK/docs/img"
+        {
+                echo "pkgname=reverie"
+                echo "pkgver=$VER"
+                echo "pkgrel=$REL"
+                echo "pkgdesc=\"$DESC_SHORT\""
+                echo "url=\"$URL\""
+                echo "arch=\"x86_64\""
+                echo "license=\"Proprietary\""
+                echo "depends=\"\""
+                echo "source=\"\""
+                echo "options=\"!check\""
+                echo "build() {"
+                echo "        return 0"
+                echo "}"
+                echo "package() {"
+                echo "        mkdir -p \"\$pkgdir/usr/bin\" \"\$pkgdir/usr/share/doc/reverie/docs\""
+                echo "        install -m 755 \"\$startdir/build/reverie\" \"\$startdir/build/revtool\" \"\$pkgdir/usr/bin/\""
+                echo "        install -m 644 \"\$startdir/README.md\" \"\$startdir/CHANGELOG.md\" \"\$startdir/LICENSE\" \"\$pkgdir/usr/share/doc/reverie/\""
+                echo "        install -m 644 \"\$startdir\"/docs/*.md \"\$pkgdir/usr/share/doc/reverie/docs/\""
+                echo "}"
+        } > "$WORK/APKBUILD"
+        chown -R builder:builder "$WORK"
+        # abuild-keygen -a -n: append, non-interactive; the abuild group
+        # membership lets it install the public key system-wide
+        su builder -c "abuild-keygen -a -n" >/dev/null 2>&1 || true
+        su builder -c "cd '$WORK' && abuild -r" >/dev/null || {
+                echo "FAIL: abuild -r failed" >&2; exit 1; }
+        APKF=$(find /home/builder/packages -name 'reverie-*.apk' 2>/dev/null | head -1)
+        [ -n "$APKF" ] || { echo "FAIL: abuild produced no .apk" >&2; exit 1; }
+        PKG="reverie-${VER}-r${REL}.apk"
+        cp "$APKF" "$PKG"
+        chown "$(id -un)" "$PKG" 2>/dev/null || true
+        apk add --allow-untrusted "./$PKG"
         helptest /usr/bin/reverie
         helptest /usr/bin/revtool
         apk del reverie >/dev/null
+        rm -rf "$WORK"
         echo "built+verified: $PKG"
         ;;
 
@@ -178,19 +203,23 @@ alpine)
 void)
         command -v xbps-create >/dev/null || { echo "xbps-create missing (xbps package)" >&2; exit 2; }
         PKG="reverie-${VER}_${REL}.x86_64.xbps"
-        # well-known xbps-create flags only: -n pkgver, -A arch, -s synopsis,
-        # -D description, -m maintainer, -l license
-        xbps-create -A x86_64 \
+        # xbps-create flag map (short letters are NOT mnemonic — the map FDK's
+        # pipeline documented): -s short desc, -S long desc, -D dependency
+        # LIST, -H homepage, -m maintainer, -l license, -n name, -A arch.
+        # Passing a description to -D makes the package depend on an
+        # unresolvable string — the first attempt died exactly there.
+        xbps-create \
+                -A x86_64 \
                 -n "reverie-${VER}_${REL}" \
                 -s "$DESC_SHORT" \
-                -D "$DESC_LONG" \
+                -S "$DESC_LONG" \
+                -H "$URL" \
                 -m "$MAINT" \
                 -l "Proprietary" \
                 "$STG" >/dev/null
         [ -f "$PKG" ] || { echo "FAIL: xbps-create produced nothing" >&2; exit 1; }
-        xbps-rindex -a "$PKG" >/dev/null 2>&1 || true
-        xbps-install -y -R "$(pwd)" reverie >/dev/null 2>&1 || \
-                { echo "FAIL: xbps self-install of the package failed" >&2; exit 1; }
+        xbps-rindex -a "$PKG"
+        xbps-install -y -R "$(pwd)" reverie || { echo "FAIL: xbps self-install" >&2; exit 1; }
         helptest /usr/bin/reverie
         helptest /usr/bin/revtool
         xbps-remove -y reverie >/dev/null 2>&1 || true

@@ -201,7 +201,7 @@ jobs:
         include:
           - distro: alpine
             image: "alpine:latest"
-            install: "apk add --no-cache git build-base ffmpeg ffmpeg-dev"
+            install: "apk add --no-cache git alpine-sdk ffmpeg ffmpeg-dev"
             pkg: alpine
           - distro: arch
             image: "archlinux:latest"
