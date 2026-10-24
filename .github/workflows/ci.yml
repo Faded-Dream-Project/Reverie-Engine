@@ -235,9 +235,9 @@ jobs:
       - name: package + self-test install
         run: |
           VER="${GITHUB_REF_NAME#v}"
-          scripts/make-package.sh "${{ matrix.pkg }}" "$VER" 1
+          sh scripts/make-package.sh "${{ matrix.pkg }}" "$VER" 1
           if [ -n "${{ matrix.extra }}" ]; then
-            scripts/make-package.sh "${{ matrix.extra }}" "$VER" 1
+            sh scripts/make-package.sh "${{ matrix.extra }}" "$VER" 1
           fi
       - name: upload package artifact
         uses: actions/upload-artifact@v4
