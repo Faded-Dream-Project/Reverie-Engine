@@ -96,9 +96,23 @@ int main(int argc, char **argv)
 			const RVideoFrame *f = rev_video_display(v, 0.0);
 			CHECK(f == NULL || f->w == 320, "dimensions sane");
 
-			/* advance ~3 seconds in 1/30s steps at real-time pace
-			 * (the decode thread needs wall-clock time to fill the
-			 * queue; the daemon's frame pacing provides it) */
+			/* PRIME: the decode thread fills its queue on wall-clock
+			 * time of its own. The paced loop below runs ~33x faster
+			 * than the daemon's real 30 fps frame pacing, and a loaded
+			 * CI runner's decoder cold start can outlast the whole loop
+			 * (run 40053471251: zero frames here, 54 in the very next).
+			 * Hold the playhead (dt=0) until the first frame exists —
+			 * bounded ~6 s, so a genuinely broken decoder still fails
+			 * fast and legibly. */
+			for (int i = 0; i < 600 && !(f && f->w); i++) {
+				f = rev_video_display(v, 0.0);
+				usleep(10000);
+			}
+			CHECK(f && f->w, "decoder primes its first frame");
+
+			/* advance ~3 seconds in 1/30s steps; with the queue primed
+			 * this measures playback advance, not cold start — the
+			 * decode thread keeps up from here */
 			int frames_seen = 0;
 			u32 last_w = 0;
 			bool saw_rgb = false;
