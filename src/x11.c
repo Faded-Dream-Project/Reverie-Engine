@@ -41,6 +41,8 @@ typedef struct {
                 size_t size;
         } shm[2];
         u8 *fallback;
+        bool presented;     /* at least one x11_present went out            */
+        bool exposed;       /* Expose latched since the last re-present     */
 } XWin;
 
 struct X11 {
@@ -1342,47 +1344,11 @@ void x11_sync(X11 *x)
                 read_reply(x, false);
 }
 
-bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h)
+/* Core PutImage fallback, in <= 256-row chunks, from an already-converted
+ * framebuffer — shared by x11_present and the Expose re-present. */
+static bool putimage_fallback(X11 *x, XWin *wd, const u8 *fb)
 {
-        if (!x || win < 0 || win >= x->nwins)
-                return false;
-        XWin *wd = &x->wins[win];
-        if (!wd->in_use || w != wd->w || h != wd->h || !rgba)
-                return false;
-        size_t n = (size_t)w * h;
-
-        if (wd->use_shm) {
-                int seg = wd->cur_seg;
-                x11_sync(x);   /* ensure the server is not still reading this segment */
-                convert_pixels(x, rgba, wd->shm[seg].mem, n);
-
-                u8 q2[40];
-                memset(q2, 0, sizeof q2);
-                q2[0] = (u8)x->ext_shm;        /* major = MIT-SHM base */
-                q2[1] = 3;                     /* minor = ShmPutImage   */
-                put16(q2 + 2, 10);              /* 36 bytes = 9 words    */
-                put32(q2 + 4, wd->wid);
-                put32(q2 + 8, wd->gc);
-                put16(q2 + 12, (u16)w);        /* total width  */
-                put16(q2 + 14, (u16)h);        /* total height */
-                put16(q2 + 16, 0);             /* src x */
-                put16(q2 + 18, 0);             /* src y */
-                put16(q2 + 20, (u16)w);        /* src width */
-                put16(q2 + 22, (u16)h);        /* src height */
-                q2[28] = (u8)x->depth;         /* layout per live capture: 4 pad bytes at 24..27 */
-                q2[29] = 2;                    /* ZPixmap */
-                q2[30] = 0;                    /* send event */
-                q2[31] = 0;                    /* pad */
-                put32(q2 + 32, wd->shm[seg].shmseg);
-                put32(q2 + 36, 0);             /* offset */
-                if (!send_req(x, q2, 40))
-                        return false;
-                wd->cur_seg ^= 1;
-                return true;
-        }
-
-        /* core PutImage fallback, in <= 256-row chunks */
-        convert_pixels(x, rgba, wd->fallback, n);
+        u32 w = wd->w, h = wd->h;
         u32 rows_per = 65536 / (w * 4);
         if (rows_per == 0) rows_per = 1;
         if (rows_per > h) rows_per = h;
@@ -1406,13 +1372,104 @@ bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h)
                 q[20] = 0;          /* left pad */
                 q[21] = (u8)x->depth;
                 if (!write_all(x->fd, q, 24) ||
-                    !write_all(x->fd, wd->fallback + (size_t)y0 * w * 4, nbytes)) {
+                    !write_all(x->fd, fb + (size_t)y0 * w * 4, nbytes)) {
                         free(q);
                         return false;
                 }
                 free(q);
         }
         return true;
+}
+
+/* ShmPutImage straight from one of the two attached segments (no convert,
+ * no flip — the caller picks which). */
+static bool shm_put(X11 *x, XWin *wd, int seg)
+{
+        u8 q2[40];
+        memset(q2, 0, sizeof q2);
+        q2[0] = (u8)x->ext_shm;        /* major = MIT-SHM base */
+        q2[1] = 3;                     /* minor = ShmPutImage   */
+        put16(q2 + 2, 10);              /* 36 bytes = 9 words    */
+        put32(q2 + 4, wd->wid);
+        put32(q2 + 8, wd->gc);
+        put16(q2 + 12, (u16)wd->w);    /* total width  */
+        put16(q2 + 14, (u16)wd->h);    /* total height */
+        put16(q2 + 16, 0);             /* src x */
+        put16(q2 + 18, 0);             /* src y */
+        put16(q2 + 20, (u16)wd->w);    /* src width */
+        put16(q2 + 22, (u16)wd->h);    /* src height */
+        q2[28] = (u8)x->depth;         /* layout per live capture: 4 pad bytes at 24..27 */
+        q2[29] = 2;                    /* ZPixmap */
+        q2[30] = 0;                    /* send event */
+        q2[31] = 0;                    /* pad */
+        put32(q2 + 32, wd->shm[seg].shmseg);
+        put32(q2 + 36, 0);             /* offset */
+        return send_req(x, q2, 40);
+}
+
+/* Puts the LAST presented frame back on the window, from the backend's own
+ * memory, without touching the main loop. This is the Expose answer: when a
+ * WM unmaps the windows of another workspace (openbox desktop switching),
+ * the server repaints our newly visible regions with the window background
+ * — black — and an Expose arrives; a 60 fps video repaints within a frame
+ * anyway, but a static --image paces at 2 fps, so the patch stayed black
+ * for up to half a second (2026-10 field report: "doesn't update fully
+ * instantly as I switch workspaces"). No sync needed: the last-presented
+ * segment is not written again until the NEXT present, which syncs first,
+ * and requests are processed in order — a re-put reads bytes that cannot
+ * have changed under it. */
+static void xwin_represent_last(X11 *x, XWin *wd)
+{
+        if (!wd->presented)
+                return;         /* nothing on screen yet — the background is it */
+        if (wd->use_shm)
+                shm_put(x, wd, wd->cur_seg ^ 1);   /* last presented segment */
+        else if (wd->fallback)
+                putimage_fallback(x, wd, wd->fallback);
+}
+
+bool x11_present(X11 *x, int win, const u32 *rgba, u32 w, u32 h)
+{
+        if (!x || win < 0 || win >= x->nwins)
+                return false;
+        XWin *wd = &x->wins[win];
+        if (!wd->in_use || w != wd->w || h != wd->h || !rgba)
+                return false;
+        size_t n = (size_t)w * h;
+
+        if (wd->use_shm) {
+                int seg = wd->cur_seg;
+                x11_sync(x);   /* ensure the server is not still reading this segment */
+                convert_pixels(x, rgba, wd->shm[seg].mem, n);
+                if (!shm_put(x, wd, seg))
+                        return false;
+                wd->cur_seg ^= 1;
+                wd->presented = true;
+                return true;
+        }
+
+        /* core PutImage fallback, in <= 256-row chunks */
+        convert_pixels(x, rgba, wd->fallback, n);
+        if (!putimage_fallback(x, wd, wd->fallback))
+                return false;
+        wd->presented = true;
+        return true;
+}
+
+/* Re-presents every window that latched an Expose since the last flush.
+ * Called from wait_frame and the platform pump — both top-level contexts
+ * where sending requests is safe (never from inside read_reply's drain). */
+void x11_flush_expose(X11 *x)
+{
+        if (!x)
+                return;
+        for (int i = 0; i < x->nwins; i++) {
+                XWin *wd = &x->wins[i];
+                if (wd->in_use && wd->exposed) {
+                        wd->exposed = false;
+                        xwin_represent_last(x, wd);
+                }
+        }
 }
 
 /* --------------------------------------------------------------------------
@@ -1489,6 +1546,10 @@ void x11_wait_frame(X11 *x, f64 seconds)
 {
         if (!x || seconds <= 0)
                 return;
+        /* an Expose that arrived while the loop was busy rendering is
+         * answered before the first sleep — the caller may be a 2 fps
+         * static image, and the re-present is backend-local */
+        x11_flush_expose(x);
         f64 deadline = rev_monotonic() + seconds;
         for (;;) {
                 f64 rem = deadline - rev_monotonic();
@@ -1504,6 +1565,7 @@ void x11_wait_frame(X11 *x, f64 seconds)
                 int r = select(x->fd + 1, &rf, NULL, NULL, &tv);
                 if (r > 0) {
                         x11_pump_events(x);    /* events keep flowing while waiting */
+                        x11_flush_expose(x);    /* Expose answered within one slice */
                         continue;
                 }
                 if (rev_monotonic() >= deadline)
@@ -1636,6 +1698,39 @@ int x11_display_active(X11 *x)
         return -1;
 }
 
+/* Wire offsets for the geometry-carrying events, shared by the pump and
+ * unit tests (a synthetic buffer pins the field offsets — the 2026-10
+ * ConfigureNotify reader matched ABOVE-SIBLING as the window and
+ * BORDER-WIDTH/OVERRIDE-REDIRECT as the size, so resize tracking never
+ * fired on a real server; nothing in e2e had ever driven it):
+ *   Expose (12):        window@4, x@8, y@10, w@12, h@14, count@16
+ *   ConfigureNotify(22): event@4, window@8, above-sibling@12, x@16, y@18,
+ *                        width@20, height@22, border-width@24, override@26
+ * Unknown event codes zero every output. */
+void x11_event_geometry(const u8 ev[32], u32 *win, i32 *x, i32 *y, u32 *w, u32 *h)
+{
+        u32 w0 = 0, ww = 0, hh = 0;
+        i32 xx = 0, yy = 0;
+        if (ev && ev[0] == 12) {
+                w0 = get32(ev + 4);
+                xx = (i16)get16(ev + 8);
+                yy = (i16)get16(ev + 10);
+                ww = get16(ev + 12);
+                hh = get16(ev + 14);
+        } else if (ev && ev[0] == 22) {
+                w0 = get32(ev + 8);
+                xx = (i16)get16(ev + 16);
+                yy = (i16)get16(ev + 18);
+                ww = get16(ev + 20);
+                hh = get16(ev + 22);
+        }
+        if (win) *win = w0;
+        if (x) *x = xx;
+        if (y) *y = yy;
+        if (w) *w = ww;
+        if (h) *h = hh;
+}
+
 void x11_pump_events(X11 *x)
 {
         /* drain our buffered queue + anything available on the socket */
@@ -1656,15 +1751,26 @@ void x11_pump_events(X11 *x)
 
                 u8 code = ev[0];
                 if (code == 22) {   /* ConfigureNotify */
-                        u32 wid = get32(ev + 12);   /* event(8) window(12) */
-                        u32 nw = get16(ev + 24), nh = get16(ev + 26);
+                        u32 wid;
+                        i32 ex, ey;
+                        u32 nw, nh;
+                        x11_event_geometry(ev, &wid, &ex, &ey, &nw, &nh);
                         for (int i = 0; i < x->nwins; i++) {
-                                if (x->wins[i].wid == wid && (nw != x->wins[i].w || nh != x->wins[i].h)) {
+                                if (x->wins[i].wid == wid && x->wins[i].in_use &&
+                                    nw > 0 && nh > 0 &&
+                                    (nw != x->wins[i].w || nh != x->wins[i].h)) {
                                         LOGI("x11: window %d resized %ux%u -> %ux%u",
                                              i, x->wins[i].w, x->wins[i].h, nw, nh);
                                         x->wins[i].w = nw;
                                         x->wins[i].h = nh;
                                 }
+                        }
+                } else if (code == 12) {   /* Expose — see xwin_represent_last */
+                        u32 wid = 0;
+                        x11_event_geometry(ev, &wid, NULL, NULL, NULL, NULL);
+                        for (int i = 0; i < x->nwins; i++) {
+                                if (x->wins[i].wid == wid && x->wins[i].in_use)
+                                        x->wins[i].exposed = true;
                         }
                 } else if (code == 4 || code == 5) {
                         /* ButtonPress / ButtonRelease — root coords at
@@ -1702,7 +1808,8 @@ void x11_pump_events(X11 *x)
                                 x->click_pending = false;
                         }
                 }
-                /* Expose etc. are no-ops: we repaint continuously or on demand */
+                /* everything else is a no-op: repaints are driven by the
+                 * frame loop, and Expose is handled above */
         }
 }
 

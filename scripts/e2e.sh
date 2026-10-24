@@ -789,6 +789,134 @@ fi
 rm -rf "$ISTATE"
 stop_xvfb
 
+# ---- Image-layer placement: sprites at authored rects ----------------------
+# The zero-code authoring vocabulary this session added: pos/size/scale/
+# anchor composite smaller images into the frame (offline render + probes).
+cp tests/fixtures/png_rgb8_40x25_i1.png "$OUT/sprite.png"
+cat > "$OUT/place.rev" <<'EOF'
+scene "Placement" {
+    fps = 30
+    layer bg { type = solid  color = #101010 }
+    layer corner {
+        type = image
+        src = "sprite.png"
+        pos = (0.25, 0.75)
+        anchor = topleft
+        scale = 1
+    }
+    layer zoom {
+        type = image
+        src = "sprite.png"
+        pos = (0.95, 0.1)
+        anchor = topright
+        scale = 1.5
+    }
+    layer box {
+        type = image
+        src = "sprite.png"
+        pos = (0.5, 0.55)
+        size = (0.25, 0.25)
+        fit = fit
+    }
+}
+EOF
+./build/reverie "$OUT/place.rev" -o -s 160x120 -O "$OUT/place.png" \
+    > "$OUT/place.log" 2>&1
+if python3 -c "
+import struct, zlib, sys
+d = open('$OUT/place.png','rb').read(); pos, idat = 8, b''
+while pos < len(d):
+    ln, typ = struct.unpack('>I4s', d[pos:pos+8]); pos += 8
+    if typ == b'IDAT': idat += d[pos:pos+ln]
+    pos += ln + 4
+raw = zlib.decompress(idat); W, H, stride = 160, 120, 160*4+1
+def px(x, y):
+    r = raw[y*stride+1:y*stride+1+stride-1]
+    return tuple(r[x*4:x*4+4])
+def near_bg(x, y):
+    r, g, b = px(x, y)[:3]
+    return abs(r-16) <= 6 and abs(g-16) <= 6 and abs(b-16) <= 6
+def diff_count(x0, y0, x1, y1):
+    return sum(1 for y in range(y0, y1) for x in range(x0, x1)
+               if not near_bg(x, y))
+ok = True
+# corner sprite: 40x25 native at (40, 90); topleft texel is #0055aa
+r, g, b = px(40, 90)[:3]
+ok = ok and abs(r-0) <= 4 and abs(g-85) <= 4 and abs(b-170) <= 4
+ok = ok and diff_count(41, 91, 79, 114) > 38*23*0.8
+ok = ok and near_bg(38, 100) and near_bg(85, 100) and near_bg(41, 88)
+# zoom sprite: 60x38 at top-right, resampled — dense non-bg content
+ok = ok and diff_count(95, 15, 150, 48) > 55*33*0.75
+# box layer: rect 40x30 centered at (80,66) -> [60,100)x[51,81); the 40x25
+# source contains to 40x25 -> 2px letterbox bars inside the rect
+ok = ok and diff_count(62, 51, 98, 53) == 0
+ok = ok and diff_count(62, 55, 98, 76) > 36*21*0.75
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+    echo "    scene(place): PASS (pos/anchor/scale/size rects land where authored)"
+    PASS=$((PASS+1))
+else
+    echo "    scene(place): FAIL (placed sprites missing or misplaced)"
+    cat "$OUT/place.log" 2>/dev/null
+    FAIL=$((FAIL+1))
+fi
+
+# ---- X11 Expose: static content snaps back on workspace switches ----------
+# openbox switches desktops by unmapping the other desktop's windows; the
+# server repaints the newly exposed wallpaper regions with the window
+# background (black) and sends Expose. A 60 fps video repaints within a
+# frame anyway; a static --image paced at 2 fps left the patch black for up
+# to half a second (2026-10 field report). The backend now re-presents the
+# last frame from its own SHM segment the moment the Expose arrives.
+# reverie's --shot cannot observe the gap (it reads the wallpaper window's
+# private content AFTER that frame's present), so the occluder grabs the
+# ROOT pixels — what the user's eyes see. --fps 1 widens the gap to a full
+# second so the sample lands deterministically inside it.
+start_xvfb
+cc -O2 -o "$OUT/occlude" scripts/occlude_x11.c 2>/dev/null
+if [ -x "$OUT/occlude" ]; then
+    DISPLAY="$XDISPLAY" timeout 6 ./build/reverie -R cpu --image "$IMG_FIX" \
+        --fps 1 > "$OUT/expose.log" 2>&1 &
+    EPID=$!
+    sleep 1.5
+    DISPLAY="$XDISPLAY" "$OUT/occlude" 300 400 150 "$OUT/expose.raw" \
+        > "$OUT/expose.dim" 2> "$OUT/expose.occl"
+    wait $EPID 2>/dev/null || true
+    if python3 -c "
+import sys
+tok = open('$OUT/expose.dim').read().split()
+if len(tok) < 4:
+    sys.exit(1)
+W, H = int(tok[1]), int(tok[2])
+raw = open('$OUT/expose.raw','rb').read()
+stride = W * 4
+half = W // 2
+def bright(frac):
+    n = tot = 0
+    for y in range(0, H, 3):
+        row = raw[y*stride : y*stride + half*4] if frac == 'l' \
+              else raw[y*stride + half*4 : (y+1)*stride]
+        for b in row[::7]:
+            tot += 1
+            if b > 12:
+                n += 1
+    return n / max(tot, 1)
+# left = the occluded-then-exposed half; right = never covered (control)
+sys.exit(0 if bright('l') > 0.10 and bright('r') > 0.10 else 1)
+" 2>/dev/null; then
+        echo "    x11(expose):  PASS (exposed region repainted within 150ms)"
+        PASS=$((PASS+1))
+    else
+        echo "    x11(expose):  FAIL (exposed region stayed black — repaint missing)"
+        cat "$OUT/expose.log" "$OUT/expose.occl" 2>/dev/null
+        FAIL=$((FAIL+1))
+    fi
+else
+    echo "    x11(expose):  FAIL (occlude helper did not compile)"
+    FAIL=$((FAIL+1))
+fi
+stop_xvfb
+
 # ---- Vulkan tier: GPU compute compositing, platform present -----------------
 # The tier composites every layer as a compute kernel; the finished frame is
 # copied out and presented via wl_shm/MIT-SHM.

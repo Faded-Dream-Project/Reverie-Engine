@@ -68,11 +68,24 @@ bool x11_query_pointer(X11 *x, i32 *rx, i32 *ry, u32 *mask);
 bool x11_pointer(X11 *x, RPointerState *out);
 
 /* Event-loop sleep: polls the X connection fd for up to `seconds` while
- * draining events — input keeps flowing between frames. */
+ * draining events — input keeps flowing between frames. Windows that
+ * latched an Expose (workspace switches under WMs like openbox) are
+ * re-presented from the backend's own memory inside the wait, so static
+ * content snaps back instantly even at low pacing. */
 void x11_wait_frame(X11 *x, f64 seconds);
 
 /* Reads pending events, updating internal window geometry. */
 void x11_pump_events(X11 *x);
+
+/* Immediate Expose service: re-presents any window that latched an Expose
+ * since the last call (workspace switches under WMs like openbox). Safe
+ * only from top-level contexts — wait_frame and the platform pump call it. */
+void x11_flush_expose(X11 *x);
+
+/* Wire field offsets for the geometry-carrying events (Expose 12,
+ * ConfigureNotify 22) — extracted so unit tests can pin the protocol
+ * layout the pump reads. Unknown codes zero every output. */
+void x11_event_geometry(const u8 ev[32], u32 *win, i32 *x, i32 *y, u32 *w, u32 *h);
 
 /* True if a window's geometry changed since the last check. */
 bool x11_win_geometry(X11 *x, int win, RRect *geom);

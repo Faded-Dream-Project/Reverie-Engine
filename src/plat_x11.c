@@ -112,6 +112,10 @@ static void px_pump(RPlatform *p)
 {
         PlatX11 *c = (PlatX11 *)p->ctx;
         x11_pump_events(c->x);
+        /* the pump is a top-level call from the frame loop (never nested in
+         * a reply wait), so Expose re-presents are safe to issue here too —
+         * a WM desktop switch that lands between ticks still snaps back */
+        x11_flush_expose(c->x);
 }
 
 static bool px_pointer(RPlatform *p, RPointerState *out)
