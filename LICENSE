@@ -1,56 +1,293 @@
-REVERIE ENGINE
-PROPRIETARY SOURCE LICENSE
-Copyright (c) 2026 FemBoyGamerTechGuy. All Rights Reserved.
+REVERIE PROPRIETARY LICENSE
+Version 1.0, 2026
+Copyright (c) 2026 FemBoyGamerTechGuy. All rights reserved.
 
----------------------------------------------------------------------------
+Reverie (the Reverie Engine) is developed as part of the Faded Dream
+Project. "Faded Dream Project" is used in this license as a project
+name only and does not, by itself, designate a legal entity.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-This license governs the source code, documentation, scene files, assets
-and all other materials contained in this repository (collectively, the
-"Software"). By obtaining, viewing or otherwise accessing the Software you
-agree to the terms of this license.
+1. DEFINITIONS
 
-1. OWNERSHIP
-   The Software is and remains the exclusive property of the copyright
-   holder stated above. No title or ownership is transferred to you.
-   All rights not expressly granted (and none are granted below) are
-   reserved by the copyright holder.
+"Engine" means Reverie itself: its source code, object code, headers,
+build scripts, build configuration, documentation, the command-line
+tools shipped with it (reverie, revtool), and the engine assets it
+ships (including the bundled example themes), in whole or in part, in
+original or modified form.
 
-2. NO COPYING, MODIFICATION OR REDISTRIBUTION
-   You may NOT copy, reproduce, republish, upload, post, transmit, share,
-   mirror, sell, resell, sublicense or distribute the Software or any part
-   of it, in source or binary form, standalone or bundled with other
-   software. You may NOT modify, adapt, translate or create derivative
-   works of the Software.
+"Wallpaper Content" means wallpaper material created by an author that
+is displayed by the Engine. Wallpaper Content includes `.rev` scene
+files, theme folders and `.revpack` theme packages, and the images,
+videos, SVG artwork, and other assets those wallpapers embed or
+reference. Wallpaper Content does NOT include the Engine itself, any
+modified version of the Engine, or any part of the Engine.
 
-3. NO COMMERCIAL USE
-   The Software may not be used, in whole or in part, for any commercial
-   purpose without prior written permission from the copyright holder.
+"Engine Copy" means a binary form of the Engine that Wallpaper Content
+needs to be present at run time in order to be displayed — for
+example, the reverie and revtool executables installed on an end
+user's system, or a package (.deb, .rpm, .pkg.tar.zst, .apk, .xbps)
+containing them. An Engine Copy is and remains part of the Engine, not
+part of Wallpaper Content, wherever it is installed, however it is
+obtained, and whoever installs it.
 
-4. LIMITED VIEWING RIGHT
-   You are granted a revocable, non-transferable, non-exclusive right to
-   view the source code of the Software for personal, non-commercial
-   evaluation and study only.
+"Licensor" means FemBoyGamerTechGuy, the copyright holder of the
+Engine, identified here by the established project handle under which
+the Engine is authored and published.
 
-5. NO WARRANTY
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES
-   OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE
-   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+"You" means any individual or entity that obtains access to the
+Engine, in any form and through any channel.
 
-6. TERMINATION
-   Any breach of this license terminates your limited viewing right
-   immediately, and you must destroy all copies of the Software in your
-   possession.
+"Written Authorization" means an express, written permission issued
+by the Licensor for a specific act or set of acts. This license
+itself is one such authorization, for the acts it expressly permits.
 
-7. TRADEMARKS
-   "Reverie Engine", the Reverie name and any associated marks are
-   trademarks of the copyright holder. Nothing in this license grants any
-   right to use them.
+2. OWNERSHIP
 
-For licensing inquiries, contact the copyright holder via the repository
-owner's GitHub profile: https://github.com/FemBoyGamerTechGuy
+The Engine is licensed, not sold. The Licensor retains all right,
+title, and interest in and to the Engine, including all intellectual
+property rights therein. No ownership or co-ownership of the Engine
+is transferred to You by this license or by access to the Engine's
+repository. All rights not expressly granted in Section 4 are
+reserved by the Licensor.
 
----------------------------------------------------------------------------
-"Reverie Engine" — an interactive wallpaper engine written in pure C.
+This license grants no rights in the Licensor's names, marks, logos,
+or branding, including "Reverie", "Reverie Engine", and "Faded
+Dream".
+
+3. SCOPE — WHAT THIS LICENSE GOVERNS
+
+This license governs the Engine and the materials expressly covered
+by it. It does NOT automatically govern Wallpaper Content. A `.rev`
+wallpaper, theme package, or media wallpaper you create with the
+Engine is YOUR work: it does not carry this license, and the Engine's
+restrictions never attach to it, as further described in Section 5.
+
+4. LICENSE GRANT
+
+Subject to the terms of this license, the Licensor grants You a
+limited, non-exclusive, non-transferable, revocable license to:
+
+a. Download, install, and use the Engine, and to make the copies of
+it (including backup copies) that are reasonably necessary to do so,
+for the purpose of creating, testing, displaying, and enjoying
+wallpapers on Your own systems;
+
+b. Create Wallpaper Content with the Engine — scenes, themes, and
+media wallpapers — including for distribution and sale, subject to
+Section 5;
+
+c. Distribute and commercially sell or otherwise exploit Your
+Wallpaper Content, subject to Section 5; and
+
+d. Rely on a separately installed Engine. Wallpaper Content You
+distribute must consist of Your own scenes, assets, and media. You
+may NOT bundle, embed, or otherwise include the Engine — or any
+Engine Copy of it — in or with anything You distribute: not in or
+with the wallpaper itself, its installer, a container or sandbox
+image, an archive, or any other distribution artifact, unless the
+Licensor first grants that permission in a further, specific Written
+Authorization. End users obtain and install the Engine themselves —
+from the Licensor or from a channel the Licensor authorizes (the
+published release packages, or a build from this repository). Stating
+that Your wallpaper requires the Reverie Engine, or directing users
+to an authorized channel for it, is permitted and does not constitute
+distributing the Engine.
+
+5. WALLPAPER CONTENT AND AUTHOR RIGHTS
+
+a. Wallpaper Content is an independent work. To the maximum extent
+permitted by applicable law, this license claims no rights over
+Wallpaper Content, and the Licensor neither owns nor co-owns a
+wallpaper by virtue of its author having used the Engine to create
+or display it.
+
+b. Creating a `.rev` wallpaper, theme, or media wallpaper with the
+Engine does NOT carry this license to the wallpaper. You retain all
+rights in and to Your Wallpaper Content — the scene files, the theme
+packages, the images, videos, and SVG artwork — and You may
+distribute, license, sell, or otherwise exploit them under terms You
+choose, subject to applicable law, to any separate agreements that
+bind You, and to the licenses of any third-party components You
+include in them. The ownership runs one way: Your wallpapers are
+Yours; the Engine is not.
+
+c. Wallpaper Content does not become the property of the Licensor or
+of the Faded Dream Project merely because it targets the Engine. The
+restrictions of Section 6 attach to the Engine, never to Your
+wallpaper files or their assets.
+
+d. Nothing in this license limits Your right to state factually that
+Your wallpaper is made with, or runs on, Reverie. However, You may
+not name, brand, or market Your wallpaper in a way that states or
+implies that it IS the Engine, that it is part of the Faded Dream
+Project, or that the Licensor endorses it, without prior Written
+Authorization.
+
+e. The boundary: if You extract, adapt, or republish Engine code,
+Engine components, or the Engine's shipped assets (including its
+bundled example themes) outside of Wallpaper Content — for example,
+as another engine, framework, library, template, or standalone asset
+collection — that act is governed by Section 6, not by this Section.
+
+f. The separate-Engine rule in Section 4(d) is a limit on what You
+may distribute of the Engine, never on Your Wallpaper Content. A
+theme that requires a separately installed Reverie Engine is none
+the less complete, independent, and fully distributable under this
+Section, and nothing in that rule restricts Your wallpaper's own
+packaging, installer, pricing, distribution channels, or terms — so
+long as the artifact You distribute does not itself contain or
+accompany the Engine or an Engine Copy.
+
+6. RESTRICTIONS ON THE ENGINE
+
+Except as expressly permitted by Section 4, or by separate Written
+Authorization, You may NOT:
+
+a. Copy or redistribute the Engine, in source or object form,
+including publishing, uploading, mirroring, or packaging it for
+third parties — in whole or in part, original or modified;
+
+b. Modify, adapt, translate, or create derivative works of the
+Engine, or distribute an Engine modified by You or for You;
+
+c. Sublicense, sell, rent, lease, lend, or otherwise transfer
+rights in the Engine to any third party;
+
+d. Commercially exploit the Engine itself — including charging for
+access to it, offering it as a product or hosted service, or
+building a competing engine, framework, or SDK upon it. This
+subsection restricts the Engine; it does NOT restrict the commercial
+distribution or sale of Wallpaper Content, which Section 4(c)
+expressly permits;
+
+e. Remove, obscure, or alter any copyright, trademark, or other
+proprietary notice contained in the Engine or in an Engine Copy;
+
+f. Reverse engineer, decompile, or disassemble the Engine, except
+where, and strictly to the extent, such acts are permitted by
+mandatory provisions of applicable law that cannot be waived by
+contract;
+
+g. Use the Engine's shipped assets (including its bundled example
+themes) outside of Wallpaper Content, or redistribute them as
+standalone theme or asset packages.
+
+Access to the Engine's repository — including cloning it, reading
+its source, or building it locally — grants only the rights in this
+license. Such access does not grant any right to redistribute, reuse,
+repackage, or sublicense the Engine beyond Sections 4 and 5, and does
+not constitute ownership of any kind.
+
+7. THIRD-PARTY COMPONENTS
+
+The Engine loads optional system components at run time (for
+example, Vulkan, OpenGL/EGL, and FFmpeg libraries) that are
+distributed under their own licenses by their respective owners.
+Those components remain governed by their own license terms, which
+this license does not modify or supersede. Nothing in this license
+imposes additional restrictions on properly-licensed third-party
+components beyond what their own licenses require, and nothing in
+this license limits the rights those licenses grant You with respect
+to those components. Wallpaper Content that embeds third-party
+assets must respect those assets' own licenses — this license grants
+no rights in them.
+
+8. SUPPORT AND UPDATES
+
+The Licensor is not obligated to provide support, maintenance,
+updates, error corrections, or new versions of the Engine to You.
+Any such materials the Licensor chooses to provide are governed by
+this license unless expressly stated otherwise.
+
+9. NO WARRANTY
+
+THE ENGINE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND
+NONINFRINGEMENT. THE LICENSOR DOES NOT WARRANT THAT THE ENGINE WILL
+BE ERROR-FREE, SECURE, OR THAT ITS USE WILL BE UNINTERRUPTED.
+
+10. LIMITATION OF LIABILITY
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL
+THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR FOR LOST PROFITS, REVENUE, OR
+DATA, ARISING OUT OF OR RELATED TO THIS LICENSE OR THE USE OR
+INABILITY TO USE THE ENGINE. SOME JURISDICTIONS DO NOT ALLOW THE
+EXCLUSION OR LIMITATION OF CERTAIN DAMAGES — INCLUDING, IN SOME
+CASES, LIABILITY FOR DEATH OR PERSONAL INJURY OR FOR GROSS
+NEGLIGENCE OR WILLFUL MISCONDUCT — SO SOME OR ALL OF THE ABOVE
+LIMITATIONS AND EXCLUSIONS MAY NOT APPLY TO YOU. NOTHING IN THIS
+SECTION EXCLUDES OR LIMITS LIABILITY TO THE EXTENT THAT APPLICABLE
+LAW PROHIBITS SUCH EXCLUSION OR LIMITATION.
+
+11. TERMINATION
+
+This license and the rights it grants terminate automatically if You
+breach any of its terms. Upon termination, You must cease all new use
+and distribution of the Engine and destroy copies in Your possession,
+except that: (a) Wallpaper Content You validly distributed before
+termination may continue to be used, displayed, and further
+distributed by its recipients; (b) end users who separately obtained
+an Engine Copy under this license hold their own license from the
+Licensor and may continue to install and use it to display those
+wallpapers; and (c) You may retain archive copies strictly for
+supporting Wallpaper Content You validly distributed before
+termination, for so long as You continue to comply with Sections 4
+through 7.
+
+12. CHANGES TO THIS LICENSE
+
+The Licensor may revise this license at any time. Revisions govern
+copies of the Engine distributed after the revision takes effect;
+copies distributed to You under this version remain governed by this
+version for the rights already granted.
+
+13. GENERAL
+
+This license is the entire agreement between You and the Licensor
+concerning the Engine and supersedes any prior or contemporaneous
+understandings on that subject. No rights are granted by implication,
+estoppel, or otherwise under any of the Licensor's intellectual
+property rights except as expressly set forth herein. If any
+provision of this license is held unenforceable, it will be enforced
+to the maximum extent permissible and the remaining provisions will
+remain in effect. The Licensor's failure to enforce any provision is
+not a waiver of it. You may not assign this license or the rights it
+grants without the Licensor's prior written consent.
+
+14. GOVERNING LAW AND VENUE
+
+This license and any dispute, claim, or controversy arising out of or
+relating to it, to the Engine, or to the use or distribution of the
+Engine shall be governed by and construed in accordance with the laws
+of Romania, without regard to its conflict-of-laws provisions. The
+parties consent to the exclusive jurisdiction and venue of the courts
+of Bucharest, Romania, for any such dispute, except and only to the
+extent that applicable law grants a mandatory, non-waivable forum to
+a party. Nothing in this Section limits either party's right to seek
+interim or protective relief in any jurisdiction in which Engine
+rights are infringed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+NOTICE
+
+This license was finalized and adopted by the Licensor without review
+by qualified legal counsel. It states the Licensor's chosen terms for
+the Engine and is not legal advice. The substantive choices in it —
+identifying the Licensor by the established project handle (Section
+1), the separate-Engine distribution model (Section 4(d)), the
+one-way ownership of Wallpaper Content (Section 5), and the governing
+law and venue (Section 14) — are the Licensor's decisions, made on
+the information available at the time of adoption, and may be revised
+in a later version of this license as provided in Section 12.
+
+IN PLAIN WORDS
+
+The Engine is proprietary — don't redistribute or repackage Reverie
+itself. The wallpapers You create with it are entirely Yours — sell
+them, share them, license them however You like; the Engine's license
+never carries over to Your work. Just don't bundle the Engine binaries
+into what You distribute: your users install Reverie themselves.
+
+END OF LICENSE
