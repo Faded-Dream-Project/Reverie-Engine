@@ -31,12 +31,22 @@
 # callback starvation characteristics of the maintainer's compositor,
 # hardware GPU timer queries) is validated by field runs — see the
 # "manual verification" notes in docs/BACKENDS.md.
+#
+# Tag pushes (v*) additionally run the `package` job: each distro
+# container builds the release binaries and scripts/make-package.sh
+# turns them into that distribution's package (.deb / .rpm /
+# .pkg.tar.zst / .apk / .xbps + a portable .tar.gz), SELF-TESTED by
+# installing it back into the same container. The packages upload as
+# workflow artifacts; the maintainer attaches them to the GitHub
+# release for the tag (both binaries — reverie and revtool — ride in
+# every package).
 # ============================================================================
 name: ci
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -176,3 +186,68 @@ jobs:
               tail -8 /tmp/diag.out
             fi
           done
+
+  # ---- release packaging (tag pushes only) -----------------------------------
+  # Same containers as the distro-matrix, but the build becomes a real
+  # package for that distribution, self-tested by installing it back into
+  # the container it was built in. Artifacts feed the GitHub release.
+  package:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: alpine
+            image: "alpine:latest"
+            install: "apk add --no-cache git build-base ffmpeg ffmpeg-dev"
+            pkg: alpine
+          - distro: arch
+            image: "archlinux:latest"
+            install: "pacman -Sy --noconfirm git base-devel ffmpeg zstd"
+            pkg: arch
+          - distro: debian
+            image: "debian:latest"
+            install: "apt-get update && apt-get install -y --no-install-recommends ca-certificates git build-essential libavcodec-dev libavformat-dev libavutil-dev libswscale-dev"
+            pkg: debian
+            extra: tarball
+          - distro: fedora
+            image: "fedora:latest"
+            install: "dnf -y install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm && dnf -y install git gcc make ffmpeg-devel rpm-build"
+            pkg: fedora
+          - distro: opensuse
+            image: "opensuse/tumbleweed:latest"
+            install: "zypper -n install git gcc make 'pkgconfig(libavcodec)' 'pkgconfig(libavformat)' 'pkgconfig(libavutil)' 'pkgconfig(libswscale)' rpm-build"
+            pkg: opensuse
+          - distro: void
+            image: "voidlinux/voidlinux:latest"
+            install: "mkdir -p /etc/xbps.d && printf 'repository=https://repo-default.voidlinux.org/current\n' > /etc/xbps.d/00-repository-main.conf && xbps-install -Sy xbps && xbps-install -Sy git base-devel ffmpeg-devel"
+            pkg: void
+    name: package (${{ matrix.distro }})
+    container: ${{ matrix.image }}
+    steps:
+      - name: toolchain
+        run: ${{ matrix.install }}
+      - uses: actions/checkout@v4
+      - name: build (release, system FFmpeg)
+        run: make -j"$(nproc)"
+      - name: package + self-test install
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          scripts/make-package.sh "${{ matrix.pkg }}" "$VER" 1
+          if [ -n "${{ matrix.extra }}" ]; then
+            scripts/make-package.sh "${{ matrix.extra }}" "$VER" 1
+          fi
+      - name: upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.distro }}
+          path: |
+            *.deb
+            *.rpm
+            *.pkg.tar.zst
+            *.apk
+            *.xbps
+            *.tar.gz
+          if-no-files-found: error
